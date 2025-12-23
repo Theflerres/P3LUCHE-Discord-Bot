@@ -1,0 +1,16 @@
+discord.py>=2.0.0
+google-generativeai
+google-api-python-client
+google-auth-oauthlib
+google-auth
+yt-dlp
+networkx
+matplotlib
+scipy
+psutil
+python-dotenv
+pypdf
+python-docx
+Pillow
+requests
+aiohttp
