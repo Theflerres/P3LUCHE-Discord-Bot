@@ -1,0 +1,17 @@
+# Arquivos de Ambiente
+.env
+credentials.json
+client_secret.json
+
+# Banco de Dados e Logs
+*.db
+database/
+logs/
+
+# Arquivos Temporários do Python
+__pycache__/
+*.pyc
+
+# Arquivos de Sistema
+.DS_Store
+Thumbs.db
