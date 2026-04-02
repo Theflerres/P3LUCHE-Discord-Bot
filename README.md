@@ -1,6 +1,6 @@
 # P3LUCHE - Sistema Operacional de Comunidade & RPG
 
-> **Versão:** 2.5 | **Status:** Em Produção | **Dev:** @Theflerres
+> **Versão:** 3.0 | **Status:** Em Produção | **Dev:** @Theflerres
 
 O **P3LUCHE** é uma aplicação robusta de engenharia de software desenvolvida em Python para atuar como o núcleo operacional de servidores de Discord focados em RPG.
 
@@ -12,7 +12,7 @@ Diferente de bots comerciais genéricos, este projeto foi arquitetado ao longo d
 
 Este projeto não utiliza apenas wrappers básicos. A arquitetura envolve:
 
-* **Core:** Python 3.13 (AsyncIO & Multithreading)
+* **Core:** Python 3.13 (AsyncIO, Multithreading & **Arquitetura Modular c/ Cogs**)
 * **Banco de Dados:** SQLite3 Relacional (c/ Migrations personalizadas & WAL mode)
 * **Data Science:** `NetworkX` (Teoria dos Grafos), `Matplotlib`, `Pandas`, `Scipy`
 * **AI & NLP:** Google Gemini API (1.5 Pro) + RAG (Retrieval-Augmented Generation)
@@ -44,6 +44,11 @@ O bot atua como um "Bibliotecário Inteligente".
 Sistema de rádio desenvolvido para superar a instabilidade de streaming direto.
 * O bot realiza o download do áudio, normaliza o volume e faz upload para um contêiner privado no **Google Drive**.
 * Isso garante persistência dos arquivos e reprodução sem *buffering*.
+
+### 5. Arquitetura Modular e Escalável (Cogs)
+Refatoração do sistema monolítico para um *design pattern* focado em alta disponibilidade e manutenibilidade.
+* **Separação de Contextos (SoC):** Funcionalidades divididas em domínios de aplicação estritamente isolados (`economia`, `lore_ai`, `musica`, `moderacao`).
+* **Hot-Reloading:** Capacidade de carregar, descarregar e atualizar componentes específicos em tempo de execução, sem interromper o WebSocket e a operação geral do bot.
 
 ---
 
