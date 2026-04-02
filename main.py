@@ -35,6 +35,8 @@ async def setup_hook():
         "cogs.spotify",
         "cogs.sistema",
         "cogs.backup",
+        "cogs.erros",  # <-- Adicionado aqui
+        "cogs.logs",   # <-- Adicionado aqui
     ]
     for ext in extensions:
         try:

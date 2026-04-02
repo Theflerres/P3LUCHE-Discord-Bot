@@ -2,6 +2,8 @@
 """
 Economia Scrap Seas — pescaria, loja, guilda, exploração, AFK traps e clima.
 """
+import sqlite3
+import threading
 import asyncio
 import json
 import os
@@ -16,6 +18,12 @@ from discord.ext import commands, tasks
 
 from config import get_bot_instance, set_bot_instance
 from utils import get_local_file, log_to_gui
+from config import get_bot_instance, set_bot_instance
+from utils import get_local_file, log_to_gui
+
+# Adicione estas duas linhas aqui:
+CATCHES_LOCK = threading.Lock()
+CATCHES_SINCE_RESTART = {}
 
 # --- SISTEMA DE ECONOMIA V3.1 (CORREÇÃO DE DATAS PYTHON 3.12) ---
 # --- 1. CONFIGURAÇÃO DE ITENS E PEIXES ---
