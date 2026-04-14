@@ -17,10 +17,24 @@ class SistemaLogs(commands.Cog):
 
     async def enviar_log(self, embed: discord.Embed):
         canal = self.bot.get_channel(self.canal_auditoria_id)
-        if canal:
-            await canal.send(embed=embed)
-        else:
-            print(f"[AVISO] Canal de auditoria ({self.canal_auditoria_id}) não encontrado.")
+
+        # get_channel só acessa o cache local — se o canal não estiver cacheado
+        # (comum em servidores onde o bot não está presente ativamente),
+        # fazemos uma requisição direta à API do Discord.
+        if canal is None:
+            try:
+                canal = await self.bot.fetch_channel(self.canal_auditoria_id)
+            except discord.NotFound:
+                print(f"[ERRO] Canal {self.canal_auditoria_id} não existe ou o bot não tem acesso.")
+                return
+            except discord.Forbidden:
+                print(f"[ERRO] Bot sem permissão para acessar o canal {self.canal_auditoria_id}.")
+                return
+            except Exception as e:
+                print(f"[ERRO] Falha ao buscar canal de auditoria: {e}")
+                return
+
+        await canal.send(embed=embed)
 
     # ──────────────────────────────────────────────
     # HELPER: campo de identificação do servidor
