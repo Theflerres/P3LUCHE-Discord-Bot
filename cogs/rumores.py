@@ -26,7 +26,7 @@ import os
 
 TEST_MODE = True                      # ← False em produção
 TEST_DB_PATH = "rumores_test.db"      # banco isolado, nunca toca o real
-CANAL_EDITORIAL_ID = 0                # ← coloque o ID do seu canal #rumores-pendentes
+CANAL_EDITORIAL_ID = 1489330740876284206  # ← coloque o ID do seu canal #rumores-pendentes
 GEMINI_MOCK = True                    # ← False quando quiser gastar tokens reais
 
 # Intervalo do job de propagação (segundos). Em prod use 3600 (1h) ou mais.
