@@ -25,7 +25,7 @@ from discord.ext import commands, tasks
 
 TEST_MODE            = True
 TEST_DB_PATH         = "rumores_test.db"
-CANAL_EDITORIAL_ID   = 0        # ← ID do canal #rumores-pendentes
+CANAL_EDITORIAL_ID   = 1449087228239155270        # ← ID do canal #rumores-pendentes
 GEMINI_MOCK          = True     # ← False para usar tokens reais
 PROPAGATION_INTERVAL = 60       # segundos (use 3600 em prod)
 MAX_HOPS             = 3
