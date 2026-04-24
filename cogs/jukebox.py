@@ -434,10 +434,39 @@ class MusicaV2(commands.Cog):
 
         channel = interaction.user.voice.channel
         voice = interaction.guild.voice_client
-        if voice and voice.channel != channel:
-            await voice.move_to(channel)
-        elif voice is None:
-            voice = await channel.connect()
+        try:
+            if voice and voice.channel != channel:
+                await voice.move_to(channel)
+            elif voice is None:
+                voice = await channel.connect()
+        except RuntimeError as exc:
+            error_text = str(exc).lower()
+            if "library needed in order to use voice" in error_text:
+                log_to_gui(f"Dependência de voz ausente: {exc}", "ERROR")
+                await interaction.followup.send(
+                    embed=_music_embed(
+                        "Dependência de voz ausente",
+                        (
+                            "Este ambiente não possui a biblioteca necessária para voz.\n"
+                            "Instale `PyNaCl` e reinicie o bot para habilitar comandos de reprodução."
+                        ),
+                        COLOR_ERROR,
+                    ),
+                    ephemeral=True,
+                )
+                return None
+            raise
+        except Exception as exc:
+            log_to_gui(f"Falha ao conectar no canal de voz: {exc}", "ERROR")
+            await interaction.followup.send(
+                embed=_music_embed(
+                    "Falha ao conectar",
+                    "Não consegui conectar no canal de voz no momento. Tente novamente.",
+                    COLOR_ERROR,
+                ),
+                ephemeral=True,
+            )
+            return None
 
         self.voice_clients[interaction.guild.id] = voice
         if self._count_non_bot_members(voice) > 0:
