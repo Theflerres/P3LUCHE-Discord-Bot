@@ -1,0 +1,168 @@
+/* Tema dark com identidade visual do P3LUCHE. */
+:root {
+  --bg: #0d0d0d;
+  --panel: #1a1a2e;
+  --primary: #7c3aed;
+  --secondary: #a78bfa;
+  --text: #e2e8f0;
+  --muted: #8b93a7;
+  --ok: #16a34a;
+  --info: #2563eb;
+}
+
+* {
+  box-sizing: border-box;
+  font-family: "Inter", "Segoe UI", sans-serif;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  min-height: 100vh;
+}
+
+.sidebar {
+  background: #111122;
+  padding: 20px;
+  border-right: 1px solid #242442;
+}
+
+.sidebar h1 {
+  font-size: 1.4rem;
+}
+
+.tab-btn {
+  width: 100%;
+  margin-bottom: 8px;
+  border: 0;
+  border-radius: 10px;
+  background: #1d1d36;
+  color: var(--text);
+  padding: 10px;
+  cursor: pointer;
+}
+
+.tab-btn.active {
+  background: var(--primary);
+}
+
+.content {
+  padding: 20px;
+}
+
+.tab {
+  display: none;
+}
+
+.tab.active {
+  display: block;
+}
+
+.toolbar {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+button,
+input {
+  padding: 10px;
+  border-radius: 10px;
+  border: 1px solid #2a2a43;
+  background: #16162a;
+  color: var(--text);
+}
+
+button {
+  cursor: pointer;
+}
+
+.chat-messages {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 12px;
+  min-height: 60vh;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.message {
+  margin: 10px 0;
+  display: flex;
+}
+
+.message.user {
+  justify-content: flex-end;
+}
+
+.bubble {
+  max-width: 72%;
+  padding: 10px;
+  border-radius: 12px;
+}
+
+.user .bubble {
+  background: var(--primary);
+}
+
+.assistant .bubble {
+  background: #24243f;
+}
+
+.badge {
+  display: inline-block;
+  margin-left: 8px;
+  font-size: 0.75rem;
+  padding: 2px 8px;
+  border-radius: 999px;
+}
+
+.badge.local {
+  background: rgba(22, 163, 74, 0.15);
+  color: #4ade80;
+}
+
+.badge.gemini {
+  background: rgba(37, 99, 235, 0.15);
+  color: #60a5fa;
+}
+
+.typing {
+  color: var(--muted);
+  margin: 8px 0;
+}
+
+.hidden {
+  display: none;
+}
+
+.chat-form {
+  margin-top: 10px;
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+}
+
+.card {
+  background: var(--panel);
+  border-radius: 12px;
+  padding: 12px;
+  white-space: pre-wrap;
+}
+
+.config-form {
+  display: grid;
+  gap: 8px;
+  max-width: 600px;
+}
+
+.config-form label {
+  color: var(--secondary);
+  font-size: 0.9rem;
+}

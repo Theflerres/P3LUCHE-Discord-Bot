@@ -1,0 +1,126 @@
+"""Servidor FastAPI principal do PelucheGPT."""
+
+from __future__ import annotations
+
+import asyncio
+from pathlib import Path
+from typing import Any
+
+import httpx
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+
+from .chat_engine import process_message
+from .config import AppConfig, config_to_dict, load_config, save_config
+from .db import get_bot_stats, query_lore_search
+from .lore_indexer import lore_indexer
+
+
+app = FastAPI(title="PelucheGPT Backend", version="1.0.0")
+
+
+class ChatRequest(BaseModel):
+    """Payload de entrada para o endpoint de chat."""
+
+    message: str = Field(min_length=1, max_length=4000)
+    history: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class ConfigUpdateRequest(BaseModel):
+    """Payload parcial para atualização de configuração."""
+
+    sqlite_path: str | None = None
+    gemini_api_key: str | None = None
+    ollama_model: str | None = None
+    ollama_url: str | None = None
+    complexity_threshold: float | None = None
+    max_context_chunks: int | None = None
+    theme: str | None = None
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    """Dispara indexação inicial em segundo plano sem bloquear a API."""
+    load_config()
+    asyncio.create_task(lore_indexer.ensure_indexed(force=False))
+
+
+@app.post("/chat")
+async def chat(payload: ChatRequest) -> dict[str, Any]:
+    """Responde mensagens do frontend via pipeline híbrido."""
+    return await process_message(payload.message, payload.history)
+
+
+@app.get("/status")
+async def status() -> dict[str, Any]:
+    """Retorna saúde dos componentes locais e cloud."""
+    cfg = load_config()
+
+    ollama_ok = False
+    gemini_ok = bool(cfg.gemini_api_key)
+    sqlite_ok = Path(cfg.sqlite_path).exists()
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            r = await client.get(f"{cfg.ollama_url}/api/tags")
+            ollama_ok = r.status_code == 200
+    except Exception:
+        ollama_ok = False
+
+    return {
+        "backend": "ok",
+        "sqlite": sqlite_ok,
+        "ollama": ollama_ok,
+        "gemini_configured": gemini_ok,
+        "chromadb": lore_indexer.stats(),
+    }
+
+
+@app.get("/lore/stats")
+async def lore_stats() -> dict[str, Any]:
+    """Exibe estatísticas de indexação do lore."""
+    return lore_indexer.stats()
+
+
+@app.post("/lore/reindex")
+async def lore_reindex() -> dict[str, Any]:
+    """Força reindexação completa do lore do SQLite."""
+    return await lore_indexer.ensure_indexed(force=True)
+
+
+@app.get("/config")
+async def get_config() -> dict[str, Any]:
+    """Retorna configuração atual para preencher formulário da UI."""
+    return config_to_dict(load_config())
+
+
+@app.post("/config")
+async def post_config(payload: ConfigUpdateRequest) -> dict[str, Any]:
+    """Atualiza config.json com os campos enviados pelo frontend."""
+    current = load_config()
+    data = current.__dict__.copy()
+    for key, value in payload.model_dump(exclude_none=True).items():
+        data[key] = value
+
+    try:
+        updated = AppConfig(**data)
+    except TypeError as exc:
+        raise HTTPException(status_code=400, detail=f"Config inválida: {exc}") from exc
+
+    save_config(updated)
+    return {"ok": True, "config": config_to_dict(updated)}
+
+
+@app.get("/bot/stats")
+async def bot_stats() -> dict[str, Any]:
+    """Retorna estatísticas gerais do banco do bot."""
+    try:
+        return get_bot_stats()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@app.get("/lore/list")
+async def lore_list(search: str = "", limit: int = 80) -> list[dict[str, Any]]:
+    """Lista lore para tabela navegável no frontend."""
+    return query_lore_search(search, limit=min(max(limit, 1), 500))

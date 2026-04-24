@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PelucheGPT</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <!-- Layout principal com sidebar e conteúdo em abas -->
+    <div class="app">
+      <aside class="sidebar">
+        <h1>PelucheGPT</h1>
+        <button class="tab-btn active" data-tab="chat">💬 PelucheGPT</button>
+        <button class="tab-btn" data-tab="painel">📊 Painel</button>
+        <button class="tab-btn" data-tab="lore">📜 Lore</button>
+        <button class="tab-btn" data-tab="config">⚙️ Configurações</button>
+      </aside>
+
+      <main class="content">
+        <section id="chat" class="tab active">
+          <div class="toolbar">
+            <button id="reindex-btn">Reindexar Lore</button>
+            <button id="clear-history-btn">Limpar histórico</button>
+          </div>
+          <div id="chat-messages" class="chat-messages"></div>
+          <div id="typing-indicator" class="typing hidden">Digitando...</div>
+          <form id="chat-form" class="chat-form">
+            <input id="chat-input" type="text" placeholder="Pergunte algo ao PelucheGPT..." />
+            <button type="submit">Enviar</button>
+          </form>
+        </section>
+
+        <section id="painel" class="tab">
+          <h2>Estatísticas do Bot</h2>
+          <pre id="bot-stats" class="card">Carregando...</pre>
+        </section>
+
+        <section id="lore" class="tab">
+          <div class="toolbar">
+            <input id="lore-search" type="text" placeholder="Buscar no lore..." />
+            <button id="lore-refresh-btn">Atualizar</button>
+          </div>
+          <div id="lore-table" class="card"></div>
+        </section>
+
+        <section id="config" class="tab">
+          <h2>Configurações</h2>
+          <form id="config-form" class="config-form"></form>
+        </section>
+      </main>
+    </div>
+
+    <script src="./app.js"></script>
+  </body>
+</html>

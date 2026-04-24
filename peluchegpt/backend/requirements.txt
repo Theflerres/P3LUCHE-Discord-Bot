@@ -1,0 +1,9 @@
+# Dependências do backend PelucheGPT.
+fastapi
+uvicorn[standard]
+httpx
+pydantic
+chromadb
+sentence-transformers
+google-generativeai
+pyinstaller
