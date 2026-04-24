@@ -31,7 +31,7 @@ from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from yt_dlp import YoutubeDL
 
-from config import DRIVE_FOLDER_ID, get_bot_instance, set_bot_instance
+from config import JUKEBOX_DRIVE_FOLDER_ID, get_bot_instance, set_bot_instance
 from utils import log_to_gui
 
 
@@ -159,7 +159,7 @@ def _db_update_missing_normalized_titles() -> int:
 
 def _drive_list_audio_files() -> list[dict[str, str]]:
     service = _get_drive_service()
-    query = f"'{DRIVE_FOLDER_ID}' in parents and mimeType contains 'audio/' and trashed = false"
+    query = f"'{JUKEBOX_DRIVE_FOLDER_ID}' in parents and mimeType contains 'audio/' and trashed = false"
     response = (
         service.files()
         .list(q=query, fields="files(id, name, webContentLink)", pageSize=1000)
@@ -171,7 +171,7 @@ def _drive_list_audio_files() -> list[dict[str, str]]:
 def _drive_upload_audio(local_path: str, title: str) -> tuple[str, str]:
     service = _get_drive_service()
     safe_name = re.sub(r'[<>:"/\\|?*]', "", title).strip() or "audio"
-    metadata = {"name": f"{safe_name}.mp3", "parents": [DRIVE_FOLDER_ID]}
+    metadata = {"name": f"{safe_name}.mp3", "parents": [JUKEBOX_DRIVE_FOLDER_ID]}
     media = MediaFileUpload(local_path, mimetype="audio/mpeg", resumable=True)
     created = service.files().create(body=metadata, media_body=media, fields="id").execute()
     file_id = created["id"]
@@ -443,12 +443,13 @@ class MusicaV2(commands.Cog):
             error_text = str(exc).lower()
             if "library needed in order to use voice" in error_text:
                 log_to_gui(f"Dependência de voz ausente: {exc}", "ERROR")
+                missing = "davey" if "davey" in error_text or "dave" in error_text else "PyNaCl"
                 await interaction.followup.send(
                     embed=_music_embed(
                         "Dependência de voz ausente",
                         (
                             "Este ambiente não possui a biblioteca necessária para voz.\n"
-                            "Instale `PyNaCl` e reinicie o bot para habilitar comandos de reprodução."
+                            f"Instale `{missing}` e reinicie o bot para habilitar comandos de reprodução."
                         ),
                         COLOR_ERROR,
                     ),

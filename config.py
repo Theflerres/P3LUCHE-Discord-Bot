@@ -23,6 +23,10 @@ os.makedirs(LOG_FOLDER, exist_ok=True)
 DB_PATH = os.path.join(LOG_FOLDER, "bot.db")
 CREATOR_NAME = "theflerres"
 DRIVE_FOLDER_ID = "1U8-Pz2YamB1OSP-wAaT8Wzw-3VOKM8Hc"
+# Pasta exclusiva do Jukebox no Drive (evita misturar com outros fluxos de áudio).
+# Configure via .env: JUKEBOX_DRIVE_FOLDER_ID=<id_da_pasta>
+# Fallback para DRIVE_FOLDER_ID para não quebrar ambientes antigos.
+JUKEBOX_DRIVE_FOLDER_ID = os.getenv("JUKEBOX_DRIVE_FOLDER_ID", DRIVE_FOLDER_ID)
 CLIENT_SECRET_FILE = os.path.join(os.getcwd(), "client_secret.json")
 CREDENTIALS_PATH = os.path.join(LOG_FOLDER, "credentials.json")
 
