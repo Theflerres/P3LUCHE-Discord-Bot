@@ -19,7 +19,7 @@ import re
 import sqlite3
 import tempfile
 import unicodedata
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Optional
 
@@ -41,7 +41,7 @@ from config import (
     get_bot_instance,
     set_bot_instance,
 )
-from utils import log_to_gui
+from utils import COOKIE_FILE, log_to_gui
 
 
 # Cores padronizadas para embeds
@@ -223,13 +223,28 @@ def _drive_upload_audio(local_path: str, title: str) -> tuple[str, str]:
 
 
 def _extract_stream_info(url: str) -> dict[str, Any]:
-    opts = {"quiet": True, "noplaylist": True, "format": "bestaudio/best"}
+    opts: dict[str, Any] = {
+        "quiet": True,
+        "noplaylist": True,
+        "format": "bestaudio[ext=m4a]/bestaudio/best",
+        "force_ipv4": True,
+        "extractor_args": {
+            "youtube": {
+                # Evita parte dos formatos instáveis recentes no YouTube.
+                "player_client": ["android", "ios"],
+                "formats": "missing_pot",
+            }
+        },
+    }
+    if os.path.exists(COOKIE_FILE):
+        opts["cookiefile"] = COOKIE_FILE
     with YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     return {
         "title": info.get("title") or "Sem título",
         "duration": int(info.get("duration") or 0),
         "stream_url": info.get("url"),
+        "http_headers": info.get("http_headers") or {},
         "webpage_url": info.get("webpage_url") or url,
     }
 
@@ -269,6 +284,8 @@ class QueueItem:
     duration: int = 0
     requested_by: str = ""
     origin: str = "db"
+    source_page_url: str = ""
+    http_headers: dict[str, str] = field(default_factory=dict)
 
 
 class TrackChoiceView(discord.ui.View):
@@ -528,6 +545,29 @@ class MusicaV2(commands.Cog):
             origin="db",
         )
 
+    def _build_ffmpeg_source(self, item: QueueItem) -> discord.FFmpegPCMAudio:
+        before_options = (
+            "-nostdin "
+            "-reconnect 1 "
+            "-reconnect_streamed 1 "
+            "-reconnect_on_network_error 1 "
+            "-reconnect_on_http_error 4xx,5xx "
+            "-reconnect_delay_max 5 "
+            "-rw_timeout 15000000"
+        )
+
+        headers = item.http_headers or {}
+        if headers:
+            header_lines = []
+            for key, value in headers.items():
+                safe_key = str(key).replace("\r", "").replace("\n", "")
+                safe_val = str(value).replace("\r", "").replace("\n", "")
+                header_lines.append(f"{safe_key}: {safe_val}")
+            if header_lines:
+                before_options += f' -headers "{r"\\r\\n".join(header_lines)}\\r\\n"'
+
+        return discord.FFmpegPCMAudio(item.source_url, before_options=before_options, options="-vn")
+
     async def _start_next_if_idle(self, guild: discord.Guild):
         guild_id = guild.id
         async with self._guild_lock(guild_id):
@@ -540,7 +580,15 @@ class MusicaV2(commands.Cog):
                 return
             item = queue.pop(0)
             try:
-                source = discord.FFmpegPCMAudio(item.source_url, options="-vn")
+                # Para URLs externas, renova stream_url na hora de tocar (evita URL expirada/cortada).
+                if item.origin == "url" and item.source_page_url:
+                    refreshed = await asyncio.to_thread(_extract_stream_info, item.source_page_url)
+                    if refreshed.get("stream_url"):
+                        item.source_url = refreshed["stream_url"]
+                        item.http_headers = dict(refreshed.get("http_headers") or {})
+                        item.duration = int(refreshed.get("duration") or item.duration)
+
+                source = self._build_ffmpeg_source(item)
                 def _after(err: Exception | None):
                     if err:
                         log_to_gui(f"Erro FFmpeg pós-faixa ({guild_id}): {err}", "ERROR")
@@ -661,6 +709,8 @@ class MusicaV2(commands.Cog):
             duration=info["duration"],
             requested_by=interaction.user.display_name,
             origin="url",
+            source_page_url=info.get("webpage_url", url),
+            http_headers=dict(info.get("http_headers") or {}),
         )
         self.queues.setdefault(interaction.guild.id, []).insert(0, item)
         await self._start_next_if_idle(interaction.guild)
@@ -714,6 +764,8 @@ class MusicaV2(commands.Cog):
             duration=int(info.get("duration", 0)),
             requested_by=interaction.user.display_name,
             origin="url",
+            source_page_url=info.get("webpage_url", url),
+            http_headers=dict(info.get("http_headers") or {}),
         )
         if not item.source_url:
             await interaction.followup.send(
