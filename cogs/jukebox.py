@@ -88,6 +88,18 @@ def _get_db_conn() -> sqlite3.Connection:
     return bot.db_conn
 
 
+def _music_cache_columns(cur: sqlite3.Cursor) -> set[str]:
+    return {row[1] for row in cur.execute("PRAGMA table_info(music_cache)").fetchall()}
+
+
+def _music_cache_url_column(columns: set[str]) -> str:
+    if "drive_url" in columns:
+        return "drive_url"
+    if "drive_link" in columns:
+        return "drive_link"
+    raise RuntimeError("Tabela music_cache sem coluna de link (drive_url/drive_link).")
+
+
 def _get_drive_service():
     """Cria cliente do Google Drive (Service Account ou OAuth legado)."""
     creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
@@ -130,11 +142,12 @@ def _get_drive_service():
 def _db_fetch_music_candidates(normalized_query: str, limit: int = 5) -> list[sqlite3.Row | tuple]:
     conn = _get_db_conn()
     cur = conn.cursor()
-    columns = [row[1] for row in cur.execute("PRAGMA table_info(music_cache)").fetchall()]
+    columns = _music_cache_columns(cur)
     drive_file_select = "drive_file_id" if "drive_file_id" in columns else "NULL AS drive_file_id"
+    url_col = _music_cache_url_column(columns)
     cur.execute(
         f"""
-        SELECT id, title, normalized_title, {drive_file_select}, drive_url, duration
+        SELECT id, title, normalized_title, {drive_file_select}, {url_col} AS drive_url, duration
         FROM music_cache
         WHERE normalized_title LIKE ?
         ORDER BY title COLLATE NOCASE
@@ -154,25 +167,26 @@ def _db_insert_music_cache(
 ):
     conn = _get_db_conn()
     cur = conn.cursor()
-    columns = {row[1] for row in cur.execute("PRAGMA table_info(music_cache)").fetchall()}
+    columns = _music_cache_columns(cur)
+    url_col = _music_cache_url_column(columns)
     now_iso = datetime.utcnow().isoformat()
 
     if "drive_file_id" in columns:
         cur.execute(
             """
             INSERT INTO music_cache
-            (title, normalized_title, drive_file_id, drive_url, duration, added_at)
+            (title, normalized_title, drive_file_id, {url_col}, duration, added_at)
             VALUES (?, ?, ?, ?, ?, ?)
-            """,
+            """.format(url_col=url_col),
             (title, normalized_title, drive_file_id, drive_url, int(duration or 0), now_iso),
         )
     else:
         cur.execute(
             """
             INSERT INTO music_cache
-            (title, normalized_title, drive_url, duration, added_at)
+            (title, normalized_title, {url_col}, duration, added_at)
             VALUES (?, ?, ?, ?, ?)
-            """,
+            """.format(url_col=url_col),
             (title, normalized_title, drive_url, int(duration or 0), now_iso),
         )
     conn.commit()
@@ -892,8 +906,9 @@ async def rebuild_database_from_drive(force: bool = False):
     """Varre o Google Drive em busca de arquivos de áudio e reconstrói/atualiza o music_cache."""
     conn = _get_db_conn()
     cur = conn.cursor()
-    columns = {row[1] for row in cur.execute("PRAGMA table_info(music_cache)").fetchall()}
+    columns = _music_cache_columns(cur)
     has_drive_file_id = "drive_file_id" in columns
+    url_col = _music_cache_url_column(columns)
 
     try:
         files = await asyncio.to_thread(_drive_list_audio_files)
@@ -914,12 +929,12 @@ async def rebuild_database_from_drive(force: bool = False):
                     c.execute(
                         """
                         INSERT INTO music_cache
-                        (title, normalized_title, drive_file_id, drive_url, duration, added_at)
+                        (title, normalized_title, drive_file_id, {url_col}, duration, added_at)
                         SELECT ?, ?, ?, ?, ?, ?
                         WHERE NOT EXISTS (
                             SELECT 1 FROM music_cache WHERE drive_file_id = ?
                         )
-                        """,
+                        """.format(url_col=url_col),
                         (
                             title,
                             normalize(title),
@@ -934,12 +949,12 @@ async def rebuild_database_from_drive(force: bool = False):
                     c.execute(
                         """
                         INSERT INTO music_cache
-                        (title, normalized_title, drive_url, duration, added_at)
+                        (title, normalized_title, {url_col}, duration, added_at)
                         SELECT ?, ?, ?, ?, ?
                         WHERE NOT EXISTS (
-                            SELECT 1 FROM music_cache WHERE drive_url = ?
+                            SELECT 1 FROM music_cache WHERE {url_col} = ?
                         )
-                        """,
+                        """.format(url_col=url_col),
                         (
                             title,
                             normalize(title),
