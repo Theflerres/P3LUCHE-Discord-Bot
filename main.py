@@ -30,6 +30,7 @@ async def setup_hook():
     extensions = [
         "cogs.lore_ai",
         "cogs.moderacao",
+        "cogs.jukebox",
         "cogs.musica",
         "cogs.economia",
         "cogs.spotify",
