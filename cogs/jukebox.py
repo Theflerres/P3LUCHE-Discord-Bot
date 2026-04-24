@@ -1,5 +1,5 @@
 """
-Módulo de música v2 para P3LUCHE.
+Módulo de música v2 para P3LUCHE.(mudei pra jukebox pra n confundir com o musica.py que ja tem no bot, mas é um módulo completamente novo)
 
 Implementa:
 - Reprodução a partir do cache no banco (Google Drive URL)
