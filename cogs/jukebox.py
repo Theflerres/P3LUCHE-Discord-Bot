@@ -100,6 +100,14 @@ def _music_cache_url_column(columns: set[str]) -> str:
     raise RuntimeError("Tabela music_cache sem coluna de link (drive_url/drive_link).")
 
 
+def _music_cache_timestamp_column(columns: set[str]) -> str:
+    if "added_at" in columns:
+        return "added_at"
+    if "created_at" in columns:
+        return "created_at"
+    return ""
+
+
 def _get_drive_service():
     """Cria cliente do Google Drive (Service Account ou OAuth legado)."""
     creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
@@ -169,25 +177,44 @@ def _db_insert_music_cache(
     cur = conn.cursor()
     columns = _music_cache_columns(cur)
     url_col = _music_cache_url_column(columns)
+    ts_col = _music_cache_timestamp_column(columns)
     now_iso = datetime.utcnow().isoformat()
 
-    if "drive_file_id" in columns:
+    if "drive_file_id" in columns and ts_col:
         cur.execute(
             """
             INSERT INTO music_cache
-            (title, normalized_title, drive_file_id, {url_col}, duration, added_at)
+            (title, normalized_title, drive_file_id, {url_col}, duration, {ts_col})
             VALUES (?, ?, ?, ?, ?, ?)
-            """.format(url_col=url_col),
+            """.format(url_col=url_col, ts_col=ts_col),
             (title, normalized_title, drive_file_id, drive_url, int(duration or 0), now_iso),
+        )
+    elif "drive_file_id" in columns:
+        cur.execute(
+            """
+            INSERT INTO music_cache
+            (title, normalized_title, drive_file_id, {url_col}, duration)
+            VALUES (?, ?, ?, ?, ?)
+            """.format(url_col=url_col),
+            (title, normalized_title, drive_file_id, drive_url, int(duration or 0)),
+        )
+    elif ts_col:
+        cur.execute(
+            """
+            INSERT INTO music_cache
+            (title, normalized_title, {url_col}, duration, {ts_col})
+            VALUES (?, ?, ?, ?, ?)
+            """.format(url_col=url_col, ts_col=ts_col),
+            (title, normalized_title, drive_url, int(duration or 0), now_iso),
         )
     else:
         cur.execute(
             """
             INSERT INTO music_cache
-            (title, normalized_title, {url_col}, duration, added_at)
-            VALUES (?, ?, ?, ?, ?)
+            (title, normalized_title, {url_col}, duration)
+            VALUES (?, ?, ?, ?)
             """.format(url_col=url_col),
-            (title, normalized_title, drive_url, int(duration or 0), now_iso),
+            (title, normalized_title, drive_url, int(duration or 0)),
         )
     conn.commit()
 
@@ -432,6 +459,66 @@ class QueuePaginationView(discord.ui.View):
         await self._refresh(interaction)
 
 
+class CatalogSelect(discord.ui.Select):
+    def __init__(self, cog: "MusicaV2", interaction_user_id: int, items: list[dict[str, Any]]):
+        self.cog = cog
+        self.interaction_user_id = interaction_user_id
+        self.items = items
+        options = []
+        for idx, item in enumerate(items[:25], start=1):
+            title = (item["title"] or "Sem título")[:90]
+            options.append(
+                discord.SelectOption(
+                    label=f"{idx}. {title}",
+                    description=f"Duração: {_seconds_to_text(item.get('duration', 0))}",
+                    value=str(idx - 1),
+                )
+            )
+        super().__init__(
+            placeholder="Escolha uma música para tocar...",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.interaction_user_id:
+            await interaction.response.send_message(
+                embed=_music_embed("Ação não permitida", "Somente quem abriu o cardápio pode escolher.", COLOR_ERROR),
+                ephemeral=True,
+            )
+            return
+
+        if not interaction.guild:
+            await interaction.response.send_message(
+                embed=_music_embed("Sem servidor", "Este comando só funciona em servidor.", COLOR_ERROR),
+                ephemeral=True,
+            )
+            return
+
+        chosen = self.items[int(self.values[0])]
+        await interaction.response.defer(thinking=True)
+        voice = await self.cog._ensure_voice(interaction)
+        if not voice:
+            return
+
+        item = self.cog._item_from_row(chosen["_row"], interaction.user.display_name)
+        await self.cog._enqueue_and_start(interaction.guild, item, to_front=True)
+        await interaction.followup.send(
+            embed=_music_embed(
+                "Reprodução iniciada",
+                f"**{item.title}**\nDuração: `{_seconds_to_text(item.duration)}`",
+                COLOR_SUCCESS,
+            )
+        )
+
+
+class CatalogView(discord.ui.View):
+    def __init__(self, cog: "MusicaV2", interaction_user_id: int, items: list[dict[str, Any]]):
+        super().__init__(timeout=30)
+        self.add_item(CatalogSelect(cog, interaction_user_id, items))
+
+
 class MusicaV2(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -559,6 +646,14 @@ class MusicaV2(commands.Cog):
             origin="db",
         )
 
+    async def _enqueue_and_start(self, guild: discord.Guild, item: QueueItem, to_front: bool = False):
+        queue = self.queues.setdefault(guild.id, [])
+        if to_front:
+            queue.insert(0, item)
+        else:
+            queue.append(item)
+        await self._start_next_if_idle(guild)
+
     def _build_ffmpeg_source(self, item: QueueItem) -> discord.FFmpegPCMAudio:
         before_options = (
             "-nostdin "
@@ -633,6 +728,21 @@ class MusicaV2(commands.Cog):
             )
         return result
 
+    async def _tocar_autocomplete(
+        self,
+        interaction: discord.Interaction,
+        current: str,
+    ) -> list[app_commands.Choice[str]]:
+        del interaction
+        term = current.strip() if current else ""
+        results = await self._search_db(term, limit=25)
+        choices: list[app_commands.Choice[str]] = []
+        for item in results:
+            title = item["title"] or "Sem título"
+            label = f"{title} ({_seconds_to_text(item['duration'])})"
+            choices.append(app_commands.Choice(name=label[:100], value=title[:100]))
+        return choices
+
     async def save_external_track(self, url: str, info: dict[str, Any]):
         audio_path = None
         try:
@@ -654,11 +764,40 @@ class MusicaV2(commands.Cog):
                 except OSError:
                     pass
 
-    @app_commands.command(name="tocar", description="Toca uma música do banco (Drive).")
-    async def tocar(self, interaction: discord.Interaction, busca: str):
+    @app_commands.command(name="tocar", description="Toca uma música do banco (Drive). Sem busca, abre o cardápio.")
+    @app_commands.autocomplete(busca=_tocar_autocomplete)
+    async def tocar(self, interaction: discord.Interaction, busca: Optional[str] = None):
         await interaction.response.defer(thinking=True)
         voice = await self._ensure_voice(interaction)
         if not voice or not interaction.guild:
+            return
+
+        if not busca or not busca.strip():
+            matches = await self._search_db("", limit=25)
+            if not matches:
+                await interaction.followup.send(
+                    embed=_music_embed("Biblioteca vazia", "Nenhuma música disponível no cache.", COLOR_ERROR)
+                )
+                return
+
+            embed = _music_embed(
+                "Cardápio do Jukebox",
+                (
+                    "Escolha uma música no menu abaixo.\n\n"
+                    "**Como usar o Jukebox:**\n"
+                    "- `/tocar <nome>`: toca do cache do Drive.\n"
+                    "- `/tocar`: abre este cardápio automático.\n"
+                    "- `/adicionar <nome>`: adiciona na fila.\n"
+                    "- `/tocar_url <url>`: toca por link externo.\n"
+                    "- `/fila`, `/pular`, `/pausar`, `/retomar`, `/parar`."
+                ),
+                COLOR_INFO,
+            )
+            await interaction.followup.send(
+                embed=embed,
+                view=CatalogView(self, interaction.user.id, matches),
+                ephemeral=True,
+            )
             return
 
         matches = await self._search_db(busca, limit=5)
@@ -689,14 +828,34 @@ class MusicaV2(commands.Cog):
                 return
 
         item = self._item_from_row(chosen["_row"], interaction.user.display_name)
-        self.queues.setdefault(interaction.guild.id, []).insert(0, item)
-        await self._start_next_if_idle(interaction.guild)
+        await self._enqueue_and_start(interaction.guild, item, to_front=True)
         await interaction.followup.send(
             embed=_music_embed(
                 "Reprodução iniciada",
                 f"**{item.title}**\nDuração: `{_seconds_to_text(item.duration)}`",
                 COLOR_SUCCESS,
             )
+        )
+
+    @app_commands.command(name="cardapio", description="Mostra um cardápio para escolher música do Drive.")
+    async def cardapio(self, interaction: discord.Interaction):
+        await interaction.response.defer(thinking=True, ephemeral=True)
+        matches = await self._search_db("", limit=25)
+        if not matches:
+            await interaction.followup.send(
+                embed=_music_embed("Biblioteca vazia", "Nenhuma música disponível no cache.", COLOR_ERROR),
+                ephemeral=True,
+            )
+            return
+
+        desc = "\n".join(
+            f"**{idx}.** {item['title']} `({_seconds_to_text(item['duration'])})`"
+            for idx, item in enumerate(matches, start=1)
+        )
+        await interaction.followup.send(
+            embed=_music_embed("Cardápio de músicas", desc, COLOR_INFO),
+            view=CatalogView(self, interaction.user.id, matches),
+            ephemeral=True,
         )
 
     @app_commands.command(name="tocar_url", description="Toca uma URL externa com yt-dlp.")
@@ -740,6 +899,7 @@ class MusicaV2(commands.Cog):
         )
 
     @app_commands.command(name="adicionar", description="Adiciona música do banco à fila.")
+    @app_commands.autocomplete(busca=_tocar_autocomplete)
     async def adicionar(self, interaction: discord.Interaction, busca: str):
         await interaction.response.defer(thinking=True, ephemeral=True)
         if not interaction.guild:
@@ -752,12 +912,11 @@ class MusicaV2(commands.Cog):
             )
             return
         item = self._item_from_row(matches[0]["_row"], interaction.user.display_name)
-        self.queues.setdefault(interaction.guild.id, []).append(item)
+        await self._enqueue_and_start(interaction.guild, item, to_front=False)
         await interaction.followup.send(
             embed=_music_embed("Adicionada na fila", f"**{item.title}** foi adicionada com sucesso.", COLOR_SUCCESS),
             ephemeral=True,
         )
-        await self._start_next_if_idle(interaction.guild)
 
     @app_commands.command(name="adicionar_url", description="Adiciona uma URL externa à fila.")
     async def adicionar_url(self, interaction: discord.Interaction, url: str):
@@ -909,6 +1068,7 @@ async def rebuild_database_from_drive(force: bool = False):
     columns = _music_cache_columns(cur)
     has_drive_file_id = "drive_file_id" in columns
     url_col = _music_cache_url_column(columns)
+    ts_col = _music_cache_timestamp_column(columns)
 
     try:
         files = await asyncio.to_thread(_drive_list_audio_files)
@@ -925,45 +1085,57 @@ async def rebuild_database_from_drive(force: bool = False):
 
             def _insert_or_ignore():
                 c = conn.cursor()
+                now_iso = datetime.utcnow().isoformat()
                 if has_drive_file_id:
-                    c.execute(
-                        """
-                        INSERT INTO music_cache
-                        (title, normalized_title, drive_file_id, {url_col}, duration, added_at)
-                        SELECT ?, ?, ?, ?, ?, ?
-                        WHERE NOT EXISTS (
-                            SELECT 1 FROM music_cache WHERE drive_file_id = ?
+                    if ts_col:
+                        c.execute(
+                            """
+                            INSERT INTO music_cache
+                            (title, normalized_title, drive_file_id, {url_col}, duration, {ts_col})
+                            SELECT ?, ?, ?, ?, ?, ?
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM music_cache WHERE drive_file_id = ?
+                            )
+                            """.format(url_col=url_col, ts_col=ts_col),
+                            (title, normalize(title), file_id, drive_url, 0, now_iso, file_id),
                         )
-                        """.format(url_col=url_col),
-                        (
-                            title,
-                            normalize(title),
-                            file_id,
-                            drive_url,
-                            0,
-                            datetime.utcnow().isoformat(),
-                            file_id,
-                        ),
-                    )
+                    else:
+                        c.execute(
+                            """
+                            INSERT INTO music_cache
+                            (title, normalized_title, drive_file_id, {url_col}, duration)
+                            SELECT ?, ?, ?, ?, ?
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM music_cache WHERE drive_file_id = ?
+                            )
+                            """.format(url_col=url_col),
+                            (title, normalize(title), file_id, drive_url, 0, file_id),
+                        )
                 else:
-                    c.execute(
-                        """
-                        INSERT INTO music_cache
-                        (title, normalized_title, {url_col}, duration, added_at)
-                        SELECT ?, ?, ?, ?, ?
-                        WHERE NOT EXISTS (
-                            SELECT 1 FROM music_cache WHERE {url_col} = ?
+                    if ts_col:
+                        c.execute(
+                            """
+                            INSERT INTO music_cache
+                            (title, normalized_title, {url_col}, duration, {ts_col})
+                            SELECT ?, ?, ?, ?, ?
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM music_cache WHERE {url_col} = ?
+                            )
+                            """.format(url_col=url_col, ts_col=ts_col),
+                            (title, normalize(title), drive_url, 0, now_iso, drive_url),
                         )
-                        """.format(url_col=url_col),
-                        (
-                            title,
-                            normalize(title),
-                            drive_url,
-                            0,
-                            datetime.utcnow().isoformat(),
-                            drive_url,
-                        ),
-                    )
+                    else:
+                        c.execute(
+                            """
+                            INSERT INTO music_cache
+                            (title, normalized_title, {url_col}, duration)
+                            SELECT ?, ?, ?, ?
+                            WHERE NOT EXISTS (
+                                SELECT 1 FROM music_cache WHERE {url_col} = ?
+                            )
+                            """.format(url_col=url_col),
+                            (title, normalize(title), drive_url, 0, drive_url),
+                        )
                 conn.commit()
                 return c.rowcount
 
