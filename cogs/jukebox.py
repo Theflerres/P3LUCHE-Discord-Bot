@@ -26,12 +26,21 @@ from typing import Any, Optional
 import discord
 from discord import app_commands
 from discord.ext import commands
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
 from google.oauth2 import service_account
+from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 from yt_dlp import YoutubeDL
 
-from config import JUKEBOX_DRIVE_FOLDER_ID, get_bot_instance, set_bot_instance
+from config import (
+    CLIENT_SECRET_FILE,
+    CREDENTIALS_PATH,
+    JUKEBOX_DRIVE_FOLDER_ID,
+    get_bot_instance,
+    set_bot_instance,
+)
 from utils import log_to_gui
 
 
@@ -80,32 +89,52 @@ def _get_db_conn() -> sqlite3.Connection:
 
 
 def _get_drive_service():
-    """Cria cliente do Google Drive via Service Account em env."""
+    """Cria cliente do Google Drive (Service Account ou OAuth legado)."""
     creds_json = os.getenv("GOOGLE_CREDENTIALS_JSON", "").strip()
-    if not creds_json:
-        raise RuntimeError("GOOGLE_CREDENTIALS_JSON não definido.")
+    scopes = ["https://www.googleapis.com/auth/drive"]
 
-    try:
-        info = json.loads(creds_json)
-    except json.JSONDecodeError:
-        if os.path.exists(creds_json):
-            with open(creds_json, "r", encoding="utf-8") as file:
-                info = json.load(file)
+    if creds_json:
+        try:
+            info = json.loads(creds_json)
+        except json.JSONDecodeError:
+            if os.path.exists(creds_json):
+                with open(creds_json, "r", encoding="utf-8") as file:
+                    info = json.load(file)
+            else:
+                raise RuntimeError("GOOGLE_CREDENTIALS_JSON inválido (JSON/path).")
+
+        credentials = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        return build("drive", "v3", credentials=credentials)
+
+    # Fallback compatível com fluxo OAuth já usado no projeto.
+    creds = None
+    if os.path.exists(CREDENTIALS_PATH):
+        creds = Credentials.from_authorized_user_file(CREDENTIALS_PATH, scopes)
+
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
         else:
-            raise RuntimeError("GOOGLE_CREDENTIALS_JSON inválido (JSON/path).")
+            if not os.path.exists(CLIENT_SECRET_FILE):
+                raise RuntimeError(
+                    "GOOGLE_CREDENTIALS_JSON não definido e client_secret.json não encontrado."
+                )
+            flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, scopes)
+            creds = flow.run_local_server(port=0)
+        with open(CREDENTIALS_PATH, "w", encoding="utf-8") as token_file:
+            token_file.write(creds.to_json())
 
-    credentials = service_account.Credentials.from_service_account_info(
-        info, scopes=["https://www.googleapis.com/auth/drive"]
-    )
-    return build("drive", "v3", credentials=credentials)
+    return build("drive", "v3", credentials=creds)
 
 
 def _db_fetch_music_candidates(normalized_query: str, limit: int = 5) -> list[sqlite3.Row | tuple]:
     conn = _get_db_conn()
     cur = conn.cursor()
+    columns = [row[1] for row in cur.execute("PRAGMA table_info(music_cache)").fetchall()]
+    drive_file_select = "drive_file_id" if "drive_file_id" in columns else "NULL AS drive_file_id"
     cur.execute(
-        """
-        SELECT id, title, normalized_title, drive_file_id, drive_url, duration
+        f"""
+        SELECT id, title, normalized_title, {drive_file_select}, drive_url, duration
         FROM music_cache
         WHERE normalized_title LIKE ?
         ORDER BY title COLLATE NOCASE
@@ -125,14 +154,27 @@ def _db_insert_music_cache(
 ):
     conn = _get_db_conn()
     cur = conn.cursor()
-    cur.execute(
-        """
-        INSERT INTO music_cache
-        (title, normalized_title, drive_file_id, drive_url, duration, added_at)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        (title, normalized_title, drive_file_id, drive_url, int(duration or 0), datetime.utcnow().isoformat()),
-    )
+    columns = {row[1] for row in cur.execute("PRAGMA table_info(music_cache)").fetchall()}
+    now_iso = datetime.utcnow().isoformat()
+
+    if "drive_file_id" in columns:
+        cur.execute(
+            """
+            INSERT INTO music_cache
+            (title, normalized_title, drive_file_id, drive_url, duration, added_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (title, normalized_title, drive_file_id, drive_url, int(duration or 0), now_iso),
+        )
+    else:
+        cur.execute(
+            """
+            INSERT INTO music_cache
+            (title, normalized_title, drive_url, duration, added_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (title, normalized_title, drive_url, int(duration or 0), now_iso),
+        )
     conn.commit()
 
 
@@ -798,6 +840,8 @@ async def rebuild_database_from_drive(force: bool = False):
     """Varre o Google Drive em busca de arquivos de áudio e reconstrói/atualiza o music_cache."""
     conn = _get_db_conn()
     cur = conn.cursor()
+    columns = {row[1] for row in cur.execute("PRAGMA table_info(music_cache)").fetchall()}
+    has_drive_file_id = "drive_file_id" in columns
 
     try:
         files = await asyncio.to_thread(_drive_list_audio_files)
@@ -814,25 +858,45 @@ async def rebuild_database_from_drive(force: bool = False):
 
             def _insert_or_ignore():
                 c = conn.cursor()
-                c.execute(
-                    """
-                    INSERT INTO music_cache
-                    (title, normalized_title, drive_file_id, drive_url, duration, added_at)
-                    SELECT ?, ?, ?, ?, ?, ?
-                    WHERE NOT EXISTS (
-                        SELECT 1 FROM music_cache WHERE drive_file_id = ?
+                if has_drive_file_id:
+                    c.execute(
+                        """
+                        INSERT INTO music_cache
+                        (title, normalized_title, drive_file_id, drive_url, duration, added_at)
+                        SELECT ?, ?, ?, ?, ?, ?
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM music_cache WHERE drive_file_id = ?
+                        )
+                        """,
+                        (
+                            title,
+                            normalize(title),
+                            file_id,
+                            drive_url,
+                            0,
+                            datetime.utcnow().isoformat(),
+                            file_id,
+                        ),
                     )
-                    """,
-                    (
-                        title,
-                        normalize(title),
-                        file_id,
-                        drive_url,
-                        0,
-                        datetime.utcnow().isoformat(),
-                        file_id,
-                    ),
-                )
+                else:
+                    c.execute(
+                        """
+                        INSERT INTO music_cache
+                        (title, normalized_title, drive_url, duration, added_at)
+                        SELECT ?, ?, ?, ?, ?
+                        WHERE NOT EXISTS (
+                            SELECT 1 FROM music_cache WHERE drive_url = ?
+                        )
+                        """,
+                        (
+                            title,
+                            normalize(title),
+                            drive_url,
+                            0,
+                            datetime.utcnow().isoformat(),
+                            drive_url,
+                        ),
+                    )
                 conn.commit()
                 return c.rowcount
 
