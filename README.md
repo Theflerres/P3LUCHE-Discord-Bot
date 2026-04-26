@@ -8,6 +8,15 @@ A v6.0 marca a transição para uma interface nativa, eliminando a dependência 
 
 ---
 
+# 🧸 PelucheGPT v6.0
+> **A Inteligência Artificial Definitiva para Gestão de Lore e Comunidades de RPG.**
+
+![Python](https://img.shields.io/badge/python-3.13-blue.svg)
+![Tauri](https://img.shields.io/badge/Tauri-Desktop-orange.svg)
+![LLM](https://img.shields.io/badge/AI-Híbrida-red.svg)
+![Status](https://img.shields.io/badge/Status-Em%20Produção-green.svg)
+
+
 ## 🛠️ Stack Tecnológica de Elite
 
 O projeto utiliza uma arquitetura moderna de sistemas distribuídos:
@@ -49,8 +58,10 @@ peluchegpt/
 │   └── src/            # UI da aplicação
 └── database/           # (Local) Persistência de dados e logs (Ignorado no Git)
 
+---
 
-📊 Exemplo de Fluxo (Lore Diff)
+
+## 📊 Exemplo de Fluxo (Lore Diff)
 --- Versão Antiga (2024-10-15)
 +++ Versão Atual
 @@ -12,4 +12,4 @@
