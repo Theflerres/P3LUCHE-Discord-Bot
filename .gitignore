@@ -1,17 +1,22 @@
-# Arquivos de Ambiente
+# Ignorar em qualquer lugar do projeto (Recursivo)
+**/node_modules/
+**/target/
+**/__pycache__/
+**/*.pyc
+**/.venv/
+
+# Específicos do seu projeto
+peluchegpt/frontend/node_modules/
+peluchegpt/frontend/src-tauri/target/
+peluchegpt/backend/__pycache__/
+
+# Ambiente e Segredos
 .env
-credentials.json
-client_secret.json
+*.json
+!package.json
+!composer.json
 
-# Banco de Dados e Logs
-*.db
+# Ignorar o Banco de Dados
 database/
-logs/
-
-# Arquivos Temporários do Python
-__pycache__/
-*.pyc
-
-# Arquivos de Sistema
-.DS_Store
-Thumbs.db
+*.db
+*.sqlite

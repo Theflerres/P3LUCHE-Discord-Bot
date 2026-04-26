@@ -4,50 +4,688 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>PelucheGPT</title>
-    <link rel="stylesheet" href="./style.css" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@400;600;800&display=swap" rel="stylesheet" />
+    <style>
+      :root {
+        --bg: #080810;
+        --bg2: #0f0f1a;
+        --bg3: #141425;
+        --border: #1e1e35;
+        --purple: #7c3aed;
+        --purple-light: #a78bfa;
+        --purple-dim: #2d1b69;
+        --green: #10b981;
+        --blue: #3b82f6;
+        --red: #ef4444;
+        --yellow: #f59e0b;
+        --text: #e2e8f0;
+        --text-dim: #64748b;
+        --font-main: 'Syne', sans-serif;
+        --font-mono: 'JetBrains Mono', monospace;
+      }
+
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+
+      body {
+        font-family: var(--font-main);
+        background: var(--bg);
+        color: var(--text);
+        height: 100vh;
+        overflow: hidden;
+        display: flex;
+      }
+
+      /* ── SIDEBAR ── */
+      .sidebar {
+        width: 220px;
+        min-width: 220px;
+        background: var(--bg2);
+        border-right: 1px solid var(--border);
+        display: flex;
+        flex-direction: column;
+        padding: 24px 16px;
+        gap: 6px;
+      }
+
+      .sidebar-logo {
+        font-size: 20px;
+        font-weight: 800;
+        color: var(--purple-light);
+        letter-spacing: -0.5px;
+        margin-bottom: 24px;
+        padding-bottom: 16px;
+        border-bottom: 1px solid var(--border);
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .sidebar-logo span { font-size: 22px; }
+
+      .tab-btn {
+        background: transparent;
+        border: none;
+        color: var(--text-dim);
+        font-family: var(--font-main);
+        font-size: 13px;
+        font-weight: 600;
+        padding: 10px 14px;
+        border-radius: 8px;
+        cursor: pointer;
+        text-align: left;
+        transition: all 0.15s;
+        letter-spacing: 0.3px;
+      }
+
+      .tab-btn:hover { background: var(--bg3); color: var(--text); }
+      .tab-btn.active { background: var(--purple-dim); color: var(--purple-light); }
+
+      /* Bot control no final da sidebar */
+      .sidebar-footer {
+        margin-top: auto;
+        padding-top: 16px;
+        border-top: 1px solid var(--border);
+      }
+
+      .bot-status-bar {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 8px 12px;
+        border-radius: 8px;
+        background: var(--bg3);
+        margin-bottom: 8px;
+        font-size: 12px;
+        font-weight: 600;
+        font-family: var(--font-mono);
+      }
+
+      .status-dot {
+        width: 8px; height: 8px;
+        border-radius: 50%;
+        background: var(--text-dim);
+        transition: background 0.3s;
+        flex-shrink: 0;
+      }
+      .status-dot.online { background: var(--green); box-shadow: 0 0 6px var(--green); }
+      .status-dot.offline { background: var(--red); }
+      .status-dot.loading { background: var(--yellow); animation: pulse 1s infinite; }
+
+      @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+
+      .bot-toggle-btn {
+        width: 100%;
+        padding: 10px;
+        border-radius: 8px;
+        border: 1px solid var(--border);
+        background: var(--bg3);
+        color: var(--text);
+        font-family: var(--font-main);
+        font-size: 13px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.15s;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+      }
+
+      .bot-toggle-btn:hover { border-color: var(--purple); color: var(--purple-light); }
+      .bot-toggle-btn.running { border-color: var(--red); color: #fca5a5; }
+      .bot-toggle-btn.running:hover { background: #1f0a0a; }
+      .bot-toggle-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+      /* ── CONTENT ── */
+      .content {
+        flex: 1;
+        display: flex;
+        flex-direction: column;
+        overflow: hidden;
+      }
+
+      .tab { display: none; flex-direction: column; height: 100%; overflow: hidden; }
+      .tab.active { display: flex; }
+
+      /* ── CHAT ── */
+      .toolbar {
+        display: flex;
+        gap: 8px;
+        padding: 12px 16px;
+        border-bottom: 1px solid var(--border);
+        background: var(--bg2);
+        flex-shrink: 0;
+      }
+
+      .toolbar button {
+        background: var(--bg3);
+        border: 1px solid var(--border);
+        color: var(--text-dim);
+        font-family: var(--font-main);
+        font-size: 12px;
+        font-weight: 600;
+        padding: 6px 14px;
+        border-radius: 6px;
+        cursor: pointer;
+        transition: all 0.15s;
+      }
+      .toolbar button:hover { border-color: var(--purple); color: var(--purple-light); }
+
+      .chat-messages {
+        flex: 1;
+        overflow-y: auto;
+        padding: 20px 24px;
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
+      }
+
+      .message { display: flex; }
+      .message.user { justify-content: flex-end; }
+      .message.assistant { justify-content: flex-start; }
+
+      .bubble {
+        max-width: 70%;
+        padding: 12px 16px;
+        border-radius: 12px;
+        font-size: 14px;
+        line-height: 1.6;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+
+      .message.user .bubble {
+        background: var(--purple);
+        color: #fff;
+        border-bottom-right-radius: 3px;
+      }
+
+      .message.assistant .bubble {
+        background: var(--bg3);
+        border: 1px solid var(--border);
+        border-bottom-left-radius: 3px;
+        color: var(--text);
+      }
+
+      .badges {
+        display: flex;
+        gap: 6px;
+        margin-top: 8px;
+        flex-wrap: wrap;
+      }
+
+      .badge {
+        font-family: var(--font-mono);
+        font-size: 10px;
+        font-weight: 600;
+        padding: 2px 8px;
+        border-radius: 4px;
+        letter-spacing: 0.5px;
+      }
+
+      .badge.local { background: #052e16; color: var(--green); border: 1px solid #166534; }
+      .badge.gemini { background: #1e3a5f; color: #93c5fd; border: 1px solid #1d4ed8; }
+      .badge.tokens { background: var(--bg2); color: var(--text-dim); border: 1px solid var(--border); }
+
+      .typing {
+        padding: 0 24px 8px;
+        font-size: 12px;
+        color: var(--text-dim);
+        font-family: var(--font-mono);
+        flex-shrink: 0;
+      }
+      .typing.hidden { display: none; }
+
+      .chat-form {
+        display: flex;
+        gap: 8px;
+        padding: 12px 16px;
+        border-top: 1px solid var(--border);
+        background: var(--bg2);
+        flex-shrink: 0;
+      }
+
+      .chat-form input {
+        flex: 1;
+        background: var(--bg3);
+        border: 1px solid var(--border);
+        color: var(--text);
+        font-family: var(--font-main);
+        font-size: 14px;
+        padding: 10px 16px;
+        border-radius: 8px;
+        outline: none;
+        transition: border-color 0.15s;
+      }
+      .chat-form input:focus { border-color: var(--purple); }
+      .chat-form input::placeholder { color: var(--text-dim); }
+
+      .chat-form button {
+        background: var(--purple);
+        border: none;
+        color: #fff;
+        font-family: var(--font-main);
+        font-size: 14px;
+        font-weight: 600;
+        padding: 10px 20px;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: opacity 0.15s;
+      }
+      .chat-form button:hover { opacity: 0.85; }
+
+      /* ── PAINEL ── */
+      .painel-content {
+        flex: 1;
+        overflow-y: auto;
+        padding: 24px;
+        display: grid;
+        grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+        gap: 16px;
+        align-content: start;
+      }
+
+      .stat-card {
+        background: var(--bg2);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 20px;
+      }
+
+      .stat-card h3 {
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--text-dim);
+        letter-spacing: 1px;
+        text-transform: uppercase;
+        margin-bottom: 8px;
+      }
+
+      .stat-card .value {
+        font-size: 28px;
+        font-weight: 800;
+        color: var(--purple-light);
+        font-family: var(--font-mono);
+      }
+
+      .stat-card .sub {
+        font-size: 12px;
+        color: var(--text-dim);
+        margin-top: 4px;
+      }
+
+      /* Bot log no painel */
+      .bot-log {
+        grid-column: 1 / -1;
+        background: var(--bg2);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 20px;
+      }
+
+      .bot-log h3 {
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--text-dim);
+        letter-spacing: 1px;
+        text-transform: uppercase;
+        margin-bottom: 12px;
+      }
+
+      #bot-log-content {
+        font-family: var(--font-mono);
+        font-size: 12px;
+        color: var(--text-dim);
+        height: 180px;
+        overflow-y: auto;
+        line-height: 1.8;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
+      }
+
+      #bot-log-content .log-line { padding: 1px 0; }
+      #bot-log-content .log-info { color: #60a5fa; }
+      #bot-log-content .log-warn { color: var(--yellow); }
+      #bot-log-content .log-error { color: var(--red); }
+      #bot-log-content .log-ok { color: var(--green); }
+
+      /* ── LORE ── */
+      .lore-content {
+        flex: 1;
+        overflow-y: auto;
+        padding: 16px 24px;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
+      }
+
+      .lore-entry {
+        background: var(--bg2);
+        border: 1px solid var(--border);
+        border-radius: 10px;
+        padding: 16px;
+        margin-bottom: 10px;
+        transition: border-color 0.15s;
+      }
+      .lore-entry:hover { border-color: var(--purple-dim); }
+
+      .lore-entry strong {
+        font-size: 14px;
+        font-weight: 600;
+        color: var(--purple-light);
+        display: block;
+        margin-bottom: 6px;
+      }
+
+      .lore-entry small {
+        font-size: 12px;
+        color: var(--text-dim);
+        line-height: 1.5;
+      }
+
+      /* ── CONFIG ── */
+      .config-content {
+        flex: 1;
+        overflow-y: auto;
+        padding: 24px;
+        scrollbar-width: thin;
+        scrollbar-color: var(--border) transparent;
+      }
+
+      .config-section {
+        background: var(--bg2);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        padding: 24px;
+        margin-bottom: 16px;
+      }
+
+      .config-section h3 {
+        font-size: 11px;
+        font-weight: 600;
+        color: var(--text-dim);
+        letter-spacing: 1px;
+        text-transform: uppercase;
+        margin-bottom: 20px;
+        padding-bottom: 12px;
+        border-bottom: 1px solid var(--border);
+      }
+
+      .config-field {
+        margin-bottom: 16px;
+      }
+
+      .config-field label {
+        display: block;
+        font-size: 13px;
+        font-weight: 600;
+        color: var(--text);
+        margin-bottom: 6px;
+      }
+
+      .config-field .hint {
+        font-size: 11px;
+        color: var(--text-dim);
+        margin-top: 4px;
+        font-family: var(--font-mono);
+      }
+
+      .config-field input[type="text"],
+      .config-field input[type="password"],
+      .config-field input[type="number"] {
+        width: 100%;
+        background: var(--bg3);
+        border: 1px solid var(--border);
+        color: var(--text);
+        font-family: var(--font-mono);
+        font-size: 13px;
+        padding: 10px 14px;
+        border-radius: 8px;
+        outline: none;
+        transition: border-color 0.15s;
+      }
+
+      .config-field input:focus { border-color: var(--purple); }
+
+      .config-field input[type="range"] {
+        width: 100%;
+        accent-color: var(--purple);
+        margin-top: 4px;
+      }
+
+      .range-display {
+        font-family: var(--font-mono);
+        font-size: 13px;
+        color: var(--purple-light);
+        font-weight: 600;
+        margin-top: 4px;
+      }
+
+      .config-field .toggle-wrap {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+      }
+
+      .eye-btn {
+        background: var(--bg3);
+        border: 1px solid var(--border);
+        color: var(--text-dim);
+        padding: 10px 12px;
+        border-radius: 8px;
+        cursor: pointer;
+        font-size: 14px;
+        transition: all 0.15s;
+        flex-shrink: 0;
+      }
+      .eye-btn:hover { border-color: var(--purple); color: var(--purple-light); }
+
+      .config-save-btn {
+        width: 100%;
+        background: var(--purple);
+        border: none;
+        color: #fff;
+        font-family: var(--font-main);
+        font-size: 14px;
+        font-weight: 700;
+        padding: 12px;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: opacity 0.15s;
+        margin-top: 8px;
+        letter-spacing: 0.5px;
+      }
+      .config-save-btn:hover { opacity: 0.85; }
+
+      .save-feedback {
+        text-align: center;
+        font-size: 12px;
+        font-weight: 600;
+        margin-top: 8px;
+        height: 18px;
+        transition: color 0.3s;
+      }
+      .save-feedback.ok { color: var(--green); }
+      .save-feedback.err { color: var(--red); }
+
+      /* Scrollbar global */
+      ::-webkit-scrollbar { width: 5px; }
+      ::-webkit-scrollbar-track { background: transparent; }
+      ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+    </style>
   </head>
   <body>
-    <!-- Layout principal com sidebar e conteúdo em abas -->
-    <div class="app">
+    <div class="app" style="display:flex;width:100%;height:100vh;">
+
+      <!-- SIDEBAR -->
       <aside class="sidebar">
-        <h1>PelucheGPT</h1>
-        <button class="tab-btn active" data-tab="chat">💬 PelucheGPT</button>
+        <div class="sidebar-logo"><span>🧸</span> PelucheGPT</div>
+
+        <button class="tab-btn active" data-tab="chat">💬 Chat</button>
         <button class="tab-btn" data-tab="painel">📊 Painel</button>
         <button class="tab-btn" data-tab="lore">📜 Lore</button>
         <button class="tab-btn" data-tab="config">⚙️ Configurações</button>
+
+        <div class="sidebar-footer">
+          <div class="bot-status-bar">
+            <div class="status-dot" id="bot-dot"></div>
+            <span id="bot-status-text">offline</span>
+          </div>
+          <button class="bot-toggle-btn" id="bot-toggle-btn" onclick="toggleBot()">
+            <span id="bot-btn-icon">▶</span>
+            <span id="bot-btn-label">Ligar Bot</span>
+          </button>
+        </div>
       </aside>
 
+      <!-- CONTENT -->
       <main class="content">
+
+        <!-- CHAT -->
         <section id="chat" class="tab active">
           <div class="toolbar">
-            <button id="reindex-btn">Reindexar Lore</button>
-            <button id="clear-history-btn">Limpar histórico</button>
+            <button id="reindex-btn">⟳ Reindexar Lore</button>
+            <button id="clear-history-btn">🗑 Limpar histórico</button>
           </div>
           <div id="chat-messages" class="chat-messages"></div>
-          <div id="typing-indicator" class="typing hidden">Digitando...</div>
+          <div id="typing-indicator" class="typing hidden">⏳ Pensando...</div>
           <form id="chat-form" class="chat-form">
-            <input id="chat-input" type="text" placeholder="Pergunte algo ao PelucheGPT..." />
+            <input id="chat-input" type="text" placeholder="Pergunte algo ao PelucheGPT..." autocomplete="off" />
             <button type="submit">Enviar</button>
           </form>
         </section>
 
+        <!-- PAINEL -->
         <section id="painel" class="tab">
-          <h2>Estatísticas do Bot</h2>
-          <pre id="bot-stats" class="card">Carregando...</pre>
+          <div class="painel-content" id="painel-content">
+            <div class="stat-card">
+              <h3>Usuários registrados</h3>
+              <div class="value" id="stat-users">—</div>
+              <div class="sub">na economia do bot</div>
+            </div>
+            <div class="stat-card">
+              <h3>Entradas de Lore</h3>
+              <div class="value" id="stat-lore">—</div>
+              <div class="sub">indexadas no ChromaDB</div>
+            </div>
+            <div class="stat-card">
+              <h3>Advertências ativas</h3>
+              <div class="value" id="stat-warns">—</div>
+              <div class="sub">warns não revogados</div>
+            </div>
+            <div class="stat-card">
+              <h3>Músicas no Drive</h3>
+              <div class="value" id="stat-music">—</div>
+              <div class="sub">no cache do Jukebox</div>
+            </div>
+            <div class="bot-log">
+              <h3>📟 Log do Bot Discord</h3>
+              <div id="bot-log-content">
+                <div class="log-line log-info">Aguardando bot iniciar...</div>
+              </div>
+            </div>
+          </div>
         </section>
 
+        <!-- LORE -->
         <section id="lore" class="tab">
           <div class="toolbar">
-            <input id="lore-search" type="text" placeholder="Buscar no lore..." />
+            <input id="lore-search" type="text" placeholder="Buscar no lore..." style="background:var(--bg3);border:1px solid var(--border);color:var(--text);font-family:var(--font-main);font-size:13px;padding:6px 14px;border-radius:6px;outline:none;flex:1;" />
             <button id="lore-refresh-btn">Atualizar</button>
           </div>
-          <div id="lore-table" class="card"></div>
+          <div class="lore-content" id="lore-table">Carregando...</div>
         </section>
 
+        <!-- CONFIG -->
         <section id="config" class="tab">
-          <h2>Configurações</h2>
-          <form id="config-form" class="config-form"></form>
+          <div class="config-content">
+
+            <div class="config-section">
+              <h3>🤖 Inteligência Artificial</h3>
+
+              <div class="config-field">
+                <label>Chave API do Gemini</label>
+                <div class="toggle-wrap">
+                  <input type="password" id="cfg-gemini-key" placeholder="AIza..." />
+                  <button class="eye-btn" onclick="togglePassword('cfg-gemini-key', this)">👁</button>
+                </div>
+                <div class="hint">Mesma chave do seu .env — usada apenas pra respostas complexas</div>
+              </div>
+
+              <div class="config-field">
+                <label>Threshold Local → Gemini</label>
+                <input type="range" id="cfg-threshold" min="0" max="100" value="70"
+                  oninput="document.getElementById('cfg-threshold-val').textContent = this.value + '%'" />
+                <div class="range-display"><span id="cfg-threshold-val">70%</span> de confiança mínima pra usar o modelo local</div>
+                <div class="hint">Quanto maior, mais perguntas vão pro Gemini (mais tokens gastos)</div>
+              </div>
+            </div>
+
+            <div class="config-section">
+              <h3>🖥️ Ollama / Hardware</h3>
+
+              <div class="config-field">
+                <label>Camadas na GPU (num_gpu)</label>
+                <input type="number" id="cfg-num-gpu" min="0" max="35" value="12" />
+                <div class="hint">0 = só CPU | 12 = híbrido (recomendado GTX 1650) | 35 = full GPU</div>
+              </div>
+
+              <div class="config-field">
+                <label>Threads da CPU (num_threads)</label>
+                <input type="number" id="cfg-num-threads" min="1" max="12" value="5" />
+                <div class="hint">i5-10400F tem 12 threads — deixe pelo menos 6 livres pra jogos</div>
+              </div>
+
+              <div class="config-field">
+                <label>Tamanho do contexto (num_ctx)</label>
+                <input type="number" id="cfg-num-ctx" min="512" max="8192" value="2048" />
+                <div class="hint">Tokens de contexto por resposta — maior = mais RAM usada</div>
+              </div>
+            </div>
+
+            <div class="config-section">
+              <h3>🤖 Bot Discord</h3>
+
+              <div class="config-field">
+                <label>Token do Bot Discord</label>
+                <div class="toggle-wrap">
+                  <input type="password" id="cfg-discord-token" placeholder="MT..." />
+                  <button class="eye-btn" onclick="togglePassword('cfg-discord-token', this)">👁</button>
+                </div>
+                <div class="hint">Token do painel do Discord Developer Portal</div>
+              </div>
+
+              <div class="config-field">
+                <label>Caminho do Python (.venv)</label>
+                <input type="text" id="cfg-python-path" placeholder="C:/P3-LUCH3/.venv/Scripts/python.exe" />
+                <div class="hint">Python do ambiente virtual do bot — necessário pra ligar o bot pelo PelucheGPT</div>
+              </div>
+
+              <div class="config-field">
+                <label>Caminho do bot (main.py)</label>
+                <input type="text" id="cfg-bot-path" placeholder="C:/P3-LUCH3/main.py" />
+                <div class="hint">Caminho completo do main.py do P3LUCHE</div>
+              </div>
+            </div>
+
+            <div class="config-section">
+              <h3>☁️ Google Drive</h3>
+
+              <div class="config-field">
+                <label>ID da Pasta do Drive</label>
+                <input type="text" id="cfg-drive-folder" placeholder="1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs..." />
+                <div class="hint">ID da pasta raiz do P3LUCHE no Google Drive</div>
+              </div>
+            </div>
+
+            <button class="config-save-btn" onclick="saveConfig()">💾 Salvar Configurações</button>
+            <div class="save-feedback" id="save-feedback"></div>
+
+          </div>
         </section>
+
       </main>
     </div>
 

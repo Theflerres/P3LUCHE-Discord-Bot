@@ -1,7 +1,7 @@
 """Configurações centrais do PelucheGPT."""
 from __future__ import annotations
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +14,7 @@ INDEX_META_PATH = APP_DIR / "index_meta.json"
 @dataclass
 class AppConfig:
     """Representa todas as opções de configuração editáveis na UI."""
-    sqlite_path: str = "C:/P3-LUCH3/cogs/bot.db"
+    sqlite_path: str = "C:/P3-LUCH3/database/bot.db"
     gemini_api_key: str = ""
     ollama_model: str = "phi3:mini"
     ollama_url: str = "http://localhost:11434"
@@ -25,6 +25,11 @@ class AppConfig:
     complexity_threshold: float = 0.7
     max_context_chunks: int = 5
     theme: str = "dark"
+    # Novos campos — controle do bot e integração
+    discord_token: str = ""
+    bot_path: str = "C:/P3-LUCH3/main.py"
+    drive_folder_id: str = ""
+    python_path: str = "C:/P3-LUCH3/.venv/Scripts/python.exe"
 
 def _ensure_base_files() -> None:
     """Garante a estrutura mínima de diretórios e arquivos do app."""
@@ -41,8 +46,8 @@ def load_config() -> AppConfig:
         save_config(default_cfg)
         return default_cfg
     data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    # ignora chaves desconhecidas para evitar erros futuros
-    valid_keys = {f.name for f in AppConfig.__dataclass_fields__.values()}
+    # Ignora chaves desconhecidas para evitar erros futuros
+    valid_keys = {f.name for f in fields(AppConfig)}
     filtered = {k: v for k, v in data.items() if k in valid_keys}
     return AppConfig(**{**asdict(AppConfig()), **filtered})
 

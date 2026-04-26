@@ -1,6 +1,5 @@
 // Inicialização do app Tauri e gerenciamento do processo backend.exe.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 use std::path::PathBuf;
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
@@ -12,8 +11,8 @@ struct BackendState {
 
 fn backend_path(app: &AppHandle) -> PathBuf {
     // Em produção, o backend fica ao lado do executável principal.
-    let exe_dir = app.path().exe().unwrap_or_else(|_| PathBuf::from("."));
-    exe_dir
+    let exe_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("."));
+    exe_path
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("backend.exe")
@@ -25,7 +24,12 @@ fn start_backend(app: &AppHandle, state: &BackendState) {
         eprintln!("backend.exe não encontrado em {:?}", path);
         return;
     }
-    let child = Command::new(path).arg("--host").arg("127.0.0.1").arg("--port").arg("7474").spawn();
+    let child = Command::new(path)
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg("7474")
+        .spawn();
     if let Ok(proc_child) = child {
         if let Ok(mut lock) = state.child.lock() {
             *lock = Some(proc_child);

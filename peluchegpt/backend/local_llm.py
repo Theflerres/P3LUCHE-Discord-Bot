@@ -1,4 +1,4 @@
-"""Cliente do Ollama para respostas locais com Mistral."""
+"""Cliente do Ollama para respostas locais."""
 
 from __future__ import annotations
 
@@ -7,43 +7,58 @@ import httpx
 from .config import load_config
 
 
-def _build_prompt(user_input: str, context_chunks: list[dict], history: list[dict]) -> str:
-    """Monta um prompt enxuto para reduzir latência e consumo de RAM."""
+async def generate(
+    user_input: str,
+    context_chunks: list[dict],
+    history: list[dict],
+    system_prompt: str = "",
+) -> dict:
+    """Gera resposta local via endpoint HTTP do Ollama."""
+    cfg = load_config()
+
+    # Monta contexto de lore
     context_text = "\n\n".join(
         f"- {chunk.get('title', 'Sem título')}: {chunk.get('content', '')[:500]}"
         for chunk in context_chunks
     )
-    history_text = "\n".join(
-        f"{item.get('role', 'user')}: {item.get('content', '')}" for item in history[-8:]
-    )
 
-    return (
-        "Você é o PelucheGPT, assistente pessoal do P3LUCHE.\n"
-        "Responda em português e seja objetivo.\n"
-        f"\nContexto de lore:\n{context_text or 'Sem contexto relevante.'}\n"
-        f"\nHistórico recente:\n{history_text or 'Sem histórico.'}\n"
-        f"\nPergunta atual:\n{user_input}"
-    )
+    # Monta histórico recente
+    messages = []
 
+    # System prompt com data/hora e identidade
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
 
-async def generate(user_input: str, context_chunks: list[dict], history: list[dict]) -> dict:
-    """Gera resposta local via endpoint HTTP do Ollama."""
-    cfg = load_config()
-    prompt = _build_prompt(user_input, context_chunks, history)
+    # Adiciona contexto de lore ao system se existir
+    if context_text:
+        messages.append({
+            "role": "system",
+            "content": f"Contexto de Lore relevante para essa pergunta:\n{context_text}"
+        })
+
+    # Histórico da conversa
+    for item in history[-8:]:
+        role = item.get("role", "user")
+        content = item.get("content", "")
+        if role in ("user", "assistant") and content:
+            messages.append({"role": role, "content": content})
+
+    # Pergunta atual
+    messages.append({"role": "user", "content": user_input})
 
     payload = {
         "model": cfg.ollama_model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "stream": False,
         "options": {
-            # Limita uso para não dominar os recursos da máquina.
-            "num_ctx": 2048,
+            "num_ctx": cfg.ollama_num_ctx or 2048,
             "temperature": 0.4,
-            "num_gpu": 1,
+            "num_gpu": cfg.ollama_num_gpu or 12,
+            "num_thread": cfg.ollama_num_threads or 5,
         },
     }
 
-    async with httpx.AsyncClient(timeout=45) as client:
+    async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(f"{cfg.ollama_url}/api/chat", json=payload)
         resp.raise_for_status()
         data = resp.json()
