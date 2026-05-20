@@ -50,7 +50,7 @@ from utils import (
 
 # Tamanho alvo em KB para o Etched carregar sem problemas.
 # O mod geralmente rejeita arquivos acima de ~100 KB no pacote de recursos.
-ETCHED_TARGET_SIZE_KB = 96
+ETCHED_TARGET_SIZE_KB = 48000
 
 # Sequência de qualidades OGG Vorbis tentadas (0–10, menor = menor arquivo)
 # O algoritmo para na primeira que couber no ETCHED_TARGET_SIZE_KB.
