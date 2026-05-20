@@ -50,15 +50,14 @@ from utils import (
 
 # Tamanho alvo em KB para o Etched carregar sem problemas.
 # O mod geralmente rejeita arquivos acima de ~100 KB no pacote de recursos.
-ETCHED_TARGET_SIZE_KB = 48000
+# NOTA: Com estéreo e qualidade máxima, o arquivo será maior. Tamanho não é mais prioridade.
+ETCHED_TARGET_SIZE_KB = 500000  # Limite aumentado (antes era 63000)
 
-# Sequência de qualidades OGG Vorbis tentadas (0–10, menor = menor arquivo)
-# O algoritmo para na primeira que couber no ETCHED_TARGET_SIZE_KB.
-ETCHED_QUALITY_STEPS = [3, 2, 1, 0]
+# Taxa de amostragem padrão em Hz. Mantém 44100 para qualidade máxima.
+ETCHED_SAMPLE_RATE = 44100
 
-# Taxa de amostragem (Hz) tentada em cada qualidade antes de descer a escada.
-# 22050 → 16000 → 11025 (voz ainda audível em 11025 mono)
-ETCHED_SAMPLE_RATES = [22050, 16000, 11025]
+# Qualidade OGG Vorbis (0–10). 10 = máxima qualidade
+ETCHED_QUALITY = 10
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -112,93 +111,67 @@ def _compress_audio_for_etched(
     target_kb: int = ETCHED_TARGET_SIZE_KB,
 ) -> tuple[str, dict]:
     """
-    Comprime o arquivo de áudio ao máximo para compatibilidade com o mod Etched.
+    Converte e otimiza o arquivo de áudio para OGG Vorbis com qualidade máxima.
 
-    Estratégia em cascata:
-      1. Converte para OGG Vorbis mono (muito mais eficiente que MP3).
-      2. Tenta todas as combinações de (qualidade × taxa de amostragem) até
-         caber em `target_kb`.
-      3. Loga o resultado final para diagnóstico.
+    Estratégia:
+      1. Converte para OGG Vorbis ESTÉREO (2 canais) com qualidade máxima (10).
+      2. Mantém taxa de amostragem de 44100 Hz para qualidade máxima.
+      3. Preserva a qualidade original do áudio.
 
     Retorna:
-        (caminho_do_arquivo_comprimido, info_dict)
-        info_dict contém: size_kb, bitrate_approx, sample_rate, quality_level
+        (caminho_do_arquivo_processado, info_dict)
+        info_dict contém: size_kb, sample_rate, quality_level, channels
     """
     base_name = os.path.splitext(os.path.basename(input_path))[0]
     output_path = os.path.join(output_dir, f"{base_name}_etched.ogg")
 
-    best_result = None
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", input_path,
+        "-ar", str(ETCHED_SAMPLE_RATE),        # taxa de amostragem: 44100 Hz
+        "-c:a", "libvorbis",                  # codec OGG Vorbis
+        "-q:a", str(ETCHED_QUALITY),          # qualidade VBR máxima (10)
+        output_path,
+    ]
+    
+    log_to_gui(
+        f"[Processamento] Convertendo para OGG Vorbis (estéreo, 44100 Hz, qualidade máxima)..."
+    )
+    
+    result = subprocess.run(cmd, capture_output=True)
 
-    for sample_rate in ETCHED_SAMPLE_RATES:
-        for quality in ETCHED_QUALITY_STEPS:
-            cmd = [
-                "ffmpeg", "-y",
-                "-i", input_path,
-                "-ac", "1",                    # mono — reduz tamanho pela metade vs estéreo
-                "-ar", str(sample_rate),        # taxa de amostragem
-                "-c:a", "libvorbis",            # codec OGG Vorbis
-                "-q:a", str(quality),           # qualidade VBR (0–10)
-                output_path,
-            ]
-            result = subprocess.run(cmd, capture_output=True)
-
-            if result.returncode != 0:
-                log_to_gui(
-                    f"[Compressão] ffmpeg falhou (q={quality}, sr={sample_rate}): "
-                    f"{result.stderr.decode(errors='replace')[-200:]}",
-                    "WARNING",
-                )
-                continue
-
-            size_kb = os.path.getsize(output_path) / 1024
-            info = {
-                "size_kb": round(size_kb, 1),
-                "sample_rate": sample_rate,
-                "quality_level": quality,
-            }
-
-            log_to_gui(
-                f"[Compressão] Tentativa q={quality}, {sample_rate}Hz → {size_kb:.1f} KB"
-            )
-
-            # Guarda o melhor resultado encontrado até agora (menor que couber)
-            if size_kb <= target_kb:
-                best_result = (output_path, info)
-                log_to_gui(
-                    f"[Compressão] ✅ Cabe no limite! "
-                    f"{size_kb:.1f} KB @ q={quality}, {sample_rate}Hz mono",
-                    "SUCCESS",
-                )
-                return best_result  # Achou — retorna imediatamente
-
-    # Nenhuma combinação coube: usa o menor resultado possível
-    if best_result is None:
-        # O arquivo da última iteração é o mais comprimido que conseguimos
-        size_kb = os.path.getsize(output_path) / 1024 if os.path.exists(output_path) else 0
-        best_result = (
-            output_path,
-            {
-                "size_kb": round(size_kb, 1),
-                "sample_rate": ETCHED_SAMPLE_RATES[-1],
-                "quality_level": ETCHED_QUALITY_STEPS[-1],
-            },
-        )
+    if result.returncode != 0:
         log_to_gui(
-            f"[Compressão] ⚠️ Não foi possível atingir {target_kb} KB. "
-            f"Menor obtido: {size_kb:.1f} KB",
-            "WARNING",
+            f"[Processamento] ffmpeg falhou: "
+            f"{result.stderr.decode(errors='replace')[-200:]}",
+            "ERROR",
         )
+        raise RuntimeError("Falha ao processar áudio com ffmpeg")
 
-    return best_result
+    size_kb = os.path.getsize(output_path) / 1024
+    info = {
+        "size_kb": round(size_kb, 1),
+        "sample_rate": ETCHED_SAMPLE_RATE,
+        "quality_level": ETCHED_QUALITY,
+        "channels": 2,
+    }
+
+    log_to_gui(
+        f"[Processamento] ✅ Conversão concluída: "
+        f"{size_kb:.1f} KB @ 44100 Hz, estéreo, qualidade máxima",
+        "SUCCESS",
+    )
+
+    return output_path, info
 
 
 def _format_compression_info(info: dict, original_path: str) -> str:
     """Gera string de resumo para exibir no Discord."""
     original_kb = os.path.getsize(original_path) / 1024 if os.path.exists(original_path) else 0
-    reduction = ((original_kb - info["size_kb"]) / original_kb * 100) if original_kb > 0 else 0
+    channels_text = "estéreo" if info.get("channels", 2) == 2 else "mono"
     return (
-        f"🗜️ **Compressão Etched:** {info['size_kb']} KB "
-        f"(↓{reduction:.0f}% | {info['sample_rate']} Hz mono, q={info['quality_level']})"
+        f"🎵 **Qualidade:** {info['size_kb']} KB "
+        f"({info['sample_rate']} Hz {channels_text}, q={info['quality_level']})"
     )
 
 #endregion COMPRESSAO_ETCHED
@@ -437,13 +410,14 @@ async def _perform_song_download_upload_cache(
         actual_dl_title = downloaded_title or initial_title
         log_to_gui(f"Download concluído: '{actual_dl_title}'. Iniciando compressão…")
 
-        # ── ETAPA 2: Compressão para Etched ───────────────────────────────
+        # ── ETAPA 2: Processamento de áudio ───────────────────────────────
         compressed_path, compress_info = await asyncio.to_thread(
             _compress_audio_for_etched, raw_path, temp_dir
         )
+        channels_text = "estéreo" if compress_info.get("channels", 2) == 2 else "mono"
         log_to_gui(
-            f"Compressão: {compress_info['size_kb']} KB "
-            f"(q={compress_info['quality_level']}, {compress_info['sample_rate']} Hz mono)"
+            f"Processamento: {compress_info['size_kb']} KB "
+            f"(44100 Hz {channels_text}, qualidade máxima)"
         )
 
         # ── ETAPA 3: Upload do arquivo comprimido ─────────────────────────
@@ -598,21 +572,17 @@ async def process_slash_music_addition(interaction: discord.Interaction, youtube
         ]
         random_comment = random.choice(p3luche_comments)
 
-        # Monta linha de info de compressão
-        size_ok = compress_info["size_kb"] <= ETCHED_TARGET_SIZE_KB
-        compression_line = (
-            f"✅ {compress_info['size_kb']} KB — pronto para o Etched!"
-            if size_ok
-            else f"⚠️ {compress_info['size_kb']} KB — pode ser grande demais para o Etched."
-        )
+        # Monta linha de info de qualidade
+        channels_text = "estéreo" if compress_info.get("channels", 2) == 2 else "mono"
+        quality_line = f"✅ {compress_info['size_kb']} KB — {channels_text} em qualidade máxima!"
 
         embed = discord.Embed(
             title=f"🎵 {actual_title}",
             description=(
                 f"{interaction.user.mention}\n\n"
                 f"🤖 **P3LUCHE diz:**\n*{random_comment}*\n\n"
-                f"🗜️ **Compressão:** {compression_line}\n"
-                f"_(mono · {compress_info['sample_rate']} Hz · OGG Vorbis q{compress_info['quality_level']})_\n\n"
+                f"🎧 **Qualidade:** {quality_line}\n"
+                f"_({channels_text} · {compress_info['sample_rate']} Hz · OGG Vorbis q{compress_info['quality_level']})_\n\n"
                 f"🔗 **Link para o Rádio:**\n{drive_link}"
             ),
             color=color,
@@ -663,9 +633,10 @@ async def process_file_music_addition(
             compressed_path, compress_info = await asyncio.to_thread(
                 _compress_audio_for_etched, temp_path, temp_dir
             )
+            channels_text = "estéreo" if compress_info.get("channels", 2) == 2 else "mono"
             log_to_gui(
-                f"Compressão de arquivo: {compress_info['size_kb']} KB "
-                f"(q={compress_info['quality_level']}, {compress_info['sample_rate']} Hz)"
+                f"Processamento de arquivo: {compress_info['size_kb']} KB "
+                f"(44100 Hz {channels_text}, qualidade máxima)"
             )
 
             # ── ETAPA 3: Upload do arquivo comprimido ─────────────────────
@@ -698,21 +669,17 @@ async def process_file_music_addition(
         get_bot_instance().db_conn.commit()
 
         # ── ETAPA 5: Resposta ──────────────────────────────────────────────
-        size_ok = compress_info["size_kb"] <= ETCHED_TARGET_SIZE_KB
-        compression_line = (
-            f"✅ {compress_info['size_kb']} KB — pronto para o Etched!"
-            if size_ok
-            else f"⚠️ {compress_info['size_kb']} KB — pode ser grande demais para o Etched."
-        )
+        channels_text = "estéreo" if compress_info.get("channels", 2) == 2 else "mono"
+        quality_line = f"✅ {compress_info['size_kb']} KB — {channels_text} em qualidade máxima!"
 
         embed = discord.Embed(
             title="💿 Arquivo Local Adicionado",
-            color=discord.Color.green() if size_ok else discord.Color.orange(),
+            color=discord.Color.green(),
         )
         embed.description = (
             f"**{title_manual}**\n\n"
-            f"🗜️ **Compressão:** {compression_line}\n"
-            f"_(mono · {compress_info['sample_rate']} Hz · OGG Vorbis q{compress_info['quality_level']})_\n\n"
+            f"🎧 **Qualidade:** {quality_line}\n"
+            f"_({channels_text} · {compress_info['sample_rate']} Hz · OGG Vorbis q{compress_info['quality_level']})_\n\n"
             f"🔗 [Link do Drive]({drive_link})"
         )
         embed.set_footer(text=f"Enviado por {interaction.user.name}")
