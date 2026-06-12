@@ -1,6 +1,6 @@
 <div align="center">
 
-# 🧸 PelucheGPT
+# 🧸 P3LUCHE
 
 ### A Inteligência Artificial Definitiva para Gestão de Lore e Comunidades de RPG
 
@@ -19,7 +19,7 @@
 
 ## O Projeto
 
-O **PelucheGPT** é a evolução definitiva do projeto [P3LUCHE](https://github.com/Theflerres/P3LUCHE-Discord-Bot). O que nasceu como um bot de automação para Discord agora é uma **aplicação desktop standalone** robusta para gerenciamento de lores complexas de RPG.
+O **P3LUCHE** é a evolução definitiva do projeto [P3LUCHE](https://github.com/Theflerres/P3LUCHE-Discord-Bot). O que nasceu como um bot de automação para Discord agora é uma **aplicação desktop standalone** robusta para gerenciamento de lores complexas de RPG.
 
 A **v6.0** marca a transição para uma interface nativa via Tauri, eliminando a dependência de IDEs e otimizando o consumo de recursos (RAM/CPU) com a ponte Rust. O backend Python continua operando como núcleo de inteligência, agora com suporte a **LLM local** para processamento completamente offline.
 
@@ -58,7 +58,7 @@ A **v6.0** marca a transição para uma interface nativa via Tauri, eliminando a
 
 ```
 ┌─────────────────────────────────────────────────┐
-│              PelucheGPT Desktop                 │
+│              P3LUCHE Desktop                    │
 │         Interface Tauri (Rust + Node.js)        │
 │  ┌──────────────┐        ┌────────────────────┐ │
 │  │  Bot Switch  │        │    Log Stream      │ │
