@@ -18,8 +18,8 @@ from discord.ext import commands, tasks
 
 from config import get_bot_instance, set_bot_instance
 from utils import get_local_file, log_to_gui
-from config import get_bot_instance, set_bot_instance
-from utils import get_local_file, log_to_gui
+from economy_constants import FISH_DB
+from economy_db import ensure_v4_tables, log_fish_sale, seed_market_prices, sync_user_from_economy
 
 # Adicione estas duas linhas aqui:
 CATCHES_LOCK = threading.Lock()
@@ -152,14 +152,14 @@ ROD_STATS = {
     # --- TIER 5: CÓSMICO (Deuses) ---
     "vara_quantum": {
         "name": "Vara Quântica", 
-        "price": 150000, 
+        "price": 80000, 
         "tier": 5, # UPGRADE DE TIER!
         "cd": 0.5, "trash": 5, "luck": 4.0,
         "desc": "Pesca em realidades paralelas simultaneamente."
     },
     "vara_void": { # NOVA VARA
         "name": "Devoradora do Vazio", 
-        "price": 500000, 
+        "price": 350000, 
         "tier": 5, 
         "cd": 0.8, "trash": 0, "luck": 6.6,
         "desc": "Olhe para ela e ela olhará de volta..."
@@ -178,6 +178,9 @@ SHOP_ITEMS = {
     "ima_saches": {"name": "Ímã de Sachês", "price": 300, "type": "buff", "rarity": "uncommon", "desc": "Duplica o valor da próxima pesca."},
     "firewall": {"name": "Firewall Portátil", "price": 100, "type": "buff", "rarity": "common", "desc": "Bloqueia 100% de Lixo na próxima pesca."},
     "chip_sorte": {"name": "Chip da Sorte", "price": 6000, "type": "buff", "desc": "Consumível. Se vier peixe Comum, tenta de novo.", "rarity": "legendary"},
+    "isca_brilhante": {"name": "Isca Brilhante", "price": 200, "type": "consumable", "rarity": "uncommon", "desc": "Aumenta em 20% a chance de peixes de Tier 2."},
+    "isca_fedorenta": {"name": "Isca Fedorenta", "price": 150, "type": "consumable", "rarity": "common", "desc": "Atrai peixes comuns, reduz lixo."},
+    "isca_eletrica": {"name": "Isca Elétrica", "price": 400, "type": "consumable", "rarity": "rare", "desc": "Chance extra de peixes elétricos/raros."},
 
     # --- VARAS (Sincronizado com ROD_STATS) ---
     # TIER 0 & 1
@@ -201,8 +204,8 @@ SHOP_ITEMS = {
     "vara_sniper":   {"name": "Vara Sniper .50", "price": 60000, "type": "rod", "key": "vara_sniper", "tier": 4, "rarity": "legendary", "desc": "100% Precisão. Lenta."},
 
     # TIER 5 (Cósmico)
-    "vara_quantum":  {"name": "Vara Quântica",  "price": 150000, "type": "rod", "key": "vara_quantum", "tier": 5, "rarity": "mythic", "desc": "Multidimensional."},
-    "vara_void":     {"name": "Devoradora do Vazio", "price": 500000, "type": "rod", "key": "vara_void", "tier": 5, "rarity": "mythic", "desc": "O fim da pescaria."},
+    "vara_quantum":  {"name": "Vara Quântica",  "price": 80000, "type": "rod", "key": "vara_quantum", "tier": 5, "rarity": "mythic", "desc": "Multidimensional."},
+    "vara_void":     {"name": "Devoradora do Vazio", "price": 350000, "type": "rod", "key": "vara_void", "tier": 5, "rarity": "mythic", "desc": "O fim da pescaria."},
 
     # --- FLEX (Ostentação) ---
     "certificado": {"name": "Certificado de Dono", "price": 5000, "type": "flex", "rarity": "rare", "desc": "Papel inútil de rico."},
@@ -218,70 +221,6 @@ SHOP_ITEMS = {
     "garrafa_incrustada": {"name": "Garrafa Incrustada", "price": 0, "type": "quest", "rarity": "quest", "desc": "Tem algo dentro... Use /ler_garrafa"},
     "selo_capitao": {"name": "Selo do Capitão", "price": 0, "type": "quest", "rarity": "epic", "desc": "Permite entrar em Porto Solare."}
 }
-
-# 3. LISTA DE PEIXES (SUPER EXPANDIDA)
-# Estrutura: (Nome, PreçoMin, PreçoMax, Emoji, Tier, Frase)
-FISH_DB = [
-    # --- TIER 0: LIXO & COMUM (O Início Humilde) ---
-    ("Bota Velha", 0, 5, "👢", 0, "Alguém foi embora pulando."), 
-    ("Lata Vazia", 2, 5, "🥫", 0, "Recicle, por favor."),
-    ("Pneu Furado", 0, 8, "🍩", 0, "Furou o rolê."),
-    ("Sacola Plástica", 0, 2, "🥡", 0, "Isso mata as tartarugas!"),
-    ("Espinha de Peixe", 0, 1, "🦴", 0, "Chegou tarde, o gato já comeu."),
-    
-    ("Sardinha", 10, 20, "🐟", 0, "O pão de cada dia."), 
-    ("Lambari", 10, 15, "🐠", 0, "Pequeno e crocante."),
-    ("Tilápia", 15, 25, "🐟", 0, "Clássico do pesque-pague."),
-    ("Peixe Dourado", 18, 28, "🐡", 0, "Fugiu do aquário."),
-    ("Bagre", 20, 30, "🐟", 0, "Cuidado com o bigode."),
-
-    # --- TIER 1: INCOMUM (Comida Boa) ---
-    ("Truta", 40, 60, "🐟", 1, "Gosta de águas geladas."),
-    ("Tambaqui", 50, 80, "🐟", 1, "O gigante redondo dos rios."),
-    ("Lula", 60, 90, "🦑", 1, "Anéis empanados... hmmm."),
-    ("Camarão", 35, 55, "🦐", 1, "A cabeça você joga fora."),
-    ("Caranguejo", 45, 75, "🦀", 1, "Andando de lado."),
-    ("Polvo", 70, 100, "🐙", 1, "8 braços para te dar um tapa."),
-    ("Baiacu", 40, 70, "🐡", 1, "Não coma se não souber limpar!"),
-    ("Piranha", 45, 65, "🦷", 1, "Ela queria seu dedo."),
-    ("Tucunaré", 55, 85, "🐠", 1, "Lutador dos rios brasileiros."),
-
-    # --- TIER 2: RARO (Exóticos & Bonitos) ---
-    ("Peixe-Palhaço", 120, 180, "🤡", 2, "Procurando o filho dele..."),
-    ("Dourado do Mar", 150, 250, "🐬", 2, "Brilha como ouro puro."),
-    ("Arraia", 180, 280, "🛸", 2, "A nave espacial do mar."),
-    ("Cavalo-Marinho", 200, 300, "🎠", 2, "O pai é quem engravida."),
-    ("Enguia Elétrica", 220, 320, "⚡", 2, "BZZZ! Cuidado com o choque!"),
-    ("Tubarão Martelo", 250, 400, "🔨", 2, "Pregos não inclusos."),
-    ("Peixe-Espada", 300, 450, "⚔️", 2, "En Garde, marinheiro!"),
-    ("Moreia", 160, 220, "🐍", 2, "Parece cobra, mas morde mais."),
-    ("Axolote", 190, 290, "🦎", 2, "Ele se regenera!"),
-    ("Peixe-Lanterna", 210, 310, "💡", 2, "Luz natural do abismo."),
-
-    # --- TIER 3: LENDÁRIO (Pesos Pesados) ---
-    ("Tubarão Branco", 1000, 1500, "🦈", 3, "Precisamos de um barco maior."),
-    ("Baleia Azul", 2000, 3000, "🐋", 3, "O maior animal da Terra."),
-    ("Lula Gigante", 2500, 3500, "🦑", 3, "Pesadelo dos marinheiros antigos."),
-    ("Narval", 1800, 2600, "🦄", 3, "O unicórnio dos mares."),
-    ("Orca", 2200, 3200, "🐼", 3, "A baleia assassina (que é um golfinho)."),
-    ("Megalodon", 4000, 6000, "🦖", 3, "Achou que estava extinto? Achou errado."),
-    ("Moby Dick", 5000, 7000, "🐳", 3, "A obsessão do Capitão Ahab."),
-    ("Peixe-Lua", 1500, 2500, "🌑", 3, "Parece uma panqueca gigante."),
-
-    # --- TIER 4: MÍTICO / CÓSMICO (Eventos & Memes) ---
-    ("Kraken", 8000, 12000, "🐙🔥", 4, "LIBEREM O KRAKEN!"),
-    ("Leviatã", 10000, 15000, "🐉", 4, "A serpente do fim do mundo."),
-    ("Nessie", 12000, 18000, "🦕", 4, "O Monstro do Lago Ness é real?!"),
-    ("Sereia", 15000, 25000, "🧜‍♀️", 4, "Cuidado com o canto dela..."),
-    ("Godzilla (Aquático)", 20000, 30000, "🦖☢️", 4, "O Rei dos Monstros acordou."),
-    ("CTHULHU", 50000, 66666, "🐙💀", 4, "Ph'nglui mglw'nafh R'lyeh..."),
-    
-    # Easter Eggs (Raros dentro do Raro)
-    ("Bob Esponja", 5000, 8000, "🧽", 4, "Vive num abacaxi."),
-    ("Peixe de 3 Olhos", 6000, 9000, "☢️", 4, "Direto de Springfield."),
-    ("Peixe Cibernético", 15000, 20000, "🤖", 4, "Veio do ano 3077."),
-    ("O PEIXE DOURADO SUPREMO", 40000, 60000, "👑", 4, "O deus de todos os aquários.")
-]
 
 #4 --- SISTEMA DE CLIMA ---
 WEATHER_EFFECTS = {
@@ -735,6 +674,176 @@ async def comprar(interaction: discord.Interaction, item: str):
     
     await interaction.response.send_message(f"✅ **Compra realizada!**\n{emoji_tipo} **{data['name']}** foi guardado na sua mochila.\nUse `/eco saldo` para ver ou usar.", ephemeral=True)
 
+
+class TensionQTEView(discord.ui.View):
+    """QTE de tensão da linha para peixes Tier 3+."""
+
+    def __init__(self, user_id: int, secret: str, catch_ctx: dict):
+        super().__init__(timeout=15)
+        self.user_id = user_id
+        self.secret = secret
+        self.catch_ctx = catch_ctx
+        options = [secret]
+        while len(options) < 3:
+            candidate = str(random.randint(100, 999))
+            if candidate not in options:
+                options.append(candidate)
+        random.shuffle(options)
+        for num in options:
+            btn = discord.ui.Button(label=num, style=discord.ButtonStyle.primary)
+
+            async def callback(interaction: discord.Interaction, n=num):
+                if interaction.user.id != self.user_id:
+                    return await interaction.response.send_message("❌ Não é sua pesca.", ephemeral=True)
+                for child in self.children:
+                    child.disabled = True
+                if n == self.secret:
+                    self.catch_ctx["valor"] = int(self.catch_ctx["valor"] * 1.5)
+                    self.catch_ctx["qte_msg"] = "⚡ Você controlou a linha! Valor x1.5!"
+                else:
+                    self.catch_ctx["valor"] = 0
+                    self.catch_ctx["qte_msg"] = "❌ A linha arrebentou! O peixe escapou!"
+                await _finalize_pescar(interaction, self.catch_ctx, edit=True)
+
+            btn.callback = callback
+            self.add_item(btn)
+
+    async def on_timeout(self):
+        self.catch_ctx["valor"] = 0
+        self.catch_ctx["qte_msg"] = "❌ Tempo esgotado — o peixe escapou!"
+        if self.catch_ctx.get("qte_message"):
+            try:
+                await _finalize_pescar_timeout(self.catch_ctx)
+            except discord.HTTPException:
+                pass
+
+
+async def _finalize_pescar(interaction: discord.Interaction, ctx: dict, edit: bool = False):
+    """Persiste captura e envia embed final."""
+    cursor = ctx["cursor"]
+    user_id = ctx["user_id"]
+    inv = ctx["inv"]
+    valor = ctx["valor"]
+    nome = ctx["nome"]
+    emoji = ctx["emoji"]
+    tier_p = ctx["tier_p"]
+    frase = ctx["frase"]
+    rod_data = ctx["rod_data"]
+    actual_cd = ctx["actual_cd"]
+    mission_msg = ctx["mission_msg"]
+    mission_completed = ctx["mission_completed"]
+    quest_trigger = ctx["quest_trigger"]
+    novo_saldo = ctx["row"]["wallet"] + valor
+    new_xp_total = ctx["new_xp_total"]
+    current_rank = ctx["current_rank"]
+    legacy_baits = ctx["legacy_baits"]
+    used_bait = ctx["used_bait"]
+    agora_str = ctx["agora_str"]
+    w_key = ctx["w_key"]
+    w_stats = ctx["w_stats"]
+
+    if used_bait and inv.get("isca", 0) <= 0:
+        inv.pop("isca", None)
+
+    cursor.execute(
+        """
+        UPDATE economy SET
+        wallet = ?, last_fish = ?, fish_count = fish_count + 1,
+        inventory = ?, baits = ?, guild_xp = ?, guild_rank = ?, user_name = ?
+        WHERE user_id = ?
+        """,
+        (
+            novo_saldo,
+            agora_str,
+            json.dumps(inv),
+            legacy_baits,
+            new_xp_total,
+            current_rank,
+            interaction.user.name,
+            user_id,
+        ),
+    )
+    if valor > 0 and not ctx.get("is_trash"):
+        log_fish_sale(get_bot_instance().db_conn, nome, valor, user_id)
+    get_bot_instance().db_conn.commit()
+
+    embed_color = discord.Color.from_rgb(46, 204, 113)
+    if tier_p == 0:
+        embed_color = discord.Color.light_grey()
+    if tier_p == 2:
+        embed_color = discord.Color.blue()
+    if tier_p >= 3:
+        embed_color = discord.Color.purple()
+
+    embed = discord.Embed(title=f"{emoji} P3LUCHE Fishing OS", color=embed_color)
+    embed.add_field(name="Capturado:", value=f"**{emoji} {nome}**", inline=False)
+    embed.add_field(name="P3LUCHE diz:", value=f"*{frase}*", inline=False)
+    cd_minutos = int(actual_cd / 60)
+    stats_info = f"**{rod_data['name']}**\n(⏱️ {cd_minutos}m | 🎲 x{rod_data['luck']})"
+    embed.add_field(name="Detalhes", value=stats_info, inline=True)
+    embed.add_field(name="Lucro", value=f"```diff\n+ {valor} Sachês\n```", inline=True)
+    iscas_restantes = inv.get("isca", 0)
+    weather_icon = "☀️" if w_key == "normal" else ("⛈️" if w_key == "bad" else "✨")
+    embed.set_footer(
+        text=f"Saldo: {novo_saldo} | Iscas: {iscas_restantes} | Clima: {weather_icon} {w_stats['name']}"
+    )
+    if ctx.get("qte_msg"):
+        embed.description = ctx["qte_msg"]
+    if mission_msg:
+        embed.description = (embed.description or "") + mission_msg
+        if mission_completed:
+            embed.color = discord.Color.gold()
+    if quest_trigger:
+        bottle_msg = "\n🧴 **Você encontrou uma Garrafa Incrustada!** Use /ler_garrafa para ver o conteúdo."
+        embed.description = (embed.description or "") + bottle_msg
+
+    if edit:
+        await interaction.response.edit_message(embed=embed, view=None)
+    else:
+        await interaction.followup.send(embed=embed)
+
+
+async def _finalize_pescar_timeout(ctx: dict):
+    msg = ctx.get("qte_message")
+    if not msg:
+        return
+    interaction = ctx["interaction"]
+    ctx["valor"] = 0
+    ctx["qte_msg"] = "❌ Tempo esgotado — o peixe escapou!"
+    cursor = ctx["cursor"]
+    user_id = ctx["user_id"]
+    inv = ctx["inv"]
+    valor = 0
+    row = ctx["row"]
+    novo_saldo = row["wallet"]
+    cursor.execute(
+        """
+        UPDATE economy SET last_fish = ?, fish_count = fish_count + 1,
+        inventory = ?, baits = ?, guild_xp = ?, guild_rank = ?, user_name = ?
+        WHERE user_id = ?
+        """,
+        (
+            ctx["agora_str"],
+            json.dumps(inv),
+            ctx["legacy_baits"],
+            ctx["new_xp_total"],
+            ctx["current_rank"],
+            interaction.user.name,
+            user_id,
+        ),
+    )
+    get_bot_instance().db_conn.commit()
+    embed = discord.Embed(
+        title="⚠️ PEIXE FORTE!",
+        description=ctx["qte_msg"],
+        color=discord.Color.red(),
+    )
+    try:
+        await msg.edit(embed=embed, view=None)
+    except discord.HTTPException:
+        pass
+
+
 @eco_group.command(name="pescar", description="Pesca usando itens da sua mochila.")
 async def pescar(interaction: discord.Interaction):
     # Defer para evitar erro de tempo limite
@@ -819,6 +928,26 @@ async def pescar(interaction: discord.Interaction):
     if inv.get("chip_sorte", 0) > 0: inv["chip_sorte"] -= 1; used_chip = True
     if inv.get("chip_sorte", 0) <= 0: inv.pop("chip_sorte", None)
 
+    used_brilhante = False
+    used_fedorenta = False
+    if inv.get("isca_brilhante", 0) > 0:
+        inv["isca_brilhante"] -= 1
+        used_brilhante = True
+    if inv.get("isca_brilhante", 0) <= 0:
+        inv.pop("isca_brilhante", None)
+
+    if inv.get("isca_fedorenta", 0) > 0:
+        inv["isca_fedorenta"] -= 1
+        used_fedorenta = True
+    if inv.get("isca_fedorenta", 0) <= 0:
+        inv.pop("isca_fedorenta", None)
+
+    if inv.get("isca_eletrica", 0) > 0:
+        inv["isca_eletrica"] -= 1
+        used_chip = True
+    if inv.get("isca_eletrica", 0) <= 0:
+        inv.pop("isca_eletrica", None)
+
     # ==========================================================
     # 6. PESCA (RNG + CLIMA ATUALIZADO)
     # ==========================================================
@@ -831,7 +960,8 @@ async def pescar(interaction: discord.Interaction):
     
     if used_bait: trash_chance /= 2
     if used_firewall: trash_chance = 0
-    
+    if used_fedorenta: trash_chance = max(0, trash_chance - 15)
+
     roll = random.randint(1, 100)
     
     pool = []
@@ -845,6 +975,10 @@ async def pescar(interaction: discord.Interaction):
         # Modifica o Tier Máximo com base no bônus do clima
         max_tier_possible = rod_data['tier'] + w_stats['tier_bonus']
         pool = [p for p in FISH_DB if p[4] <= max_tier_possible and p[4] > 0]
+        if used_brilhante and random.random() < 0.2:
+            tier2_pool = [p for p in pool if p[4] == 2]
+            if tier2_pool:
+                pool = tier2_pool
         if not pool: pool = [p for p in FISH_DB if p[4] == 0]
 
     catch_data = random.choice(pool)
@@ -979,57 +1113,49 @@ async def pescar(interaction: discord.Interaction):
             else:
                 cursor.execute("INSERT OR IGNORE INTO quest_progress (user_id, current_chapter) VALUES (?, 'garrafa_encontrada')", (user_id,))
                 
-    # 10. SALVA NO BANCO
-    if used_bait:
-        if inv.get("isca", 0) <= 0: inv.pop("isca", None)
-    
-    cursor.execute("""
-        UPDATE economy SET 
-        wallet = ?, last_fish = ?, fish_count = fish_count + 1, 
-        inventory = ?, baits = ?, guild_xp = ?, guild_rank = ?, user_name = ?
-        WHERE user_id = ?
-    """, (novo_saldo, agora_str, json.dumps(inv), legacy_baits, new_xp_total, current_rank, interaction.user.name, user_id))
-    get_bot_instance().db_conn.commit()
+    # 10. QTE TENSÃO (Tier 3+) ou salva direto
+    catch_ctx = {
+        "cursor": cursor,
+        "user_id": user_id,
+        "interaction": interaction,
+        "inv": inv,
+        "valor": valor,
+        "nome": nome,
+        "emoji": emoji,
+        "tier_p": tier_p,
+        "frase": frase,
+        "rod_data": rod_data,
+        "actual_cd": actual_cd,
+        "mission_msg": mission_msg,
+        "mission_completed": mission_completed,
+        "quest_trigger": quest_trigger,
+        "row": row,
+        "new_xp_total": new_xp_total,
+        "current_rank": current_rank,
+        "legacy_baits": legacy_baits,
+        "used_bait": used_bait,
+        "agora_str": agora_str,
+        "w_key": w_key,
+        "w_stats": w_stats,
+        "is_trash": is_trash,
+    }
 
-    # 11. GERA EMBED FINAL (Visual Intacto)
-    
-    embed_color = discord.Color.from_rgb(46, 204, 113) # Verde estilo Matrix
-    if tier_p == 0: embed_color = discord.Color.light_grey()
-    if tier_p == 2: embed_color = discord.Color.blue()
-    if tier_p >= 3: embed_color = discord.Color.purple()
+    if tier_p >= 3 and not is_trash:
+        secret = str(random.randint(100, 999))
+        qte_embed = discord.Embed(
+            title="⚠️ PEIXE FORTE!",
+            description=f"Tensão da linha! Memorize: **{secret}**\n*(some em 2 segundos...)*",
+            color=discord.Color.orange(),
+        )
+        msg = await interaction.followup.send(embed=qte_embed)
+        catch_ctx["qte_message"] = msg
+        await asyncio.sleep(2)
+        view = TensionQTEView(user_id, secret, catch_ctx)
+        qte_embed.description = "⚠️ **Qual era o número?** Escolha rápido!"
+        await msg.edit(embed=qte_embed, view=view)
+        return
 
-    embed = discord.Embed(title=f"{emoji} P3LUCHE Fishing OS", color=embed_color)
-    
-    # Campo 1: Capturado
-    embed.add_field(name="Capturado:", value=f"**{emoji} {nome}**", inline=False)
-    
-    # Campo 2: Frase
-    embed.add_field(name="P3LUCHE diz:", value=f"*{frase}*", inline=False)
-    
-    # Campo 3: Detalhes
-    cd_minutos = int(actual_cd / 60) if 'actual_cd' in locals() else int(rod_data['cd'] * 5)
-    stats_info = f"**{rod_data['name']}**\n(⏱️ {cd_minutos}m | 🎲 x{rod_data['luck']})"
-    embed.add_field(name="Detalhes", value=stats_info, inline=True)
-
-    # Campo 4: Lucro Visual
-    lucro_visual = f"```diff\n+ {valor} Sachês\n```"
-    embed.add_field(name="Lucro", value=lucro_visual, inline=True)
-    
-    # Rodapé com Clima e Saldo
-    iscas_restantes = inv.get("isca", 0)
-    weather_icon = "☀️" if w_key == "normal" else ("⛈️" if w_key == "bad" else "✨")
-    embed.set_footer(text=f"Saldo: {novo_saldo} | Iscas: {iscas_restantes} | Clima: {weather_icon} {w_stats['name']}")
-
-    if mission_msg:
-        embed.description = f"{mission_msg}" 
-        if mission_completed: embed.color = discord.Color.gold()
-
-    if quest_trigger:
-        bottle_msg = "\n🧴 **Você encontrou uma Garrafa Incrustada!** Use /ler_garrafa para ver o conteúdo."
-        if embed.description: embed.description = f"{embed.description}{bottle_msg}"
-        else: embed.description = bottle_msg
-
-    await interaction.followup.send(embed=embed)
+    await _finalize_pescar(interaction, catch_ctx, edit=False)
 
 # --- VIEW DE ESCOLHA DE EXPLORAÇÃO (ILHA vs CIDADE) ---
 class ExplorationView(discord.ui.View):
@@ -1627,28 +1753,59 @@ async def saldo(interaction: discord.Interaction, usuario: discord.Member = None
     else:
         await interaction.response.send_message(embed=embed)
 
-@eco_group.command(name="diario", description="Resgate diário.")
+@eco_group.command(name="diario", description="Resgate diário com bônus de streak.")
 async def diario(interaction: discord.Interaction):
+    from economy_db import ensure_user, sync_user_to_economy
+
     user_id = interaction.user.id
-    cursor = get_bot_instance().db_conn.cursor()
-    row = cursor.execute("SELECT last_daily FROM economy WHERE user_id = ?", (user_id,)).fetchone()
-    agora_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
-    
-    if row and row['last_daily']:
-        try:
-            last = datetime.strptime(row['last_daily'], "%Y-%m-%d %H:%M:%S.%f")
-            if (datetime.now() - last).total_seconds() < 86400:
+    conn = get_bot_instance().db_conn
+    ensure_v4_tables(conn)
+    ensure_user(conn, user_id, interaction.user.name)
+    sync_user_from_economy(conn, user_id)
+
+    cursor = conn.cursor()
+    row = cursor.execute(
+        "SELECT last_daily, daily_streak FROM user_cooldowns WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    agora = datetime.now()
+    streak = 1
+
+    if row and row["last_daily"]:
+        last = None
+        for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+            try:
+                last = datetime.strptime(row["last_daily"], fmt)
+                break
+            except ValueError:
+                continue
+        if last is None:
+            try:
+                last = datetime.fromisoformat(row["last_daily"])
+            except ValueError:
+                last = None
+        if last:
+            diff_days = (agora.date() - last.date()).days
+            if diff_days == 0:
                 ts = int((last + timedelta(days=1)).timestamp())
                 return await interaction.response.send_message(f"📅 Volte <t:{ts}:R>.", ephemeral=True)
-        except: pass
+            if diff_days == 1:
+                streak = (row["daily_streak"] or 0) + 1
 
-    premio = random.randint(200, 500)
-    cursor.execute("""
-        INSERT INTO economy (user_id, user_name, wallet, last_daily) VALUES (?, ?, ?, ?)
-        ON CONFLICT(user_id) DO UPDATE SET wallet = wallet + ?, last_daily = ?, user_name = ?
-    """, (user_id, interaction.user.name, premio, agora_str, premio, agora_str, interaction.user.name))
-    get_bot_instance().db_conn.commit()
-    await interaction.response.send_message(f"💰 **Diário!** +{premio} Sachês.")
+    base_reward = random.randint(100, 300)
+    bonus = streak * 50
+    total = base_reward + bonus
+    agora_str = agora.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+    cursor.execute("UPDATE users SET wallet = wallet + ? WHERE user_id = ?", (total, user_id))
+    cursor.execute(
+        "UPDATE user_cooldowns SET last_daily = ?, daily_streak = ? WHERE user_id = ?",
+        (agora_str, streak, user_id),
+    )
+    sync_user_to_economy(conn, user_id)
+    conn.commit()
+    await interaction.response.send_message(
+        f"📅 **Diário dia {streak}!** Recebeu **{total}** Sachês (bônus de streak: +{bonus})."
+    )
 
 @eco_group.command(name="rank", description="Hall da Fama.")
 async def rank(interaction: discord.Interaction):
@@ -2736,11 +2893,17 @@ class EconomiaCog(commands.Cog):
     async def cog_load(self):
         self.bot.tree.add_command(eco_group)
         self.bot.tree.add_command(guilda)
+        conn = self.bot.db_conn
+        ensure_v4_tables(conn)
+        seed_market_prices(conn, FISH_DB)
         if not self.weather_cycle.is_running():
             self.weather_cycle.start()
+        if not self.market_cycle.is_running():
+            self.market_cycle.start()
 
     def cog_unload(self):
         self.weather_cycle.cancel()
+        self.market_cycle.cancel()
 
     @tasks.loop(hours=4)
     async def weather_cycle(self):
@@ -2756,6 +2919,40 @@ class EconomiaCog(commands.Cog):
 
     @weather_cycle.before_loop
     async def before_weather_cycle(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(hours=1)
+    async def market_cycle(self):
+        cursor = self.bot.db_conn.cursor()
+        cursor.execute(
+            """
+            UPDATE market_prices
+            SET current_price = CAST(current_price * 0.95 AS INTEGER),
+                last_updated = datetime('now')
+            WHERE fish_name IN (
+                SELECT fish_name FROM fish_sales_history
+                WHERE sale_time > datetime('now', '-1 day')
+                GROUP BY fish_name
+                ORDER BY COUNT(*) DESC LIMIT 5
+            )
+            """
+        )
+        cursor.execute(
+            """
+            UPDATE market_prices
+            SET current_price = CAST(current_price * 1.10 AS INTEGER),
+                last_updated = datetime('now')
+            WHERE fish_name NOT IN (
+                SELECT DISTINCT fish_name FROM fish_sales_history
+                WHERE sale_time > datetime('now', '-1 day')
+            )
+            """
+        )
+        self.bot.db_conn.commit()
+        print("[MERCADO] Preços de peixes atualizados.")
+
+    @market_cycle.before_loop
+    async def before_market_cycle(self):
         await self.bot.wait_until_ready()
 
 

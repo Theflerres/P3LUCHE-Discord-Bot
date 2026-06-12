@@ -24,6 +24,17 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 async def setup_hook():
     bot.db_conn = db_manager.connect()
     db_manager.migrate()
+    try:
+        from migration_v4 import migrate_to_normalized
+
+        report = migrate_to_normalized()
+        if report["migrated"] > 0:
+            log_to_gui(
+                f"Migracao v4: {report['migrated']} jogador(es) sincronizados.",
+                "SUCCESS",
+            )
+    except Exception as e:
+        log_to_gui(f"Migracao v4: {e}", "WARNING")
     set_bot_instance(bot)
 
     # Ordem: Lore/Persona antes de moderação (advertência usa IA).
@@ -33,6 +44,8 @@ async def setup_hook():
         "cogs.jukebox",
         "cogs.musica",
         "cogs.economia",
+        "cogs.minigames",
+        "cogs.casino",
         "cogs.spotify",
         "cogs.sistema",
         "cogs.backup",

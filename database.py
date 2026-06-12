@@ -146,8 +146,14 @@ class DatabaseManager:
         self._add_column_safe("player_lore", "edited_at TIMESTAMP")
         self._add_column_safe("user_memories", "is_active INTEGER DEFAULT 1")
 
+        from economy_constants import FISH_DB
+        from economy_db import ensure_v4_tables, seed_market_prices
+
+        ensure_v4_tables(self.conn)
+        seed_market_prices(self.conn, FISH_DB)
+
         self.conn.commit()
-        print("💾 Banco de Dados atualizado: Sistema v3.1 (Scrap Seas) pronto.")
+        print("💾 Banco de Dados atualizado: Sistema v4.0 (Scrap Seas) pronto.")
 
 
 db_manager = DatabaseManager(DB_PATH)
