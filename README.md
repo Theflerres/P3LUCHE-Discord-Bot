@@ -57,13 +57,13 @@ A **v6.0** marca a transição para uma interface nativa via Tauri, eliminando a
 ## 🏗️ Arquitetura Geral
 
 ```
-┌─────────────────────────────────────────────────┐
-│              P3LUCHE Desktop                    │
-│         Interface Tauri (Rust + Node.js)        │
-│  ┌──────────────┐        ┌────────────────────┐ │
-│  │  Bot Switch  │        │    Log Stream      │ │
-│  │ Liga/Desliga │        │ Monitoramento RT   │ │
-│  └──────┬───────┘        └────────┬───────────┘ │
+┌────────────────────────────────────────────────┐
+│              P3LUCHE Desktop                   │
+│         Interface Tauri (Rust + Node.js)       │
+│  ┌──────────────┐        ┌────────────────────┐│
+│  │  Bot Switch  │        │    Log Stream      ││
+│  │ Liga/Desliga │        │ Monitoramento RT   ││
+│  └──────┬───────┘        └────────┬───────────┘│
 └─────────┼────────────────────────┼─────────────┘
           │   Ponte Nativa (Rust)  │
           ▼                        ▼
@@ -74,7 +74,7 @@ A **v6.0** marca a transição para uma interface nativa via Tauri, eliminando a
 │  │  Gemini  │  │ yt-dlp   │  │  Soft Delete  │  │
 │  │   RAG    │  │  GDrive  │  │  Auditoria    │  │
 │  └──────────┘  └──────────┘  └───────────────┘  │
-│       │              SQLite3 (WAL Mode)          │
+│       │              SQLite3 (WAL Mode)         │
 └───────┼─────────────────────────────────────────┘
         ▼
    Discord API / LLM Local
