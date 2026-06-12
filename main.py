@@ -84,15 +84,16 @@ async def on_ready():
     except Exception:
         pass
 
-
 @bot.event
 async def on_disconnect():
-    if hasattr(bot, "db_conn") and bot.db_conn:
-        try:
-            bot.db_conn.close()
-        except Exception:
-            pass
+    log_to_gui("Bot desconectado; mantendo conexão com o banco para reconexão automática.", "INFO")
 
+@bot.event
+async def on_connect():
+    if not hasattr(bot, "db_conn") or bot.db_conn is None:
+        bot.db_conn = db_manager.connect()
+        db_manager.migrate()
+        log_to_gui("Reconectado e conexão com o banco reaberta.", "INFO")
 
 if __name__ == "__main__":
     try:
