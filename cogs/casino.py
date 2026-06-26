@@ -1,5 +1,7 @@
 """
 Casino P3LUCHE — poker, blackjack, crash e slots.
+
+DESABILITADO: o casino está em manutenção porque o crash está criando lucros excessivos.
 """
 from __future__ import annotations
 
