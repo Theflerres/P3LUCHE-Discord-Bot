@@ -117,8 +117,15 @@ def sync_user_from_economy(conn: sqlite3.Connection, user_id: int) -> None:
 
     cursor.execute(
         """
-        INSERT OR IGNORE INTO users (user_id, user_name, wallet, fish_count, guild_rank, guild_xp, scrap)
+        INSERT INTO users (user_id, user_name, wallet, fish_count, guild_rank, guild_xp, scrap)
         VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id) DO UPDATE SET
+            user_name = excluded.user_name,
+            wallet = excluded.wallet,
+            fish_count = excluded.fish_count,
+            guild_rank = excluded.guild_rank,
+            guild_xp = excluded.guild_xp,
+            scrap = excluded.scrap
         """,
         (
             row["user_id"],
@@ -279,9 +286,8 @@ def ensure_user(conn: sqlite3.Connection, user_id: int, user_name: str = "") -> 
     cursor = conn.cursor()
     ensure_v4_tables(conn)
     row = cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
-    if not row:
-        sync_user_from_economy(conn, user_id)
-        row = cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    sync_user_from_economy(conn, user_id)
+    row = cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
     if not row:
         cursor.execute(
             "INSERT OR IGNORE INTO users (user_id, user_name) VALUES (?, ?)",
@@ -299,10 +305,17 @@ def ensure_user(conn: sqlite3.Connection, user_id: int, user_name: str = "") -> 
         conn.commit()
 
 
+def _coerce_int(value: object, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def get_wallet(conn: sqlite3.Connection, user_id: int) -> int:
     ensure_user(conn, user_id)
     row = conn.execute("SELECT wallet FROM users WHERE user_id = ?", (user_id,)).fetchone()
-    return row["wallet"] if row else 0
+    return _coerce_int(row["wallet"] if row else 0)
 
 
 def modify_wallet(conn: sqlite3.Connection, user_id: int, delta: int, user_name: str = "") -> int:
@@ -313,7 +326,8 @@ def modify_wallet(conn: sqlite3.Connection, user_id: int, delta: int, user_name:
         row = conn.execute(
             "SELECT wallet FROM users WHERE user_id = ?", (user_id,)
         ).fetchone()
-        new_wallet = max(0, (row["wallet"] if row else 0) + delta)
+        current_wallet = _coerce_int(row["wallet"] if row else 0)
+        new_wallet = max(0, current_wallet + delta)
         conn.execute(
             "UPDATE users SET wallet = ? WHERE user_id = ?", (new_wallet, user_id)
         )

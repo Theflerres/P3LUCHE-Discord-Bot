@@ -267,7 +267,7 @@ class BlackjackView(discord.ui.View):
         for child in self.children:
             child.disabled = True
 
-        while _bj_value(self.dealer) < 17:
+        while _bj_value(self.dealer) < 17 and self.deck:
             self.dealer.append(self.deck.pop())
 
         p_val = _bj_value(self.player)
@@ -286,7 +286,8 @@ class BlackjackView(discord.ui.View):
             modify_wallet(conn, uid, win)
             msg = f"🏆 Você venceu! +{win} Sachês"
         elif p_val == d_val:
-            msg = "🤝 Empate!"
+            modify_wallet(conn, uid, self.aposta)
+            msg = f"🤝 Empate! Aposta devolvida (+{self.aposta} Sachês)"
         else:
             modify_wallet(conn, uid, -self.aposta)
             msg = f"💀 Banca vence ({d_val}). -{self.aposta} Sachês"

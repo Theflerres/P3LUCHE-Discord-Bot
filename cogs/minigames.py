@@ -48,6 +48,64 @@ FISH_TYPES = {
 }
 
 TYPE_WEAKNESS = {"Água": "Planta", "Planta": "Fogo", "Fogo": "Água"}
+APPROVAL_CHANNEL_ID = 1176206157380079718
+AUCTION_CHANNEL_ID = 1453842140030435458
+APPROVAL_TIMEOUT_SECONDS = 300
+BOT_OWNER_ID = 299323165937500160
+
+
+def _get_auction_min_bid(item: dict) -> int:
+    rarity = item.get("rarity", "common")
+    rarity_multipliers = {
+        "common": 1.0,
+        "rare": 1.5,
+        "epic": 2.0,
+        "legendary": 3.0,
+        "mythic": 4.0,
+    }
+    return max(50, int(item.get("price", 0) * rarity_multipliers.get(rarity, 1.0) // 2))
+
+
+def build_auction_start_message(item_name: str) -> str:
+    return f"🎉 NOVO LEILÃO INICIADO! O item de hoje é **{item_name}**"
+
+
+def build_auction_approval_embed(item_name: str, rarity: str, min_bid: int) -> discord.Embed:
+    embed = discord.Embed(
+        title="📝 Solicitação de Leilão",
+        description=(
+            f"Um novo leilão foi solicitado para **{item_name}**.\n\n"
+            f"✨ Raridade: **{rarity.title()}**\n"
+            f"💸 Lance mínimo: **{min_bid}** Sachês\n\n"
+            f"⏳ Você tem **5 minutos** para **aprovar** ou **recusar** esta solicitação."
+        ),
+        color=discord.Color.orange(),
+    )
+    return embed
+
+
+def format_time_remaining(total_seconds: int) -> str:
+    remaining = max(0, total_seconds)
+    minutes, seconds = divmod(remaining, 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m {seconds}s"
+
+
+def build_auction_embed(item_name: str, rarity: str, min_bid: int, ends_at: datetime | None = None, participant: str | None = None, last_bid: int | None = None) -> discord.Embed:
+    embed = discord.Embed(
+        title="🔨 Leilão Secreto!",
+        description=(
+            f"Item: **{item_name}**\n"
+            f"Raridade: **{rarity.title()}**\n"
+            f"Lance mínimo: **{min_bid}** Sachês"
+        ),
+        color=discord.Color.purple(),
+    )
+    if ends_at is not None:
+        embed.add_field(name="⏳ Tempo restante", value=format_time_remaining(int((ends_at - datetime.now()).total_seconds())), inline=False)
+    embed.add_field(name="👤 Participante atual", value=participant or "Nenhum", inline=True)
+    embed.add_field(name="💸 Último lance", value=f"{last_bid} Sachês" if last_bid is not None else "Nenhum", inline=True)
+    return embed
 
 
 @eco_group.command(name="craftar", description="Cria iscas especiais com peixes e sucata.")
@@ -318,6 +376,121 @@ async def batalhar(interaction: discord.Interaction, oponente: discord.Member):
 _active_auctions: dict[int, dict] = {}
 
 
+class AuctionView(discord.ui.View):
+    def __init__(self, auction_id: int, item_key: str, item_name: str, min_bid: int, ends_at: datetime):
+        super().__init__(timeout=None)
+        self.auction_id = auction_id
+        self.item_key = item_key
+        self.item_name = item_name
+        self.min_bid = min_bid
+        self.ends_at = ends_at
+
+    @discord.ui.button(label="Dar Lance", style=discord.ButtonStyle.primary, emoji="💸")
+    async def place_bid(self, interaction: discord.Interaction, button: discord.ui.Button):
+        auction = _active_auctions.get(self.auction_id)
+        if not auction:
+            return await interaction.response.send_message("❌ Este leilão já encerrou.", ephemeral=True)
+        if self.ends_at <= datetime.now():
+            _active_auctions.pop(self.auction_id, None)
+            return await interaction.response.send_message("❌ Este leilão já encerrou.", ephemeral=True)
+
+        conn = get_bot_instance().db_conn
+        bidder_id = interaction.user.id
+        bidder_name = interaction.user.display_name
+        ensure_user(conn, bidder_id, bidder_name)
+
+        wallet = get_wallet(conn, bidder_id)
+        current_highest = auction.get("highest", 0)
+        suggested = max(self.min_bid, current_highest + max(10, self.min_bid // 10)) if current_highest > 0 else self.min_bid
+        if wallet < suggested:
+            return await interaction.response.send_message(
+                f"💸 Você precisa de pelo menos {suggested} Sachês para dar este lance.",
+                ephemeral=True,
+            )
+
+        previous_bidder = auction.get("bidder")
+        previous_highest = auction.get("highest", 0)
+        if previous_bidder and previous_bidder != bidder_id:
+            modify_wallet(conn, previous_bidder, previous_highest, auction.get("bidder_name", ""))
+
+        modify_wallet(conn, bidder_id, -suggested, bidder_name)
+        auction["highest"] = suggested
+        auction["bidder"] = bidder_id
+        auction["bidder_name"] = bidder_name
+        auction["last_message"] = interaction.message.id
+
+        embed = build_auction_embed(
+            self.item_name,
+            auction.get("rarity", "common"),
+            auction.get("min_bid", self.min_bid),
+            auction.get("ends"),
+            bidder_name,
+            suggested,
+        )
+        await interaction.message.edit(embed=embed)
+
+        await interaction.response.send_message(
+            f"✅ Lance de **{suggested} Sachês** aceito para **{self.item_name}**.",
+            ephemeral=True,
+        )
+
+
+class AuctionApprovalView(discord.ui.View):
+    def __init__(self, bot, item_key: str, item_name: str, min_bid: int, rarity: str):
+        super().__init__(timeout=APPROVAL_TIMEOUT_SECONDS)
+        self.bot = bot
+        self.item_key = item_key
+        self.item_name = item_name
+        self.min_bid = min_bid
+        self.rarity = rarity
+        self.message: discord.Message | None = None
+        self.approval_completed = asyncio.Event()
+        self.approved = False
+
+    async def _is_approver(self, user: discord.User) -> bool:
+        return user.id == BOT_OWNER_ID
+
+    async def _start_auction(self, interaction: discord.Interaction):
+        await interaction.response.send_message("✅ Leilão aprovado. Iniciando...", ephemeral=True)
+        self.approved = True
+        self.approval_completed.set()
+        await self.bot.get_cog("MinigamesCog")._launch_auction(
+            self.item_key,
+            self.item_name,
+            self.min_bid,
+            self.rarity,
+        )
+
+    async def _reject_auction(self, interaction: discord.Interaction):
+        self.approval_completed.set()
+        if self.message:
+            await self.message.edit(content="❌ Leilão recusado pelo aprovador.", view=None, embed=None)
+        await interaction.response.send_message("❌ Leilão recusado.", ephemeral=True)
+
+    @discord.ui.button(label="✅ Aprovar", style=discord.ButtonStyle.success)
+    async def approve(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._is_approver(interaction.user):
+            return await interaction.response.send_message("❌ Apenas o dono do bot pode aprovar ou recusar este leilão.", ephemeral=True)
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            await self.message.edit(content="✅ Leilão aprovado! Iniciando no canal de jogadores...", view=self)
+        await self._start_auction(interaction)
+
+    @discord.ui.button(label="❌ Recusar", style=discord.ButtonStyle.danger)
+    async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._is_approver(interaction.user):
+            return await interaction.response.send_message("❌ Apenas o dono do bot pode aprovar ou recusar este leilão.", ephemeral=True)
+        for child in self.children:
+            child.disabled = True
+        await self._reject_auction(interaction)
+
+    async def on_timeout(self) -> None:
+        self.approval_completed.set()
+        if self.message:
+            await self.message.edit(content="⏰ Tempo de aprovação encerrado. Leilão não iniciado.", view=None, embed=None)
+
+
 class MinigamesCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
@@ -329,43 +502,51 @@ class MinigamesCog(commands.Cog):
     def cog_unload(self):
         self.auction_loop.cancel()
 
-    @tasks.loop(hours=12)
-    async def auction_loop(self):
-        await self.bot.wait_until_ready()
-        item_key = random.choice(
-            [k for k, v in SHOP_ITEMS.items() if v.get("price", 0) > 0]
-        )
+    async def _launch_auction(self, item_key: str, item_name: str, min_bid: int, rarity: str):
         item = SHOP_ITEMS[item_key]
-        channel = None
-        for guild in self.bot.guilds:
-            for ch in guild.text_channels:
-                if ch.permissions_for(guild.me).send_messages:
-                    channel = ch
-                    break
-            if channel:
-                break
+        channel = self.bot.get_channel(AUCTION_CHANNEL_ID)
         if not channel:
-            return
+            channel = await self.bot.fetch_channel(AUCTION_CHANNEL_ID)
 
-        embed = discord.Embed(
-            title="🔨 Leilão Secreto!",
-            description=(
-                f"Item: **{item['name']}**\n"
-                f"Lance mínimo: **{max(50, item['price'] // 2)}** Sachês\n"
-                f"⏰ Encerra em 1 hora!"
-            ),
-            color=discord.Color.purple(),
-        )
-        msg = await channel.send(embed=embed)
+        ends_at = datetime.now() + timedelta(hours=1)
+        embed = build_auction_embed(item_name, rarity, min_bid, ends_at)
+        view = AuctionView(0, item_key, item_name, min_bid, datetime.now() + timedelta(hours=1))
+        content = build_auction_start_message(item_name)
+        msg = await channel.send(content=content, embed=embed, view=view)
         ends = datetime.now() + timedelta(hours=1)
         _active_auctions[msg.id] = {
             "item_key": item_key,
             "highest": 0,
             "bidder": None,
+            "bidder_name": None,
             "ends": ends,
             "channel_id": channel.id,
+            "item_name": item_name,
+            "min_bid": min_bid,
+            "rarity": rarity,
+            "message_id": msg.id,
         }
-        await asyncio.sleep(3600)
+        view.auction_id = msg.id
+        await msg.edit(view=view)
+
+        while True:
+            auction = _active_auctions.get(msg.id)
+            if not auction:
+                break
+            if datetime.now() >= auction["ends"]:
+                break
+            try:
+                await msg.edit(embed=build_auction_embed(
+                    auction["item_name"],
+                    auction.get("rarity", "common"),
+                    auction.get("min_bid", min_bid),
+                    auction["ends"],
+                    auction.get("bidder_name"),
+                    auction.get("highest"),
+                ))
+            except discord.NotFound:
+                break
+            await asyncio.sleep(10)
 
         auction = _active_auctions.pop(msg.id, None)
         if not auction:
@@ -376,10 +557,33 @@ class MinigamesCog(commands.Cog):
             winner = await self.bot.fetch_user(auction["bidder"])
             await channel.send(
                 f"🏆 Leilão encerrado! **{winner.mention}** venceu com "
-                f"**{auction['highest']}** Sachês e recebeu **{item['name']}**!"
+                f"**{auction['highest']}** Sachês e recebeu **{item_name}**!"
             )
         else:
             await channel.send("😢 Leilão encerrado sem lances.")
+
+    @tasks.loop(hours=12)
+    async def auction_loop(self):
+        await self.bot.wait_until_ready()
+        item_key = random.choice(
+            [k for k, v in SHOP_ITEMS.items() if v.get("price", 0) > 0]
+        )
+        item = SHOP_ITEMS[item_key]
+        min_bid = _get_auction_min_bid(item)
+        approval_channel = self.bot.get_channel(APPROVAL_CHANNEL_ID)
+        if not approval_channel:
+            approval_channel = await self.bot.fetch_channel(APPROVAL_CHANNEL_ID)
+
+        if not approval_channel:
+            return
+
+        embed = build_auction_approval_embed(item['name'], item.get('rarity', 'common'), min_bid)
+        view = AuctionApprovalView(self.bot, item_key, item['name'], min_bid, item.get('rarity', 'common'))
+        msg = await approval_channel.send(embed=embed, view=view)
+        view.message = msg
+        await view.approval_completed.wait()
+        if not view.approved:
+            return
 
     @auction_loop.before_loop
     async def before_auction(self):

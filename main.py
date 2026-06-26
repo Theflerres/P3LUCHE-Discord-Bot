@@ -45,12 +45,12 @@ async def setup_hook():
         "cogs.musica",
         "cogs.economia",
         "cogs.minigames",
-        "cogs.casino",
+        # "cogs.casino",  # Desabilitado temporariamente até correção do crash
         "cogs.spotify",
         "cogs.sistema",
         "cogs.backup",
-        "cogs.erros", 
-        "cogs.logs",   
+        "cogs.erros",
+        "cogs.logs",
     ]
     for ext in extensions:
         try:
