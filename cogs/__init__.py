@@ -1,1 +1,3 @@
-# Pacote de extensões (Cogs) do P3LUCHE.
+from pathlib import Path
+
+__path__ = [str(Path(__file__).resolve().parent.parent / "src" / "p3luche" / "cogs")]
