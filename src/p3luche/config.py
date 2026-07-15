@@ -1,5 +1,7 @@
-"""
-Configuração central do P3LUCHE — constantes, IDs, caminhos e estado global.
+"""Configuração central do P3LUCHE.
+
+Centraliza constantes, IDs, caminhos de arquivos locais, variáveis de ambiente
+necessárias ao bot e algumas estruturas compartilhadas usadas por diferentes cogs.
 """
 import os
 import threading

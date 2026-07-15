@@ -1,5 +1,8 @@
-"""
-Funções utilitárias isoladas — logging, texto, anexos e helpers visuais.
+"""Helpers reutilizáveis do projeto.
+
+Este módulo reúne funções pequenas e transversais, como logging, limpeza de
+texto, extração de conteúdo a partir de anexos, normalização de títulos e
+auxílios para construir elementos visuais nas respostas do bot.
 """
 import os
 import re

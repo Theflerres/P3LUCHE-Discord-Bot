@@ -1,5 +1,8 @@
-"""
-Gerenciamento SQLite — criação de tabelas, migrações e instância global.
+"""Gerenciamento da camada de persistência SQLite.
+
+Responsável por abrir a conexão com o banco, criar as tabelas principais,
+adicionar colunas de forma segura e aplicar migrações de estrutura para os
+módulos de economia, música, lore e memória do bot.
 """
 import sqlite3
 

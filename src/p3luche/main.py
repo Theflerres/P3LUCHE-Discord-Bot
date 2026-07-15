@@ -1,5 +1,9 @@
-"""
-P3LUCHE — ponto de entrada. Carrega extensões (Cogs), banco SQLite e inicia o bot.
+"""Ponto de entrada do bot Discord.
+
+Este módulo cria a instância do bot, registra os intents necessários,
+carrega as cogs principais e inicializa a conexão com o banco SQLite.
+A configuração do ambiente é feita via módulos auxiliares, e o fluxo de
+startup inclui migrações de esquema e sincronização de comandos slash.
 """
 import asyncio
 import sqlite3
@@ -37,7 +41,8 @@ async def setup_hook():
         log_to_gui(f"Migracao v4: {e}", "WARNING")
     set_bot_instance(bot)
 
-    # Ordem: Lore/Persona antes de moderação (advertência usa IA).
+    # Ordem de carregamento: primeiro os módulos que fornecem contexto e IA,
+    # depois os que dependem de advertências ou integração com o resto do bot.
     extensions = [
         "cogs.lore_ai",
         "cogs.moderacao",
