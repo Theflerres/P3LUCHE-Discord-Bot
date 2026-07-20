@@ -3,6 +3,7 @@
 Centraliza constantes, IDs, caminhos de arquivos locais, variáveis de ambiente
 necessárias ao bot e algumas estruturas compartilhadas usadas por diferentes cogs.
 """
+import asyncio
 import os
 import threading
 
@@ -73,9 +74,11 @@ db_lock = threading.Lock()
 
 # Contador em memória de pescas desde o último restart do bot.
 # Usado para garantir a garrafa na 2ª pesca após reinício.
-CATCHES_SINCE_RESTART = {}
-# Trava para proteger o contador em ambientes multi-thread
-CATCHES_LOCK = threading.Lock()
+CATCHES_SINCE_RESTART: dict[int, tuple[int, float]] = {}
+# Tempo de expiração para entradas inativas no contador.
+CATCHES_TTL_SECONDS = 60 * 60 * 24  # 24 horas
+# Trava assíncrona para proteger o contador em coroutines do bot.
+CATCHES_LOCK = asyncio.Lock()
 
 # Referência ao bot (preenchida em main.setup_hook) para cogs que precisam
 # acessar a instância sem passar por todos os construtores legados.

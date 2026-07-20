@@ -529,26 +529,29 @@ class MinigamesCog(commands.Cog):
         view.auction_id = msg.id
         await msg.edit(view=view)
 
-        while True:
-            auction = _active_auctions.get(msg.id)
-            if not auction:
-                break
-            if datetime.now() >= auction["ends"]:
-                break
-            try:
-                await msg.edit(embed=build_auction_embed(
-                    auction["item_name"],
-                    auction.get("rarity", "common"),
-                    auction.get("min_bid", min_bid),
-                    auction["ends"],
-                    auction.get("bidder_name"),
-                    auction.get("highest"),
-                ))
-            except discord.NotFound:
-                break
-            await asyncio.sleep(10)
+        auction = None
+        try:
+            while True:
+                auction = _active_auctions.get(msg.id)
+                if not auction:
+                    break
+                if datetime.now() >= auction["ends"]:
+                    break
+                try:
+                    await msg.edit(embed=build_auction_embed(
+                        auction["item_name"],
+                        auction.get("rarity", "common"),
+                        auction.get("min_bid", min_bid),
+                        auction["ends"],
+                        auction.get("bidder_name"),
+                        auction.get("highest"),
+                    ))
+                except discord.NotFound:
+                    break
+                await asyncio.sleep(10)
+        finally:
+            auction = _active_auctions.pop(msg.id, None)
 
-        auction = _active_auctions.pop(msg.id, None)
         if not auction:
             return
         if auction["bidder"]:

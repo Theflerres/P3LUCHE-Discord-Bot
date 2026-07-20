@@ -226,10 +226,27 @@ async def bot_stop() -> dict[str, Any]:
             _bot_process.wait(timeout=5)
         except subprocess.TimeoutExpired:
             _bot_process.kill()
-        _bot_process = None
-        return {"ok": True}
+            try:
+                _bot_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"Erro ao parar bot: {exc}") from exc
+    finally:
+        if _bot_process is not None:
+            if _bot_process.stdout is not None:
+                try:
+                    _bot_process.stdout.close()
+                except Exception:
+                    pass
+            if _bot_process.stderr is not None:
+                try:
+                    _bot_process.stderr.close()
+                except Exception:
+                    pass
+            _bot_process = None
+
+    return {"ok": True}
 
 
 # ── BOT STATS ─────────────────────────────────────────────────────────────

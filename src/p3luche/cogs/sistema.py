@@ -2,6 +2,7 @@
 Comandos gerais — ajuda, stats, apoiadores, mensagens manuais, debug e grupo /ia.
 """
 import json
+import time
 from datetime import datetime
 
 import discord
@@ -12,10 +13,18 @@ from discord.ext import commands
 from config import (
     CATCHES_LOCK,
     CATCHES_SINCE_RESTART,
+    CATCHES_TTL_SECONDS,
     CREATOR_ID,
     MOD_ROLE_IDS,
     set_bot_instance,
 )
+
+
+def _cleanup_stale_catches() -> None:
+    now = time.time()
+    expired = [uid for uid, (_, ts) in CATCHES_SINCE_RESTART.items() if now - ts > CATCHES_TTL_SECONDS]
+    for uid in expired:
+        CATCHES_SINCE_RESTART.pop(uid, None)
 
 
 class HelpSelect(discord.ui.Select):
@@ -298,8 +307,13 @@ class SistemaCog(commands.Cog):
     async def catches_inspect(self, interaction: discord.Interaction):
         if interaction.user.id != CREATOR_ID:
             return await interaction.response.send_message("🚫 Apenas o criador pode usar.", ephemeral=True)
-        with CATCHES_LOCK:
-            items = sorted(CATCHES_SINCE_RESTART.items(), key=lambda x: x[1], reverse=True)
+        async with CATCHES_LOCK:
+            _cleanup_stale_catches()
+            items = sorted(
+                ((uid, data[0]) for uid, data in CATCHES_SINCE_RESTART.items()),
+                key=lambda x: x[1],
+                reverse=True,
+            )
         if not items:
             return await interaction.response.send_message(
                 "Nenhuma pesca registrada desde o restart.",
@@ -313,7 +327,7 @@ class SistemaCog(commands.Cog):
     async def catches_reset(self, interaction: discord.Interaction, user: discord.User = None):
         if interaction.user.id != CREATOR_ID:
             return await interaction.response.send_message("🚫 Apenas o criador pode usar.", ephemeral=True)
-        with CATCHES_LOCK:
+        async with CATCHES_LOCK:
             if user:
                 removed = CATCHES_SINCE_RESTART.pop(user.id, None)
                 await interaction.response.send_message(

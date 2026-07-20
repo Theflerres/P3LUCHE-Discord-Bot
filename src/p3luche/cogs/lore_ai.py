@@ -316,9 +316,12 @@ class P3luchePersona(commands.Cog):
         self.status_rotation_loop.start()
 
     def cog_unload(self):
-        self.random_event_loop.cancel()
-        self.standby_check_loop.cancel()
-        self.status_rotation_loop.cancel()
+        if self.random_event_loop.is_running():
+            self.random_event_loop.cancel()
+        if self.standby_check_loop.is_running():
+            self.standby_check_loop.cancel()
+        if self.status_rotation_loop.is_running():
+            self.status_rotation_loop.cancel()
 
     # ── Standby ──
     async def register_activity(self):

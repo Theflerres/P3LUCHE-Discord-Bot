@@ -1,3 +1,4 @@
+import asyncio
 import discord
 from discord.ext import commands
 from datetime import datetime
@@ -8,6 +9,7 @@ import sys
 class SistemaLogs(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self._exception_tasks: set[asyncio.Task] = set()
         # ID do canal privado de auditoria (servidor pessoal)
         self.canal_auditoria_id = 1489330740876284206
 
@@ -295,7 +297,9 @@ class SistemaLogs(commands.Cog):
                     )
                     embed.set_footer(text="Este erro ocorreu FORA do loop de eventos.")
                     await _self.enviar_log(embed)
-                loop.create_task(_enviar())
+                task = loop.create_task(_enviar())
+                self._exception_tasks.add(task)
+                task.add_done_callback(self._exception_tasks.discard)
 
         sys.excepthook = _hook
 

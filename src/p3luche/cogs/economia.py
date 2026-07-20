@@ -9,6 +9,7 @@ import json
 import os
 import random
 import re
+import time
 from collections import Counter
 from datetime import datetime, timedelta
 
@@ -16,14 +17,24 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
-from config import get_bot_instance, set_bot_instance
+from config import (
+    get_bot_instance,
+    set_bot_instance,
+    CATCHES_LOCK,
+    CATCHES_SINCE_RESTART,
+    CATCHES_TTL_SECONDS,
+)
 from utils import get_local_file, log_to_gui
 from economy_constants import FISH_DB
 from economy_db import ensure_v4_tables, log_fish_sale, seed_market_prices, sync_user_from_economy
 
-# Adicione estas duas linhas aqui:
-CATCHES_LOCK = threading.Lock()
-CATCHES_SINCE_RESTART = {}
+
+def _cleanup_stale_catches() -> None:
+    now = time.time()
+    expired = [uid for uid, (_, ts) in CATCHES_SINCE_RESTART.items() if now - ts > CATCHES_TTL_SECONDS]
+    for uid in expired:
+        CATCHES_SINCE_RESTART.pop(uid, None)
+
 
 # --- SISTEMA DE ECONOMIA V3.1 (CORREÇÃO DE DATAS PYTHON 3.12) ---
 # --- 1. CONFIGURAÇÃO DE ITENS E PEIXES ---
@@ -1089,9 +1100,11 @@ async def pescar(interaction: discord.Interaction):
     already_has = inv.get('garrafa_incrustada', 0) > 0
 
     if not already_has:
-        with CATCHES_LOCK:
-            CATCHES_SINCE_RESTART[user_id] = CATCHES_SINCE_RESTART.get(user_id, 0) + 1
-            session_count = CATCHES_SINCE_RESTART[user_id]
+        async with CATCHES_LOCK:
+            _cleanup_stale_catches()
+            previous_count, _ = CATCHES_SINCE_RESTART.get(user_id, (0, 0.0))
+            session_count = previous_count + 1
+            CATCHES_SINCE_RESTART[user_id] = (session_count, time.time())
 
         try:
             cursor.execute("""
@@ -2900,10 +2913,25 @@ class EconomiaCog(commands.Cog):
             self.weather_cycle.start()
         if not self.market_cycle.is_running():
             self.market_cycle.start()
+        if not self.catch_cleanup_loop.is_running():
+            self.catch_cleanup_loop.start()
 
     def cog_unload(self):
-        self.weather_cycle.cancel()
-        self.market_cycle.cancel()
+        if self.weather_cycle.is_running():
+            self.weather_cycle.cancel()
+        if self.market_cycle.is_running():
+            self.market_cycle.cancel()
+        if self.catch_cleanup_loop.is_running():
+            self.catch_cleanup_loop.cancel()
+
+    @tasks.loop(hours=1)
+    async def catch_cleanup_loop(self):
+        async with CATCHES_LOCK:
+            _cleanup_stale_catches()
+
+    @catch_cleanup_loop.before_loop
+    async def before_catch_cleanup(self):
+        await self.bot.wait_until_ready()
 
     @tasks.loop(hours=4)
     async def weather_cycle(self):

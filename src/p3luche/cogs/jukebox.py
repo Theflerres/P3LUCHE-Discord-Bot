@@ -539,6 +539,7 @@ class MusicaV2(commands.Cog):
         self.queues.pop(guild_id, None)
         self.voice_clients.pop(guild_id, None)
         self.current_tracks.pop(guild_id, None)
+        self._locks.pop(guild_id, None)
         task = self._alone_tasks.pop(guild_id, None)
         if task and not task.done():
             task.cancel()
