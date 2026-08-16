@@ -42,6 +42,7 @@ from config import (
     set_bot_instance,
 )
 from utils import COOKIE_FILE, log_to_gui
+from cogs.musica import check_channel_permission
 
 
 # Cores padronizadas para embeds
@@ -768,6 +769,8 @@ class MusicaV2(commands.Cog):
     @app_commands.command(name="tocar", description="Toca uma música do banco (Drive). Sem busca, abre o cardápio.")
     @app_commands.autocomplete(busca=_tocar_autocomplete)
     async def tocar(self, interaction: discord.Interaction, busca: Optional[str] = None):
+        if not await check_channel_permission(interaction):
+            return
         await interaction.response.defer(thinking=True)
         voice = await self._ensure_voice(interaction)
         if not voice or not interaction.guild:
@@ -840,6 +843,8 @@ class MusicaV2(commands.Cog):
 
     @app_commands.command(name="cardapio", description="Mostra um cardápio para escolher música do Drive.")
     async def cardapio(self, interaction: discord.Interaction):
+        if not await check_channel_permission(interaction):
+            return
         await interaction.response.defer(thinking=True, ephemeral=True)
         matches = await self._search_db("", limit=25)
         if not matches:
@@ -861,6 +866,8 @@ class MusicaV2(commands.Cog):
 
     @app_commands.command(name="tocar_url", description="Toca uma URL externa com yt-dlp.")
     async def tocar_url(self, interaction: discord.Interaction, url: str):
+        if not await check_channel_permission(interaction):
+            return
         await interaction.response.defer(thinking=True)
         voice = await self._ensure_voice(interaction)
         if not voice or not interaction.guild:
@@ -902,6 +909,8 @@ class MusicaV2(commands.Cog):
     @app_commands.command(name="adicionar", description="Adiciona música do banco à fila.")
     @app_commands.autocomplete(busca=_tocar_autocomplete)
     async def adicionar(self, interaction: discord.Interaction, busca: str):
+        if not await check_channel_permission(interaction):
+            return
         await interaction.response.defer(thinking=True, ephemeral=True)
         if not interaction.guild:
             return
@@ -921,6 +930,8 @@ class MusicaV2(commands.Cog):
 
     @app_commands.command(name="adicionar_url", description="Adiciona uma URL externa à fila.")
     async def adicionar_url(self, interaction: discord.Interaction, url: str):
+        if not await check_channel_permission(interaction):
+            return
         await interaction.response.defer(thinking=True, ephemeral=True)
         if not interaction.guild:
             return
@@ -956,6 +967,8 @@ class MusicaV2(commands.Cog):
 
     @app_commands.command(name="pausar", description="Pausa a música atual.")
     async def pausar(self, interaction: discord.Interaction):
+        if not await check_channel_permission(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         voice = interaction.guild.voice_client if interaction.guild else None
         if not voice or not voice.is_playing():
@@ -968,6 +981,8 @@ class MusicaV2(commands.Cog):
 
     @app_commands.command(name="retomar", description="Retoma a música pausada.")
     async def retomar(self, interaction: discord.Interaction):
+        if not await check_channel_permission(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         voice = interaction.guild.voice_client if interaction.guild else None
         if not voice or not voice.is_paused():
@@ -980,6 +995,8 @@ class MusicaV2(commands.Cog):
 
     @app_commands.command(name="parar", description="Para a reprodução e desconecta o bot.")
     async def parar(self, interaction: discord.Interaction):
+        if not await check_channel_permission(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         if not interaction.guild:
             return
@@ -999,6 +1016,8 @@ class MusicaV2(commands.Cog):
 
     @app_commands.command(name="pular", description="Pula para a próxima música da fila.")
     async def pular(self, interaction: discord.Interaction):
+        if not await check_channel_permission(interaction):
+            return
         await interaction.response.defer(ephemeral=True)
         voice = interaction.guild.voice_client if interaction.guild else None
         if not voice or not (voice.is_playing() or voice.is_paused()):
@@ -1013,6 +1032,8 @@ class MusicaV2(commands.Cog):
 
     @app_commands.command(name="fila", description="Mostra a fila atual.")
     async def fila(self, interaction: discord.Interaction):
+        if not await check_channel_permission(interaction):
+            return
         if not interaction.guild:
             await interaction.response.send_message(
                 embed=_music_embed("Sem guild", "Comando disponível apenas em servidor.", COLOR_ERROR), ephemeral=True

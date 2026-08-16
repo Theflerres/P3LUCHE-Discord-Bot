@@ -25,7 +25,9 @@ def _upload_db_sync(local_path: str, remote_name: str) -> str:
     media = MediaFileUpload(local_path, mimetype="application/x-sqlite3", resumable=True)
     file = service.files().create(body=metadata, media_body=media, fields="id").execute()
     fid = file.get("id")
-    service.permissions().create(fileId=fid, body={"role": "reader", "type": "anyone"}).execute()
+    # Sem permissions().create(): o arquivo fica privado, visível apenas para a
+    # conta (service account/OAuth) que já autentica o Drive do bot. Nunca
+    # compartilhar o backup do banco publicamente (contém economia, moderação etc).
     return f"https://drive.google.com/file/d/{fid}/view"
 
 

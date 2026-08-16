@@ -7,7 +7,7 @@ import os
 from datetime import datetime
 from typing import Optional
 
-from config import LOG_FOLDER, WARN_CHANNEL_ID
+from config import ERROR_LOG_CHANNEL_ID, LOG_FOLDER
 
 # --- CONFIGURAÇÃO DE LOGGING ---
 ERRO_LOG_FILE = os.path.join(LOG_FOLDER, "bot_erros.log")
@@ -37,9 +37,20 @@ class TratamentoErros(commands.Cog):
         bot.tree.on_error = self.on_app_command_error
 
     async def cog_load(self):
-        """Obtém referência do canal de logs de erro ao carregar a cog."""
+        """Obtém referência do canal PRIVADO de logs de erro ao carregar a cog.
+
+        Nunca usar WARN_CHANNEL_ID aqui: esse é o canal público de advertências
+        de moderação, e stack traces completos (caminhos de arquivo, nomes de
+        variável etc.) não podem vazar para lá.
+        """
+        if not ERROR_LOG_CHANNEL_ID:
+            logger.warning(
+                "ERROR_LOG_CHANNEL_ID não configurado — stack traces não serão "
+                "enviados a nenhum canal do Discord, só ao arquivo de log local."
+            )
+            return
         try:
-            self.error_log_channel = self.bot.get_channel(WARN_CHANNEL_ID)
+            self.error_log_channel = self.bot.get_channel(ERROR_LOG_CHANNEL_ID)
         except:
             logger.warning("Não foi possível obter o canal de logs de erro")
 

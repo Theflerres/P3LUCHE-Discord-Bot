@@ -142,6 +142,8 @@ class DatabaseManager:
         self._add_column_safe("economy", "fish_count INTEGER DEFAULT 0")
 
         self._add_column_safe("warnings", "status TEXT DEFAULT 'active'")
+        self._add_column_safe("warnings", "revoked_by TEXT")
+        self._add_column_safe("warnings", "revoked_at TIMESTAMP")
         self._add_column_safe("music_cache", "is_active INTEGER DEFAULT 1")
         self._add_column_safe("music_cache", "edited_by TEXT")
         self._add_column_safe("music_cache", "edited_at TIMESTAMP")

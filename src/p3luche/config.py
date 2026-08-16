@@ -39,6 +39,14 @@ WARN_CHANNEL_ID = 1349002209794195526
 MOD_ROLE_IDS = [1444846159850901584, 1282147756814766132]
 CREATOR_ID = 299323165937500160
 
+# Canal privado/staff para stack traces e detalhes técnicos de erro (NUNCA o
+# mesmo canal usado para advertências públicas). Configure via .env:
+# ERROR_LOG_CHANNEL_ID=<id_do_canal>. Sem essa variável, o bot não envia
+# stack traces a canal nenhum do Discord (só grava em database/bot_erros.log)
+# em vez de cair de volta para um canal público por engano.
+_error_log_channel_env = os.getenv("ERROR_LOG_CHANNEL_ID")
+ERROR_LOG_CHANNEL_ID = int(_error_log_channel_env) if _error_log_channel_env else None
+
 # --- LIMITES MÚSICA ---
 MAX_SONG_SIZE_MB = 3000
 STANDBY_TIMEOUT_MINUTES = 20
