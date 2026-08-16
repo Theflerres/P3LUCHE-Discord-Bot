@@ -26,7 +26,25 @@ from config import (
 )
 from utils import get_local_file, log_to_gui
 from economy_constants import FISH_DB
-from economy_db import ensure_v4_tables, log_fish_sale, seed_market_prices, sync_user_from_economy
+from economy_db import (
+    add_inventory_item,
+    ensure_user,
+    ensure_v4_tables,
+    get_cooldowns,
+    get_inventory,
+    get_rod_upgrades,
+    get_scrap,
+    get_wallet,
+    log_fish_sale,
+    modify_wallet,
+    seed_market_prices,
+    set_cooldown,
+    set_current_rod,
+    sync_user_from_economy,
+    sync_user_to_economy,
+    try_spend_wallet,
+    try_upgrade_rod,
+)
 
 
 def _cleanup_stale_catches() -> None:
@@ -181,7 +199,7 @@ ROD_STATS = {
 SHOP_ITEMS = {
     # --- CONSUMÍVEIS (Buffs para Pesca) ---
     "isca": {"name": "Isca Minhoca", "price": 50, "type": "consumable", "rarity": "common", "desc": "Reduz lixo pela metade (+Valor)."},
-    "energetico": {"name": "Energético", "price": 150, "type": "buff", "rarity": "common", "desc": "Reseta cooldown imediatamente."},
+    "energetico": {"name": "Energético", "price": 900, "type": "buff", "rarity": "common", "desc": "Reseta cooldown imediatamente."},
     "rede": {"name": "Rede de Mão", "price": 400, "type": "consumable", "rarity": "uncommon", "desc": "Pega 3 itens de uma vez (Consumível)."},
     "caixa_misteriosa": {"name": "Caixa Misteriosa", "price": 500, "type": "box", "rarity": "rare", "desc": "Pode ter dinheiro, itens ou nada."},
     
@@ -458,7 +476,11 @@ def get_daily_shop():
     # Coloque aqui o ID (key) exato do item de quest que vazou na loja
     ban_list = [
         "chave_antiga", "mapa_tesouro", "item_de_quest_aqui", # Exemplo
-        "vara_void", "admin_item" # Outros itens proibidos
+        "vara_void", "admin_item", # Outros itens proibidos
+        # isca_eletrica descontinuada: efeito idêntico ao chip_sorte por
+        # 1/15 do preço (mesma flag used_chip, mesmo pool tier>=2). Fica na
+        # SHOP_ITEMS só pra quem já possui cópias continuar usando/vendendo.
+        "isca_eletrica",
     ]
 
     final_shop = []
@@ -595,30 +617,28 @@ async def loja(interaction: discord.Interaction):
         
         if not item_stats: return await inter.response.send_message("❌ Item sumiu.", ephemeral=True)
 
-        cursor = get_bot_instance().db_conn.cursor()
-        row = cursor.execute("SELECT wallet, inventory FROM economy WHERE user_id = ?", (inter.user.id,)).fetchone()
-        
-        if not row: return await inter.response.send_message("❌ Crie conta com /eco pescar.", ephemeral=True)
-            
-        wallet = row['wallet']
-        inv = json.loads(row['inventory']) if row['inventory'] else {}
+        conn = get_bot_instance().db_conn
+        has_account = conn.execute("SELECT 1 FROM economy WHERE user_id = ?", (inter.user.id,)).fetchone()
+        if not has_account: return await inter.response.send_message("❌ Crie conta com /eco pescar.", ephemeral=True)
+
         tipo = item_stats.get('type')
 
-        # ROTA A: VARAS (Compra 1x Direto e Salva no Inventário)
+        # ROTA A: VARAS (Compra 1x Direto e Salva no Inventário) — atômico:
+        # relê saldo fresco na hora de gravar em vez de um valor capturado
+        # antes.
         if tipo == 'rod':
             custo = item_stats['price']
-            if wallet < custo: return await inter.response.send_message(f"💸 Falta grana ({custo}).", ephemeral=True)
-            
-            # Adiciona na mochila (inv) E equipa (current_rod)
-            inv[item_key] = 1 
-            cursor.execute("UPDATE economy SET wallet = wallet - ?, inventory = ?, current_rod = ? WHERE user_id = ?", (custo, json.dumps(inv), item_key, inter.user.id))
-            get_bot_instance().db_conn.commit()
-            
+            if not try_spend_wallet(conn, inter.user.id, custo, inter.user.name):
+                return await inter.response.send_message(f"💸 Falta grana ({custo}).", ephemeral=True)
+
+            add_inventory_item(conn, inter.user.id, item_key, 1)
+            set_current_rod(conn, inter.user.id, item_key)
+
             await inter.response.send_message(f"🎣 **Compra Efetuada!**\n**{item_stats['name']}** foi adicionada à mochila e equipada.", ephemeral=True)
 
         # ROTA B: CONSUMÍVEIS (Abre Modal de Quantidade)
         else:
-            modal = CompraQuantidadeModal(item_key, item_stats, wallet, inv, inter.user.id, get_bot_instance())
+            modal = CompraQuantidadeModal(item_key, item_stats, inter.user.id, get_bot_instance())
             await inter.response.send_modal(modal)
 
     select.callback = shop_callback
@@ -646,37 +666,25 @@ async def comprar(interaction: discord.Interaction, item: str):
             return await interaction.response.send_message(f"🚫 O item `{item}` não está na loja hoje.", ephemeral=True)
 
     if item not in SHOP_ITEMS: return await interaction.response.send_message("❌ Item inválido.", ephemeral=True)
-    
+
     data = SHOP_ITEMS[item]
     price = data['price']
-    cursor = get_bot_instance().db_conn.cursor()
-    row = cursor.execute("SELECT wallet, inventory FROM economy WHERE user_id = ?", (user_id,)).fetchone()
-    
-    if not row: return await interaction.response.send_message("❌ Use /eco pescar primeiro.", ephemeral=True)
-    if row['wallet'] < price: return await interaction.response.send_message(f"💸 Sem saldo ({row['wallet']} < {price}).", ephemeral=True)
+    conn = get_bot_instance().db_conn
 
-    # --- COMPRA E ARMAZENAMENTO ---
-    new_wallet = row['wallet'] - price
-    
-    # Carrega mochila atual
-    try:
-        inv = json.loads(row['inventory']) if row['inventory'] else {}
-    except (json.JSONDecodeError, TypeError) as e:
-        log_to_gui(f"Erro ao carregar inventário na compra: {e}", "WARNING")
-        inv = {}
+    # Exige conta já existente (não cria uma nova aqui) — mesmo gate de
+    # antes, só que checando a tabela legada em vez de reler manualmente.
+    has_account = conn.execute("SELECT 1 FROM economy WHERE user_id = ?", (user_id,)).fetchone()
+    if not has_account: return await interaction.response.send_message("❌ Use /eco pescar primeiro.", ephemeral=True)
 
-    # Adiciona o item na mochila (SOMA +1)
-    inv[item] = inv.get(item, 0) + 1
+    # --- COMPRA E ARMAZENAMENTO (atômico: relê saldo fresco na hora de gravar) ---
+    if not try_spend_wallet(conn, user_id, price, interaction.user.name):
+        wallet_atual = get_wallet(conn, user_id)
+        return await interaction.response.send_message(f"💸 Sem saldo ({wallet_atual} < {price}).", ephemeral=True)
 
-    # Se for isca, também atualiza a coluna legacy 'baits' para compatibilidade com outras rotinas
-    baits_add = 1 if item == 'isca' else 0
-
-    # Salva no banco (atualiza wallet, inventory e incrementa baits se necessário)
-    if baits_add:
-        cursor.execute("UPDATE economy SET wallet = ?, inventory = ?, baits = COALESCE(baits, 0) + ? WHERE user_id = ?", (new_wallet, json.dumps(inv), baits_add, user_id))
-    else:
-        cursor.execute("UPDATE economy SET wallet = ?, inventory = ? WHERE user_id = ?", (new_wallet, json.dumps(inv), user_id))
-    get_bot_instance().db_conn.commit()
+    # Adiciona o item na mochila (SOMA +1). A coluna legada 'baits' é
+    # derivada automaticamente do inventário por sync_user_to_economy —
+    # não precisa mais de tratamento manual aqui.
+    add_inventory_item(conn, user_id, item, 1)
 
     # Mensagem de confirmação
     emoji_tipo = "🎒"
@@ -731,7 +739,7 @@ class TensionQTEView(discord.ui.View):
 
 async def _finalize_pescar(interaction: discord.Interaction, ctx: dict, edit: bool = False):
     """Persiste captura e envia embed final."""
-    cursor = ctx["cursor"]
+    conn = get_bot_instance().db_conn
     user_id = ctx["user_id"]
     inv = ctx["inv"]
     valor = ctx["valor"]
@@ -744,39 +752,40 @@ async def _finalize_pescar(interaction: discord.Interaction, ctx: dict, edit: bo
     mission_msg = ctx["mission_msg"]
     mission_completed = ctx["mission_completed"]
     quest_trigger = ctx["quest_trigger"]
-    novo_saldo = ctx["row"]["wallet"] + valor
     new_xp_total = ctx["new_xp_total"]
     current_rank = ctx["current_rank"]
-    legacy_baits = ctx["legacy_baits"]
     used_bait = ctx["used_bait"]
-    agora_str = ctx["agora_str"]
     w_key = ctx["w_key"]
     w_stats = ctx["w_stats"]
 
     if used_bait and inv.get("isca", 0) <= 0:
         inv.pop("isca", None)
 
-    cursor.execute(
+    # Aplica a pescaria como DELTA em cima do estado fresco do banco (pode
+    # ter mudado durante o QTE, que fica aberto por até ~17s), em vez de
+    # sobrescrever com o snapshot antigo. modify_wallet/add_inventory_item
+    # já releem o valor atual dentro de sua própria transação atômica —
+    # não há mais necessidade de reler/computar o diff manualmente aqui.
+    novo_saldo = modify_wallet(conn, user_id, valor, interaction.user.name)
+
+    inv_before = ctx["inv_before"]
+    for key in set(inv_before) | set(inv):
+        delta = inv.get(key, 0) - inv_before.get(key, 0)
+        if delta != 0:
+            add_inventory_item(conn, user_id, key, delta)
+    fresh_inv = get_inventory(conn, user_id)
+
+    conn.execute(
         """
-        UPDATE economy SET
-        wallet = ?, last_fish = ?, fish_count = fish_count + 1,
-        inventory = ?, baits = ?, guild_xp = ?, guild_rank = ?, user_name = ?
+        UPDATE users SET fish_count = fish_count + 1, guild_xp = ?, guild_rank = ?, user_name = ?
         WHERE user_id = ?
         """,
-        (
-            novo_saldo,
-            agora_str,
-            json.dumps(inv),
-            legacy_baits,
-            new_xp_total,
-            current_rank,
-            interaction.user.name,
-            user_id,
-        ),
+        (new_xp_total, current_rank, interaction.user.name, user_id),
     )
+    sync_user_to_economy(conn, user_id)
     if valor > 0 and not ctx.get("is_trash"):
-        log_fish_sale(get_bot_instance().db_conn, nome, valor, user_id)
-    get_bot_instance().db_conn.commit()
+        log_fish_sale(conn, nome, valor, user_id)
+    conn.commit()
 
     embed_color = discord.Color.from_rgb(46, 204, 113)
     if tier_p == 0:
@@ -793,7 +802,7 @@ async def _finalize_pescar(interaction: discord.Interaction, ctx: dict, edit: bo
     stats_info = f"**{rod_data['name']}**\n(⏱️ {cd_minutos}m | 🎲 x{rod_data['luck']})"
     embed.add_field(name="Detalhes", value=stats_info, inline=True)
     embed.add_field(name="Lucro", value=f"```diff\n+ {valor} Sachês\n```", inline=True)
-    iscas_restantes = inv.get("isca", 0)
+    iscas_restantes = fresh_inv.get("isca", 0)
     weather_icon = "☀️" if w_key == "normal" else ("⛈️" if w_key == "bad" else "✨")
     embed.set_footer(
         text=f"Saldo: {novo_saldo} | Iscas: {iscas_restantes} | Clima: {weather_icon} {w_stats['name']}"
@@ -821,29 +830,31 @@ async def _finalize_pescar_timeout(ctx: dict):
     interaction = ctx["interaction"]
     ctx["valor"] = 0
     ctx["qte_msg"] = "❌ Tempo esgotado — o peixe escapou!"
-    cursor = ctx["cursor"]
+    conn = get_bot_instance().db_conn
     user_id = ctx["user_id"]
     inv = ctx["inv"]
-    valor = 0
-    row = ctx["row"]
-    novo_saldo = row["wallet"]
-    cursor.execute(
+
+    # Mesmo tratamento de _finalize_pescar: aplica só o delta consumido
+    # nesta pescaria (linha arrebentou, sem ganho de saldo) em cima do
+    # estado fresco, em vez de sobrescrever com o snapshot pré-QTE.
+    inv_before = ctx["inv_before"]
+    for key in set(inv_before) | set(inv):
+        delta = inv.get(key, 0) - inv_before.get(key, 0)
+        if delta != 0:
+            add_inventory_item(conn, user_id, key, delta)
+
+    # Regrava o mesmo agora_str já reservado no início de pescar() —
+    # idempotente, mantém a semântica original.
+    set_cooldown(conn, user_id, "last_fish", ctx["agora_str"])
+    conn.execute(
         """
-        UPDATE economy SET last_fish = ?, fish_count = fish_count + 1,
-        inventory = ?, baits = ?, guild_xp = ?, guild_rank = ?, user_name = ?
+        UPDATE users SET fish_count = fish_count + 1, guild_xp = ?, guild_rank = ?, user_name = ?
         WHERE user_id = ?
         """,
-        (
-            ctx["agora_str"],
-            json.dumps(inv),
-            ctx["legacy_baits"],
-            ctx["new_xp_total"],
-            ctx["current_rank"],
-            interaction.user.name,
-            user_id,
-        ),
+        (ctx["new_xp_total"], ctx["current_rank"], interaction.user.name, user_id),
     )
-    get_bot_instance().db_conn.commit()
+    sync_user_to_economy(conn, user_id)
+    conn.commit()
     embed = discord.Embed(
         title="⚠️ PEIXE FORTE!",
         description=ctx["qte_msg"],
@@ -864,46 +875,60 @@ async def pescar(interaction: discord.Interaction):
         log_to_gui(f"interaction.defer() falhou: {e}", "WARNING")
 
     user_id = interaction.user.id
-    cursor = get_bot_instance().db_conn.cursor()
-    
-    # 1. BUSCA DADOS COMPLETOS
-    row = cursor.execute("""
-        SELECT e.last_fish, e.wallet, e.fish_count, e.rod_tier, e.current_rod, e.inventory, e.baits, e.guild_rank, e.guild_xp,
-               e.rod_upgrades, e.scrap,
-               q.current_chapter
-        FROM economy e
-        LEFT JOIN quest_progress q ON e.user_id = q.user_id
-        WHERE e.user_id = ?
-    """, (user_id,)).fetchone()
-    
-    if not row:
-        cursor.execute("INSERT INTO economy (user_id, user_name) VALUES (?, ?)", (user_id, interaction.user.name))
-        get_bot_instance().db_conn.commit()
+    conn = get_bot_instance().db_conn
+    cursor = conn.cursor()
+
+    # 1. BUSCA DADOS COMPLETOS (camada v4)
+    # A checagem de conta nova usa a tabela legada `economy` (não `users`)
+    # porque comandos ainda não migrados (saldo, rank...) só leem `economy`
+    # — precisa existir uma linha lá pro usuário não cair em loop de "conta
+    # criada" pra sempre.
+    is_new_account = not cursor.execute(
+        "SELECT 1 FROM economy WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    if is_new_account:
+        ensure_user(conn, user_id, interaction.user.name)
+        sync_user_to_economy(conn, user_id)
         return await interaction.followup.send("🆕 Conta criada! Tente pescar novamente.", ephemeral=True)
 
+    # Usuário já existia na tabela legada — garante que as tabelas v4 estão
+    # sincronizadas com o estado dela antes de ler.
+    ensure_user(conn, user_id, interaction.user.name)
+
+    row = cursor.execute("""
+        SELECT u.wallet, u.fish_count, u.guild_rank, u.guild_xp, u.scrap,
+               ur.current_rod, ru.luck_level, ru.cd_level,
+               uc.last_fish,
+               q.current_chapter
+        FROM users u
+        LEFT JOIN user_rods ur ON u.user_id = ur.user_id
+        LEFT JOIN rod_upgrades ru ON u.user_id = ru.user_id
+        LEFT JOIN user_cooldowns uc ON u.user_id = uc.user_id
+        LEFT JOIN quest_progress q ON u.user_id = q.user_id
+        WHERE u.user_id = ?
+    """, (user_id,)).fetchone()
+
     # 2. CARREGA INVENTÁRIO E VARA
-    try:
-        inv = json.loads(row['inventory']) if row['inventory'] else {}
-    except (json.JSONDecodeError, TypeError):
-        inv = {}
+    inv = get_inventory(conn, user_id)
+    # Snapshot do inventário no momento da leitura: usado para persistir a
+    # pescaria como DELTA (ganho/perda), não como substituição total do
+    # estado — evita apagar mudanças feitas em outros comandos durante o QTE.
+    inv_before = dict(inv)
 
     current_rod_key = row['current_rod'] if row['current_rod'] else 'vara_bambu'
     if current_rod_key not in ROD_STATS: current_rod_key = 'vara_bambu'
     rod_data = ROD_STATS[current_rod_key]
-    
+
     # 3. CARREGA UPGRADES
-    try:
-        upgrades = json.loads(row['rod_upgrades']) if row['rod_upgrades'] else {"luck": 0, "cd": 0}
-    except (json.JSONDecodeError, TypeError):
-        upgrades = {"luck": 0, "cd": 0}
+    upgrades = {"luck": row['luck_level'] or 0, "cd": row['cd_level'] or 0}
 
     luck_bonus = 1 + (upgrades.get("luck", 0) * 0.10) # +10% por nível
     cd_reduction = 1 - (upgrades.get("cd", 0) * 0.05) # -5% por nível
-    
+
     # 4. LÓGICA DE COOLDOWN
     base_cd = 300 # 5 minutos padrão
     actual_cd = int((base_cd * rod_data['cd']) * cd_reduction)
-    
+
     agora = datetime.now()
     agora_str = agora.strftime("%Y-%m-%d %H:%M:%S.%f")
 
@@ -917,10 +942,23 @@ async def pescar(interaction: discord.Interaction):
                 return await interaction.followup.send(f"⏳ **{rod_data['name']}:** Descansando... Volte <t:{ts}:R>.", ephemeral=True)
         except ValueError: pass
 
+    # Reserva o cooldown IMEDIATAMENTE após a checagem passar, antes de
+    # qualquer processamento longo (o QTE de Tier 3+ pode manter esta
+    # pescaria em aberto por ~17s). Sem isso, uma segunda chamada de
+    # /eco pescar do mesmo usuário nessa janela leria o last_fish antigo,
+    # passaria pela checagem acima e abriria um segundo fluxo em paralelo,
+    # duplicando a captura dentro do intervalo de um único cooldown.
+    # _finalize_pescar/_finalize_pescar_timeout regravam o mesmo valor no
+    # final (agora_str não muda), então isto é idempotente.
+    set_cooldown(conn, user_id, "last_fish", agora_str)
+
     # 5. CONSUMO DE ITENS
     used_bait = False; used_magnet = False; used_firewall = False; used_chip = False
-    legacy_baits = row['baits'] if row['baits'] else 0
-    
+    # Fallback de compatibilidade com a coluna legada 'baits' (só leitura —
+    # a escrita dela agora é 100% derivada do inventário via sync_user_to_economy).
+    legacy_row = cursor.execute("SELECT baits FROM economy WHERE user_id = ?", (user_id,)).fetchone()
+    legacy_baits = (legacy_row['baits'] if legacy_row and legacy_row['baits'] else 0)
+
     # Consome isca
     if inv.get("isca", 0) > 0: 
         inv["isca"] -= 1
@@ -1066,10 +1104,19 @@ async def pescar(interaction: discord.Interaction):
                     
                     members_ids = json.loads(my_party['members_json'])
                     members_ids.append(my_party['leader_id'])
-                    
-                    for member_id in set(members_ids):
-                        cursor.execute("UPDATE economy SET wallet = wallet + ?, guild_xp = guild_xp + ? WHERE user_id = ?", (reward_money, reward_xp, member_id))
-                    
+                    unique_members = set(members_ids)
+                    leader_id = my_party['leader_id']
+                    # Divide a recompensa igualmente; resto (se reward_money
+                    # não for divisível) vai para o líder, não é descartado.
+                    base_share = reward_money // len(unique_members)
+                    remainder = reward_money % len(unique_members)
+
+                    for member_id in unique_members:
+                        share = base_share + remainder if member_id == leader_id else base_share
+                        modify_wallet(conn, member_id, share)
+                        conn.execute("UPDATE users SET guild_xp = guild_xp + ? WHERE user_id = ?", (reward_xp, member_id))
+                        sync_user_to_economy(conn, member_id)
+
                     cursor.execute("UPDATE parties SET active_mission_id = NULL, mission_progress = 0 WHERE leader_id = ?", (my_party['leader_id'],))
                     mission_msg = f"\n🎉 **MISSÃO CUMPRIDA!**\nGrupo completou: **{m_data['title']}**\nPrêmio: 💰 {reward_money} | ⭐ {reward_xp} XP!"
 
@@ -1079,7 +1126,6 @@ async def pescar(interaction: discord.Interaction):
         xp_table = {0: 2, 1: 10, 2: 25, 3: 100, 4: 500}
         xp_ganho = xp_table.get(tier_p, 2)
 
-    novo_saldo = row['wallet'] + valor
     new_xp_total = (row['guild_xp'] or 0) + xp_ganho
     
     current_rank = row['guild_rank'] if row['guild_rank'] else 'F'
@@ -1128,10 +1174,10 @@ async def pescar(interaction: discord.Interaction):
                 
     # 10. QTE TENSÃO (Tier 3+) ou salva direto
     catch_ctx = {
-        "cursor": cursor,
         "user_id": user_id,
         "interaction": interaction,
         "inv": inv,
+        "inv_before": inv_before,
         "valor": valor,
         "nome": nome,
         "emoji": emoji,
@@ -1142,10 +1188,8 @@ async def pescar(interaction: discord.Interaction):
         "mission_msg": mission_msg,
         "mission_completed": mission_completed,
         "quest_trigger": quest_trigger,
-        "row": row,
         "new_xp_total": new_xp_total,
         "current_rank": current_rank,
-        "legacy_baits": legacy_baits,
         "used_bait": used_bait,
         "agora_str": agora_str,
         "w_key": w_key,
@@ -1273,53 +1317,62 @@ class CityHubView(discord.ui.View):
 @eco_group.command(name="explorar", description="Envia o drone para a Ilha, Cidade ou Mar.")
 async def explorar(interaction: discord.Interaction):
     user_id = interaction.user.id
-    cursor = get_bot_instance().db_conn.cursor()
-    
+    conn = get_bot_instance().db_conn
+    cursor = conn.cursor()
+
     # 1. VERIFICAÇÕES BÁSICAS
-    row = cursor.execute("SELECT wallet, last_explore FROM economy WHERE user_id = ?", (user_id,)).fetchone()
-    if not row: return await interaction.response.send_message("❌ Crie uma conta pescando primeiro.", ephemeral=True)
+    has_account = cursor.execute("SELECT 1 FROM economy WHERE user_id = ?", (user_id,)).fetchone()
+    if not has_account: return await interaction.response.send_message("❌ Crie uma conta pescando primeiro.", ephemeral=True)
+    ensure_user(conn, user_id, interaction.user.name)
 
     quest = cursor.execute("SELECT current_chapter, inventory FROM quest_progress WHERE user_id = ?", (user_id,)).fetchone()
     city_spotted = quest and quest['current_chapter'] not in ['inicio', 'locked', None]
-    
-    # 2. DECISÃO (VIEW DE ESCOLHA)
+
+    # 2. CUSTO E COOLDOWN — checados e RESERVADOS antes de qualquer await
+    # (inclusive antes de mostrar a ExplorationView, que fica aberta até
+    # 60s esperando o jogador escolher o destino). Igual ao fix já aplicado
+    # em /eco pescar: sem reservar aqui, uma 2ª chamada durante a janela do
+    # view.wait() leria o cooldown/saldo antigos e passaria pela checagem
+    # em paralelo com a 1ª.
+    custo = 80
+    agora = datetime.now()
+    agora_str = agora.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+    last_explore = get_cooldowns(conn, user_id)["last_explore"]
+    if last_explore:
+        try:
+            last_exp = datetime.strptime(last_explore, "%Y-%m-%d %H:%M:%S.%f")
+            if (agora - last_exp).total_seconds() < 600:
+                ts = int((last_exp + timedelta(minutes=10)).timestamp())
+                return await interaction.response.send_message(f"⏳ **Drone Recarregando!** <t:{ts}:R>.", ephemeral=True)
+        except ValueError: pass
+
+    if not try_spend_wallet(conn, user_id, custo, interaction.user.name):
+        return await interaction.response.send_message(f"🔋 Precisa de {custo} Sachês para operar o drone.", ephemeral=True)
+    set_cooldown(conn, user_id, "last_explore", agora_str)
+
+    # 3. DECISÃO (VIEW DE ESCOLHA) — só depois de custo+cooldown já reservados.
     modo_exploracao = "farm"
-    
+
     # Se já viu a cidade, pergunta pra onde quer ir
     if city_spotted:
         view = ExplorationView(user_id)
         await interaction.response.send_message("📡 **Painel de Controle do Drone:** Escolha o destino.", view=view, ephemeral=True)
         await view.wait()
-        if view.choice is None: return # Se o tempo acabar ou não escolher
+        if view.choice is None:
+            # Custo/cooldown já foram reservados antes da view abrir (pro
+            # fix da race acima) — sem escolha, o drone "se perde" em vez de
+            # reembolsar, mesma filosofia do QTE de pesca (cooldown gasto
+            # mesmo se o jogador não reage a tempo).
+            await interaction.followup.send(
+                "📡 O drone perdeu o sinal sem ordens claras e voltou vazio. (Custo e cooldown consumidos.)",
+                ephemeral=True,
+            )
+            return
         modo_exploracao = view.choice
     else:
         # Se não viu a cidade, vai direto farmar na ilha
         await interaction.response.defer()
-
-    # 3. CUSTO E COOLDOWN
-    custo = 80
-    agora = datetime.now()
-    agora_str = agora.strftime("%Y-%m-%d %H:%M:%S.%f")
-    
-    # Lógica de Cooldown (10 min)
-    if row['last_explore']:
-        try:
-            last_exp = datetime.strptime(row['last_explore'], "%Y-%m-%d %H:%M:%S.%f")
-            if (agora - last_exp).total_seconds() < 600:
-                ts = int((last_exp + timedelta(minutes=10)).timestamp())
-                msg = f"⏳ **Drone Recarregando!** <t:{ts}:R>."
-                if city_spotted: return await interaction.followup.send(msg, ephemeral=True)
-                else: return await interaction.followup.send(msg, ephemeral=True)
-        except: pass
-
-    # Verifica Saldo
-    if row['wallet'] < custo:
-        msg = f"🔋 Precisa de {custo} Sachês para operar o drone."
-        if city_spotted: return await interaction.followup.send(msg, ephemeral=True)
-        else: return await interaction.followup.send(msg, ephemeral=True)
-
-    # 4. COBRA O CUSTO
-    cursor.execute("UPDATE economy SET wallet = wallet - ? WHERE user_id = ?", (custo, user_id))
 
     # --- LÓGICA DE MISSÃO DE GUILDA (EXPLORE COUNT) ---
     mission_msg = ""
@@ -1345,8 +1398,17 @@ async def explorar(interaction: discord.Interaction):
             if new_prog >= my_party['mission_target']:
                 rw, rx = m_data['reward'], m_data['xp']
                 mems = json.loads(my_party['members_json']) + [my_party['leader_id']]
-                for mid in set(mems):
-                    cursor.execute("UPDATE economy SET wallet=wallet+?, guild_xp=guild_xp+? WHERE user_id=?", (rw, rx, mid))
+                unique_mems = set(mems)
+                leader_id = my_party['leader_id']
+                # Divide a recompensa igualmente; resto (se rw não for
+                # divisível) vai para o líder, não é descartado.
+                base_share = rw // len(unique_mems)
+                remainder = rw % len(unique_mems)
+                for mid in unique_mems:
+                    share = base_share + remainder if mid == leader_id else base_share
+                    modify_wallet(conn, mid, share)
+                    conn.execute("UPDATE users SET guild_xp = guild_xp + ? WHERE user_id = ?", (rx, mid))
+                    sync_user_to_economy(conn, mid)
                 cursor.execute("UPDATE parties SET active_mission_id=NULL, mission_progress=0 WHERE leader_id=?", (my_party['leader_id'],))
                 mission_msg = f"\n🎉 **Missão Completa!** Ganharam {rw} Sachês!"
 
@@ -1381,8 +1443,7 @@ async def explorar(interaction: discord.Interaction):
             # ACESSO NEGADO
             embed = discord.Embed(title="🚫 ACESSO NEGADO", description="Os guardas exigem o **Selo do Capitão**.\nVolte quando tiver autorização.", color=discord.Color.red())
             embed.set_footer(text="Dica: Pesque a Garrafa na ilha e use /ler_garrafa.")
-            cursor.execute("UPDATE economy SET last_explore = NULL WHERE user_id = ?", (user_id,)) # Reembolsa
-            get_bot_instance().db_conn.commit()
+            set_cooldown(conn, user_id, "last_explore", None)  # Reembolsa só o cooldown (não o custo, igual antes)
             await interaction.followup.send(embed=embed)
         return
 
@@ -1406,32 +1467,24 @@ async def explorar(interaction: discord.Interaction):
     msg = historia
     cor = discord.Color.red()
     
+    # Custo e cooldown já foram cobrados/reservados antes da view — as
+    # branches abaixo só aplicam o resultado do sorteio (dinheiro/item).
     if valor_ganho > 0:
-        cursor.execute("UPDATE economy SET wallet = wallet + ?, last_explore = ? WHERE user_id = ?", (valor_ganho, agora_str, user_id))
+        modify_wallet(conn, user_id, valor_ganho)
         msg += f"\n\n💰 **Resultado:** +{valor_ganho} Sachês (Lucro: {valor_ganho - custo})"
         cor = discord.Color.green()
-    
+
     elif item_ganho:
-        inv_atual = {}
-        cursor.execute("SELECT inventory FROM economy WHERE user_id = ?", (user_id,))
-        curr_inv_json = cursor.fetchone()[0]
-        if curr_inv_json:
-             try: inv_atual = json.loads(curr_inv_json)
-             except: pass
-        
         if item_ganho == "caixa_misteriosa":
-             inv_atual["caixa_misteriosa"] = inv_atual.get("caixa_misteriosa", 0) + 1
+             add_inventory_item(conn, user_id, "caixa_misteriosa", 1)
              msg += f"\n\n📦 **Loot Raro!** Você achou uma Caixa Misteriosa."
              cor = discord.Color.gold()
         elif item_ganho == "energetico":
-             cursor.execute("UPDATE economy SET last_fish = NULL WHERE user_id = ?", (user_id,))
+             set_cooldown(conn, user_id, "last_fish", None)
              msg += f"\n\n⚡ **Energia Pura!** Seu cooldown de PESCA foi resetado."
              cor = discord.Color.blue()
-        
-        cursor.execute("UPDATE economy SET inventory = ?, last_explore = ? WHERE user_id = ?", (json.dumps(inv_atual), agora_str, user_id))
 
     else:
-        cursor.execute("UPDATE economy SET last_explore = ? WHERE user_id = ?", (agora_str, user_id))
         msg += f"\n\n💸 **Prejuízo:** -{custo} Sachês."
 
     # --- DESCOBERTA DA CIDADE ---
@@ -1462,35 +1515,62 @@ async def explorar(interaction: discord.Interaction):
 
 @eco_group.command(name="presentear", description="Dê um item a um amigo.")
 async def presentear(interaction: discord.Interaction, amigo: discord.Member, item: str):
+    ID_CRIADOR = 299323165937500160
+    ID_DONO = 541680099477422110
+
     if amigo.id == interaction.user.id: return await interaction.response.send_message("🎁 Use /eco comprar.", ephemeral=True)
     if item not in SHOP_ITEMS: return await interaction.response.send_message("❌ Item inválido.", ephemeral=True)
-    
+
+    # --- CHECAGEM DE ITENS ESPECIAIS/SECRETOS (mesma regra de /eco comprar) ---
+    if item == "item_criador" and interaction.user.id != ID_CRIADOR:
+        return await interaction.response.send_message("⛔ Acesso Negado.", ephemeral=True)
+    if item == "item_dono" and interaction.user.id != ID_DONO:
+        return await interaction.response.send_message("🔥 Pesado demais para você.", ephemeral=True)
+
     data = SHOP_ITEMS[item]
     price = data['price']
-    cursor = get_bot_instance().db_conn.cursor()
-    sender = cursor.execute("SELECT wallet FROM economy WHERE user_id = ?", (interaction.user.id,)).fetchone()
-    if not sender or sender['wallet'] < price: return await interaction.response.send_message(f"💸 Falta grana ({price}).", ephemeral=True)
+    conn = get_bot_instance().db_conn
+    sender_id = interaction.user.id
 
-    receiver = cursor.execute("SELECT rod_tier, inventory FROM economy WHERE user_id = ?", (amigo.id,)).fetchone()
-    if not receiver:
-        cursor.execute("INSERT INTO economy (user_id, user_name) VALUES (?, ?)", (amigo.id, amigo.name))
-        receiver = {'rod_tier': 0, 'inventory': '{}'}
+    sender_wallet = get_wallet(conn, sender_id)
+    if sender_wallet < price: return await interaction.response.send_message(f"💸 Falta grana ({price}).", ephemeral=True)
+
+    sender_inv = get_inventory(conn, sender_id)
+
+    # Item de preço 0 só pode ser presenteado se o remetente já o possuir de fato
+    # (evita criar itens exclusivos/míticos do nada via um "presente" gratuito).
+    owned_key = None
+    if sender_inv.get(item, 0) > 0:
+        owned_key = item
+    elif sender_inv.get(data['name'], 0) > 0:
+        owned_key = data['name']
+    if price == 0 and owned_key is None:
+        return await interaction.response.send_message("🚫 Você não possui esse item para presentear.", ephemeral=True)
+
+    # 'rod_tier' (gate de "já tem vara melhor") não tem equivalente na v4 —
+    # só existe na tabela legada. Garante que a linha legada do destinatário
+    # existe antes de ler esse campo específico.
+    ensure_user(conn, amigo.id, amigo.name)
+    sync_user_to_economy(conn, amigo.id)
+    receiver_row = conn.execute("SELECT rod_tier FROM economy WHERE user_id = ?", (amigo.id,)).fetchone()
+    receiver_rod_tier = receiver_row['rod_tier'] if receiver_row and receiver_row['rod_tier'] else 0
 
     msg = ""
     if data['type'] == 'rod':
-        if receiver['rod_tier'] >= data['tier']: return await interaction.response.send_message(f"⚠️ {amigo.name} já tem vara melhor.", ephemeral=True)
-        cursor.execute("UPDATE economy SET rod_tier = ?, current_rod = ? WHERE user_id = ?", (data['tier'], data['key'], amigo.id))
+        if receiver_rod_tier >= data['tier']: return await interaction.response.send_message(f"⚠️ {amigo.name} já tem vara melhor.", ephemeral=True)
+        conn.execute("UPDATE economy SET rod_tier = ? WHERE user_id = ?", (data['tier'], amigo.id))
+        set_current_rod(conn, amigo.id, data['key'])
         msg = f"🎣 **Presente:** {data['name']} entregue!"
     elif data['type'] == 'flex':
-        try: inv = json.loads(receiver['inventory']) if receiver['inventory'] else {}
-        except: inv = {}
-        inv[data['name']] = inv.get(data['name'], 0) + 1
-        cursor.execute("UPDATE economy SET inventory = ? WHERE user_id = ?", (json.dumps(inv), amigo.id))
+        add_inventory_item(conn, amigo.id, data['name'], 1)
         msg = f"💎 **Luxo:** {data['name']} entregue!"
     else: return await interaction.response.send_message("❌ Só pode dar Varas ou Flex.", ephemeral=True)
 
-    cursor.execute("UPDATE economy SET wallet = wallet - ? WHERE user_id = ?", (price, interaction.user.id))
-    get_bot_instance().db_conn.commit()
+    # Item gratuito: consome a cópia do remetente (é uma transferência, não uma criação).
+    if price == 0 and owned_key is not None:
+        add_inventory_item(conn, sender_id, owned_key, -1)
+
+    try_spend_wallet(conn, sender_id, price, interaction.user.name)
     await interaction.response.send_message(f"🎁 **Enviado!**\n{msg}")
 
 # --- CLASSES DE INTERFACE DO INVENTÁRIO (DROPDOWN) ---
@@ -1612,7 +1692,7 @@ class ConsumeSelect(discord.ui.Select):
         cursor = get_bot_instance().db_conn.cursor()
         
         # Recarrega inventário para garantir que não houve dupe
-        row = cursor.execute("SELECT inventory, wallet, last_fish_time FROM economy WHERE user_id = ?", (user_id,)).fetchone()
+        row = cursor.execute("SELECT inventory, wallet FROM economy WHERE user_id = ?", (user_id,)).fetchone()
         if not row: return
         
         inv = json.loads(row['inventory'])
@@ -1629,8 +1709,11 @@ class ConsumeSelect(discord.ui.Select):
         # 1. ENERGÉTICO (Reseta Cooldown)
         if item_key == "energetico":
             inv[item_key] -= 1
-            # Reseta o tempo de pesca definindo para o passado distante
-            cursor.execute("UPDATE economy SET last_fish_time = ? WHERE user_id = ?", (datetime.min.isoformat(), user_id))
+            # Corrigido: escrevia em 'last_fish_time', uma coluna órfã nunca
+            # lida pela checagem real de cooldown (que usa 'last_fish') —
+            # o item não fazia NADA. Mesmo padrão de reset já usado
+            # corretamente no evento "Energético Perdido" do drone.
+            set_cooldown(get_bot_instance().db_conn, user_id, "last_fish", None)
             msg = "⚡ **Energético bebido!** Você está pilhado! O tempo de espera da pesca foi zerado."
 
         # 2. CAIXA MISTERIOSA (Sorteio)
@@ -1768,8 +1851,6 @@ async def saldo(interaction: discord.Interaction, usuario: discord.Member = None
 
 @eco_group.command(name="diario", description="Resgate diário com bônus de streak.")
 async def diario(interaction: discord.Interaction):
-    from economy_db import ensure_user, sync_user_to_economy
-
     user_id = interaction.user.id
     conn = get_bot_instance().db_conn
     ensure_v4_tables(conn)
@@ -1805,7 +1886,12 @@ async def diario(interaction: discord.Interaction):
                 streak = (row["daily_streak"] or 0) + 1
 
     base_reward = random.randint(100, 300)
-    bonus = streak * 50
+    # Teto no bônus: sem isso, uma streak de 365 dias daria +18.250 (90x a
+    # recompensa-base média de ~200) — inflação de longo prazo sem limite.
+    # Streak em si (exibida ao jogador) continua sem teto, só o bônus
+    # monetário é capado em 60 dias (+3.000 no máximo).
+    STREAK_BONUS_CAP_DAYS = 60
+    bonus = min(streak, STREAK_BONUS_CAP_DAYS) * 50
     total = base_reward + bonus
     agora_str = agora.strftime("%Y-%m-%d %H:%M:%S.%f")
 
@@ -2574,37 +2660,35 @@ class GaldinoView(discord.ui.View):
     # --- BOTÃO 2: TUNING DE VARA ---
     @discord.ui.button(label="Tunar Vara", style=discord.ButtonStyle.primary, emoji="🔫", row=0)
     async def tune_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # (O código do Tuning continua idêntico ao anterior, pode manter)
-        # Vou resumir aqui para não ficar gigante, use o mesmo lógica do tuning que enviei antes.
-        cursor = get_bot_instance().db_conn.cursor()
-        row = cursor.execute("SELECT scrap, rod_upgrades, current_rod FROM economy WHERE user_id = ?", (self.user_id,)).fetchone()
-        scrap = row['scrap']
-        upgrades = json.loads(row['rod_upgrades']) if row['rod_upgrades'] else {"luck": 0, "cd": 0}
-        
-        luck_lvl = upgrades.get("luck", 0)
-        cd_lvl = upgrades.get("cd", 0)
+        conn = get_bot_instance().db_conn
+        scrap = get_scrap(conn, self.user_id)
+        upgrades = get_rod_upgrades(conn, self.user_id)
+
+        luck_lvl = upgrades["luck"]
+        cd_lvl = upgrades["cd"]
         cost_luck = (luck_lvl + 1) * 100
         cost_cd = (cd_lvl + 1) * 100
-        
+
         embed = discord.Embed(title="🔧 Tuning de Equipamento", description=f"**Sucata Disponível:** ⚙️ {scrap}", color=discord.Color.orange())
         embed.add_field(name=f"🍀 Mira Laser [Lv {luck_lvl}]", value=f"Custo: ⚙️ {cost_luck}", inline=True)
         embed.add_field(name=f"⚡ Rolamentos [Lv {cd_lvl}]", value=f"Custo: ⚙️ {cost_cd}", inline=True)
 
+        # Os botões abaixo NÃO usam scrap/custo capturados aqui em cima —
+        # try_upgrade_rod relê sucata e nível na hora do clique e recalcula o
+        # custo a partir do nível fresco (mesmo padrão do fix do QTE de
+        # pesca: nunca confiar em estado capturado na abertura da view, que
+        # fica aberta por até 180s e pode ser clicada mais de uma vez).
         view = discord.ui.View()
         async def up_luck(inter):
-            if scrap < cost_luck: return await inter.response.send_message("❌ Sucata insuficiente!", ephemeral=True)
-            if luck_lvl >= 5: return await inter.response.send_message("⚠️ Max Level!", ephemeral=True)
-            upgrades["luck"] += 1
-            cursor.execute("UPDATE economy SET scrap = scrap - ?, rod_upgrades = ? WHERE user_id = ?", (cost_luck, json.dumps(upgrades), self.user_id))
-            get_bot_instance().db_conn.commit()
+            result = try_upgrade_rod(conn, self.user_id, "luck", cost_per_level=100, max_level=5)
+            if result["reason"] == "insufficient_scrap": return await inter.response.send_message("❌ Sucata insuficiente!", ephemeral=True)
+            if result["reason"] == "max_level": return await inter.response.send_message("⚠️ Max Level!", ephemeral=True)
             await inter.response.send_message("✅ Sorte aumentada!", ephemeral=True)
-            
+
         async def up_cd(inter):
-            if scrap < cost_cd: return await inter.response.send_message("❌ Sucata insuficiente!", ephemeral=True)
-            if cd_lvl >= 5: return await inter.response.send_message("⚠️ Max Level!", ephemeral=True)
-            upgrades["cd"] += 1
-            cursor.execute("UPDATE economy SET scrap = scrap - ?, rod_upgrades = ? WHERE user_id = ?", (cost_cd, json.dumps(upgrades), self.user_id))
-            get_bot_instance().db_conn.commit()
+            result = try_upgrade_rod(conn, self.user_id, "cd", cost_per_level=100, max_level=5)
+            if result["reason"] == "insufficient_scrap": return await inter.response.send_message("❌ Sucata insuficiente!", ephemeral=True)
+            if result["reason"] == "max_level": return await inter.response.send_message("⚠️ Max Level!", ephemeral=True)
             await inter.response.send_message("✅ Cooldown reduzido!", ephemeral=True)
 
         b1 = discord.ui.Button(label="Upar Sorte", style=discord.ButtonStyle.success); b1.callback = up_luck
@@ -2798,12 +2882,10 @@ class GaldinoView(discord.ui.View):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 class CompraQuantidadeModal(discord.ui.Modal):
-    def __init__(self, item_key, item_stats, current_wallet, current_inv, user_id, bot_instance):
+    def __init__(self, item_key, item_stats, user_id, bot_instance):
         super().__init__(title=f"Comprar: {item_stats['name']}")
         self.item_key = item_key
         self.stats = item_stats
-        self.wallet = current_wallet
-        self.inv = current_inv
         self.user_id = user_id
         self.bot = bot_instance
 
@@ -2826,19 +2908,16 @@ class CompraQuantidadeModal(discord.ui.Modal):
             return await interaction.response.send_message("❌ Digite apenas números válidos.", ephemeral=True)
 
         custo_total = self.stats['price'] * quantidade
+        conn = self.bot.db_conn
 
-        if self.wallet < custo_total:
-            return await interaction.response.send_message(f"💸 **Saldo Insuficiente!**\nVocê quer {quantidade}x ({custo_total} $), mas só tem {self.wallet} $.", ephemeral=True)
+        # Atômico: relê o saldo na hora do submit (o modal pode ter ficado
+        # aberto um tempo arbitrário desde que foi mostrado), em vez de usar
+        # um saldo capturado quando o dropdown foi clicado.
+        if not try_spend_wallet(conn, self.user_id, custo_total, interaction.user.name):
+            wallet_atual = get_wallet(conn, self.user_id)
+            return await interaction.response.send_message(f"💸 **Saldo Insuficiente!**\nVocê quer {quantidade}x ({custo_total} $), mas só tem {wallet_atual} $.", ephemeral=True)
 
-        # Processa a compra
-        cursor = self.bot.db_conn.cursor()
-        
-        # Adiciona ao inventário
-        self.inv[self.item_key] = self.inv.get(self.item_key, 0) + quantidade
-        
-        # Atualiza Banco
-        cursor.execute("UPDATE economy SET wallet = wallet - ?, inventory = ? WHERE user_id = ?", (custo_total, json.dumps(self.inv), self.user_id))
-        self.bot.db_conn.commit()
+        add_inventory_item(conn, self.user_id, self.item_key, quantidade)
 
         # Feedback
         emoji = "📦"

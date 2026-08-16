@@ -343,6 +343,168 @@ def modify_wallet(conn: sqlite3.Connection, user_id: int, delta: int, user_name:
         raise
 
 
+def try_spend_wallet(conn: sqlite3.Connection, user_id: int, amount: int, user_name: str = "") -> bool:
+    """Deduz `amount` do saldo de forma atômica, só se houver saldo suficiente.
+
+    Substitui o padrão `if wallet < price: recusa` + escrita separada
+    (vulnerável a sobrescrever um saldo que mudou entre a checagem e a
+    escrita) por uma única transação que relê o saldo na hora de gravar.
+    """
+    if amount <= 0:
+        return True
+    ensure_user(conn, user_id, user_name)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT wallet FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        current_wallet = _coerce_int(row["wallet"] if row else 0)
+        if current_wallet < amount:
+            conn.commit()
+            return False
+        conn.execute(
+            "UPDATE users SET wallet = ? WHERE user_id = ?",
+            (current_wallet - amount, user_id),
+        )
+        if user_name:
+            conn.execute(
+                "UPDATE users SET user_name = ? WHERE user_id = ?", (user_name, user_id)
+            )
+        sync_user_to_economy(conn, user_id)
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_scrap(conn: sqlite3.Connection, user_id: int) -> int:
+    ensure_user(conn, user_id)
+    row = conn.execute("SELECT scrap FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    return _coerce_int(row["scrap"] if row else 0)
+
+
+def modify_scrap(conn: sqlite3.Connection, user_id: int, delta: int, user_name: str = "") -> int:
+    """Altera sucata com transação imediata. Retorna novo total (piso em 0)."""
+    ensure_user(conn, user_id, user_name)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute("SELECT scrap FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        current_scrap = _coerce_int(row["scrap"] if row else 0)
+        new_scrap = max(0, current_scrap + delta)
+        conn.execute("UPDATE users SET scrap = ? WHERE user_id = ?", (new_scrap, user_id))
+        sync_user_to_economy(conn, user_id)
+        conn.commit()
+        return new_scrap
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_current_rod(conn: sqlite3.Connection, user_id: int) -> str:
+    ensure_user(conn, user_id)
+    row = conn.execute(
+        "SELECT current_rod FROM user_rods WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    return row["current_rod"] if row and row["current_rod"] else "vara_bambu"
+
+
+def set_current_rod(conn: sqlite3.Connection, user_id: int, rod_key: str) -> None:
+    ensure_user(conn, user_id)
+    conn.execute(
+        "UPDATE user_rods SET current_rod = ? WHERE user_id = ?", (rod_key, user_id)
+    )
+    sync_user_to_economy(conn, user_id)
+    conn.commit()
+
+
+def get_rod_upgrades(conn: sqlite3.Connection, user_id: int) -> dict:
+    ensure_user(conn, user_id)
+    row = conn.execute(
+        "SELECT luck_level, cd_level FROM rod_upgrades WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    return {
+        "luck": _coerce_int(row["luck_level"] if row else 0),
+        "cd": _coerce_int(row["cd_level"] if row else 0),
+    }
+
+
+def try_upgrade_rod(
+    conn: sqlite3.Connection,
+    user_id: int,
+    upgrade_type: str,
+    cost_per_level: int = 100,
+    max_level: int = 5,
+) -> dict:
+    """Compra atomicamente 1 nível de upgrade de vara (luck ou cd).
+
+    O custo é recalculado a partir do nível ATUAL lido dentro da transação
+    (nunca de um valor capturado antes, ex.: na abertura de uma view) —
+    mesmo raciocínio do fix de duplicação do QTE de pesca.
+    """
+    if upgrade_type not in ("luck", "cd"):
+        raise ValueError(f"upgrade_type inválido: {upgrade_type!r}")
+    level_col = f"{upgrade_type}_level"
+    ensure_user(conn, user_id)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        srow = conn.execute(
+            "SELECT scrap FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        scrap = _coerce_int(srow["scrap"] if srow else 0)
+        urow = conn.execute(
+            f"SELECT {level_col} FROM rod_upgrades WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        current_level = _coerce_int(urow[level_col] if urow else 0)
+        cost = (current_level + 1) * cost_per_level
+
+        if current_level >= max_level:
+            conn.commit()
+            return {"success": False, "reason": "max_level", "scrap": scrap, "level": current_level, "cost": cost}
+        if scrap < cost:
+            conn.commit()
+            return {"success": False, "reason": "insufficient_scrap", "scrap": scrap, "level": current_level, "cost": cost}
+
+        new_scrap = scrap - cost
+        new_level = current_level + 1
+        conn.execute("UPDATE users SET scrap = ? WHERE user_id = ?", (new_scrap, user_id))
+        conn.execute(
+            f"UPDATE rod_upgrades SET {level_col} = ? WHERE user_id = ?", (new_level, user_id)
+        )
+        sync_user_to_economy(conn, user_id)
+        conn.commit()
+        return {"success": True, "reason": None, "scrap": new_scrap, "level": new_level, "cost": cost}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+_COOLDOWN_FIELDS = ("last_fish", "last_daily", "last_explore")
+
+
+def get_cooldowns(conn: sqlite3.Connection, user_id: int) -> dict:
+    ensure_user(conn, user_id)
+    row = conn.execute(
+        "SELECT last_fish, last_daily, last_explore, daily_streak FROM user_cooldowns WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    return {
+        "last_fish": row["last_fish"] if row else None,
+        "last_daily": row["last_daily"] if row else None,
+        "last_explore": row["last_explore"] if row else None,
+        "daily_streak": _coerce_int(row["daily_streak"] if row else 0),
+    }
+
+
+def set_cooldown(conn: sqlite3.Connection, user_id: int, field: str, value) -> None:
+    if field not in _COOLDOWN_FIELDS:
+        raise ValueError(f"campo de cooldown inválido: {field!r}")
+    ensure_user(conn, user_id)
+    conn.execute(f"UPDATE user_cooldowns SET {field} = ? WHERE user_id = ?", (value, user_id))
+    sync_user_to_economy(conn, user_id)
+    conn.commit()
+
+
 def get_inventory(conn: sqlite3.Connection, user_id: int) -> dict:
     ensure_user(conn, user_id)
     rows = conn.execute(
