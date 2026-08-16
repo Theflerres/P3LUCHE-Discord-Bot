@@ -1243,7 +1243,7 @@ async def p3_reescrever(interaction: discord.Interaction, texto: str, tom: str):
         await interaction.followup.send(f"❌ Erro: {e}")
 
 
-@p3luche_group.command(name="ajuda", description="Lista tudo que o P3LUCHE sabe fazer.")
+@p3luche_group.command(name="comandos", description="Lista tudo que o P3LUCHE sabe fazer.")
 async def p3_ajuda(interaction: discord.Interaction):
     embed = discord.Embed(
         title="😺 P3LUCHE — O que eu sei fazer",

@@ -85,8 +85,8 @@ def create_member_embed(bot_ref):
     embed.add_field(name="🎣 Economia & Pescaria", value=eco_txt, inline=False)
 
     music_txt = (
-        "`/musica adicionar [link]` - Toca músicas do YouTube.\n"
-        "`/biblioteca` - Vê o catálogo de músicas salvas.\n"
+        "`/musica adicionar [link]` - Guarda músicas do YouTube no acervo.\n"
+        "`/musica biblioteca` - Vê o catálogo de músicas salvas.\n"
         "`/musica buscar [termo]` - Pesquisa músicas pelo nome."
     )
     embed.add_field(name="🎵 Rádio", value=music_txt, inline=False)
@@ -95,15 +95,15 @@ def create_member_embed(bot_ref):
         "`/lore player` - Registra a história do SEU personagem.\n"
         "`/lore ler [id]` - Lê uma história completa com páginas.\n"
         "`/lore grafo` - Gera a teia visual de conexões entre players.\n"
+        "`/p3luche enquete` - Cria uma enquete rápida com reações.\n"
         "`/apoiadores` - Veja quem mantém meus servidores ligados!"
     )
     embed.add_field(name="📜 Roleplay & Comunidade", value=lore_txt, inline=False)
 
-    ia_txt = (
-        "**Conversa:** Me mencione (@P3LUCHE) para bater papo.\n"
-        "**Memória:** Diga 'Lembre-se que [algo]' para eu anotar.\n"
-        "`/ia memoria_ver` - Veja o que eu sei sobre você."
-    )
+    # Conversar por menção (@P3LUCHE) e registrar memórias são restritos a
+    # Staff/Criador (checagem em lore_ai.py:on_message) — não prometer isso
+    # aqui para membros comuns, que nunca conseguiriam usar.
+    ia_txt = "`/ia memoria_ver` - Veja o que eu sei sobre você (se algo já foi anotado)."
     embed.add_field(name="🤖 Inteligência Artificial", value=ia_txt, inline=False)
 
     embed.set_footer(text="Dica: Use /eco diario todo dia para ganhar Sachês grátis!")
@@ -120,10 +120,10 @@ def create_staff_embed(bot_ref, user):
     embed.set_thumbnail(url=avatar_url)
 
     mod_txt = (
-        "`/advertencia [user] [motivo] [provas]`\n"
+        "`/mod advertencia [user] [motivo] [provas]`\n"
         "> Gera Nota Fiscal e avisa na DM. 4 Warns = Sugestão de Ban.\n"
-        "`/historico [user]` - Vê ficha criminal completa.\n"
-        "`/perdoar [id]` - Revoga um warn (Soft Delete)."
+        "`/mod historico [user]` - Vê ficha criminal completa.\n"
+        "`/mod perdoar [id]` - Revoga um warn (Soft Delete)."
     )
     embed.add_field(name="⚖️ Sistema de Justiça", value=mod_txt, inline=False)
 
@@ -144,7 +144,9 @@ def create_staff_embed(bot_ref, user):
 
     extra_txt = (
         "`/mensagem_manual [canal] [msg]` - O bot fala por você.\n"
-        "`/stats` - Monitoramento de CPU/RAM e Latência."
+        "`/stats` - Monitoramento de CPU/RAM e Latência.\n"
+        "`/p3luche comandos` - Tradução, resumo e reescrita de texto via IA "
+        "(restrito a Staff/Criador, assim como conversar por menção)."
     )
     embed.add_field(name="⚙️ Ferramentas do Sistema", value=extra_txt, inline=False)
 

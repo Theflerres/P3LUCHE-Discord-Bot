@@ -2349,8 +2349,8 @@ class GuildView(discord.ui.View):
 
         await interaction.response.edit_message(embed=embed, view=view_mission, attachments=[]) # Limpa anexos
 
-# --- COMANDO PRINCIPAL: /GUILDA ---
-@app_commands.command(name="guilda", description="Acessa o hub da Guilda (Perfil, Rank, Grupo).")
+# --- COMANDO PRINCIPAL: /ECO GUILDA ---
+@eco_group.command(name="guilda", description="Acessa o hub da Guilda (Perfil, Rank, Grupo).")
 async def guilda(interaction: discord.Interaction):
     # 1. TRAVA DE ACESSO (O Portão da Cidade)
     user_id = interaction.user.id

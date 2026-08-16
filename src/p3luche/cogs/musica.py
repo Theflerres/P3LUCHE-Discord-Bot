@@ -891,7 +891,7 @@ async def musica_restaurar(interaction: discord.Interaction, id_musica: int):
     )
 
 
-@app_commands.command(name="biblioteca", description="Navega pela biblioteca.")
+@musica_group.command(name="biblioteca", description="Navega pela biblioteca.")
 async def biblioteca(interaction: discord.Interaction):
     if not await check_channel_permission(interaction):
         return
@@ -902,7 +902,7 @@ async def biblioteca(interaction: discord.Interaction):
 
 
 class MusicaCog(commands.Cog):
-    """Registra /musica e /biblioteca."""
+    """Registra /musica."""
 
     def __init__(self, bot):
         self.bot = bot
@@ -910,7 +910,6 @@ class MusicaCog(commands.Cog):
 
     async def cog_load(self):
         self.bot.tree.add_command(musica_group)
-        self.bot.tree.add_command(biblioteca)
 
 
 async def setup(bot):

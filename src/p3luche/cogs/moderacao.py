@@ -13,11 +13,13 @@ from config import MOD_ROLE_IDS, WARN_CHANNEL_ID, set_bot_instance
 class ModeracaoCog(commands.Cog):
     """Comandos de justiça com embeds estilo Nota Fiscal."""
 
+    mod_group = app_commands.Group(name="mod", description="Comandos de moderação do P3LUCHE.")
+
     def __init__(self, bot):
         self.bot = bot
         set_bot_instance(bot)
 
-    @app_commands.command(name="advertencia", description="Registra uma advertência (Somente Moderadores).")
+    @mod_group.command(name="advertencia", description="Registra uma advertência (Somente Moderadores).")
     @app_commands.describe(
         usuario="O usuário infrator",
         motivo="Motivo da advertência",
@@ -129,7 +131,7 @@ class ModeracaoCog(commands.Cog):
         except Exception:
             pass
 
-    @app_commands.command(name="historico", description="Ver o histórico completo (Ativos e Perdoados).")
+    @mod_group.command(name="historico", description="Ver o histórico completo (Ativos e Perdoados).")
     @app_commands.describe(usuario="O usuário para consultar")
     async def historico_warns(self, interaction: discord.Interaction, usuario: discord.Member):
         has_role = any(role.id in MOD_ROLE_IDS for role in interaction.user.roles)
@@ -187,7 +189,7 @@ class ModeracaoCog(commands.Cog):
 
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(name="perdoar", description="Revoga uma advertência (Soft Delete).")
+    @mod_group.command(name="perdoar", description="Revoga uma advertência (Soft Delete).")
     @app_commands.describe(id_advertencia="O ID da advertência")
     async def remover_warn(self, interaction: discord.Interaction, id_advertencia: int):
         has_role = any(role.id in MOD_ROLE_IDS for role in interaction.user.roles)
