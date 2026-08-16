@@ -13,7 +13,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from .chat_engine import process_message
+from chat_engine import process_message
 from .config import AppConfig, config_to_dict, load_config, save_config
 from .db import get_bot_stats, query_lore_search
 from .lore_indexer import lore_indexer
