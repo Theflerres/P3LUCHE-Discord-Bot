@@ -53,6 +53,7 @@ async def setup_hook():
         # "cogs.casino",  # Desabilitado temporariamente até correção do crash
         "cogs.spotify",
         "cogs.sistema",
+        "cogs.admin",
         "cogs.backup",
         "cogs.erros",
         "cogs.logs",
