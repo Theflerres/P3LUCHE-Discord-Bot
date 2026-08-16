@@ -2976,15 +2976,20 @@ class ValeriusShopSelect(discord.ui.Select):
 
 
 class EconomiaCog(commands.Cog):
-    """Registra /eco e /guilda no Command Tree e mantém o ciclo automático de clima."""
+    """Registra /eco (com /eco guilda como subcomando) e mantém o ciclo automático de clima."""
 
     def __init__(self, bot):
         self.bot = bot
         set_bot_instance(bot)
 
     async def cog_load(self):
+        # 'guilda' é registrado automaticamente aqui: desde a migração
+        # /guilda -> /eco guilda ela virou um @eco_group.command (subcomando),
+        # não mais um app_commands.command standalone. Um segundo
+        # add_command(guilda) explícito quebra com CommandAlreadyRegistered,
+        # porque a árvore resolve o nome pelo root_parent ("eco"), que já foi
+        # registrado na linha acima.
         self.bot.tree.add_command(eco_group)
-        self.bot.tree.add_command(guilda)
         conn = self.bot.db_conn
         ensure_v4_tables(conn)
         seed_market_prices(conn, FISH_DB)
