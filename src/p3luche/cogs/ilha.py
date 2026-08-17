@@ -89,28 +89,6 @@ ISLAND_STRUCTURES = {
     },
 }
 
-# ============================================================================
-# ⚠️ MODO DE TESTE TEMPORÁRIO (sessão de validação manual do dono) ⚠️
-# Sobrescreve build_hours das 4 estruturas acima para 30-60s, só para dar pra
-# testar o fluxo completo (construir → esperar → coletar → subir tier) sem
-# esperar as horas reais. Os valores no dict ISLAND_STRUCTURES acima
-# (2h/3h/5h/8h) são os placeholders REAIS do catálogo e NÃO foram tocados —
-# é só isto aqui embaixo que precisa sumir depois.
-# TODO(dono): remover este bloco inteiro após validar o fluxo manualmente.
-# ============================================================================
-_TEST_BUILD_SECONDS = {
-    "nucleo": 30,
-    "deposito": 40,
-    "oficina": 50,
-    "farol": 60,
-}
-for _test_key, _test_seconds in _TEST_BUILD_SECONDS.items():
-    ISLAND_STRUCTURES[_test_key]["build_hours"] = _test_seconds / 3600
-del _test_key, _test_seconds
-# ============================================================================
-# FIM DO MODO DE TESTE — nada abaixo desta linha faz parte da alteração.
-# ============================================================================
-
 
 def _structure_cost(structure_key: str, current_level: int) -> dict:
     """Custo/tempo para levar `structure_key` de current_level para o
