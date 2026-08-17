@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS user_cooldowns (
     last_fish TIMESTAMP,
     last_daily TIMESTAMP,
     last_explore TIMESTAMP,
-    daily_streak INTEGER DEFAULT 0
+    daily_streak INTEGER DEFAULT 0,
+    last_memoria TIMESTAMP
 );
 CREATE TABLE IF NOT EXISTS achievements (
     user_id INTEGER,
@@ -92,6 +93,13 @@ def ensure_v4_tables(conn: sqlite3.Connection) -> None:
     try:
         cursor.execute(
             "ALTER TABLE user_cooldowns ADD COLUMN daily_streak INTEGER DEFAULT 0"
+        )
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            raise
+    try:
+        cursor.execute(
+            "ALTER TABLE user_cooldowns ADD COLUMN last_memoria TIMESTAMP"
         )
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e):
@@ -479,13 +487,13 @@ def try_upgrade_rod(
         raise
 
 
-_COOLDOWN_FIELDS = ("last_fish", "last_daily", "last_explore")
+_COOLDOWN_FIELDS = ("last_fish", "last_daily", "last_explore", "last_memoria")
 
 
 def get_cooldowns(conn: sqlite3.Connection, user_id: int) -> dict:
     ensure_user(conn, user_id)
     row = conn.execute(
-        "SELECT last_fish, last_daily, last_explore, daily_streak FROM user_cooldowns WHERE user_id = ?",
+        "SELECT last_fish, last_daily, last_explore, daily_streak, last_memoria FROM user_cooldowns WHERE user_id = ?",
         (user_id,),
     ).fetchone()
     return {
@@ -493,6 +501,7 @@ def get_cooldowns(conn: sqlite3.Connection, user_id: int) -> dict:
         "last_daily": row["last_daily"] if row else None,
         "last_explore": row["last_explore"] if row else None,
         "daily_streak": _coerce_int(row["daily_streak"] if row else 0),
+        "last_memoria": row["last_memoria"] if row else None,
     }
 
 

@@ -1,7 +1,10 @@
 """
 Casino P3LUCHE — poker, blackjack, crash e slots.
 
-DESABILITADO: o casino está em manutenção porque o crash está criando lucros excessivos.
+DESABILITADO: correções da Fase 4 (escrow, bug do Dobrar, overshoot do
+crash, house edge/RTP de crash e slots) já aplicadas e testadas — cog
+segue fora de main.py aguardando decisão explícita de reativação em
+produção (não é mais o bug de lucro excessivo do crash, já corrigido).
 """
 from __future__ import annotations
 
@@ -115,6 +118,7 @@ class PokerView(discord.ui.View):
         self.player = [deck.pop(), deck.pop()]
         self.bot_hand = [deck.pop(), deck.pop()]
         self.community: list[str] = []
+        self.finished = False
         self.message: discord.Message | None = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -124,11 +128,20 @@ class PokerView(discord.ui.View):
         return True
 
     async def on_timeout(self):
+        if self.finished:
+            return
+        self.finished = True
         for child in self.children:
             child.disabled = True
+        # A aposta já foi debitada na abertura da mesa (escrow) — sem
+        # showdown, ela fica perdida (mesma semântica de "derrota
+        # automática" já usada em BlackjackView.on_timeout).
         if self.message:
             try:
-                await self.message.edit(view=self)
+                await self.message.edit(
+                    content=f"⏰ Tempo esgotado — mesa fechada, aposta perdida ({self.aposta} Sachês).",
+                    view=self,
+                )
             except discord.HTTPException:
                 pass
 
@@ -163,6 +176,9 @@ class PokerView(discord.ui.View):
     async def showdown(self, interaction: discord.Interaction, button: discord.ui.Button):
         if len(self.community) < 5:
             return await interaction.response.send_message("❌ Complete a mesa primeiro.", ephemeral=True)
+        if self.finished:
+            return await interaction.response.send_message("❌ Mesa já encerrada.", ephemeral=True)
+        self.finished = True
         for child in self.children:
             child.disabled = True
 
@@ -172,13 +188,16 @@ class PokerView(discord.ui.View):
         uid = interaction.user.id
         name = interaction.user.display_name
 
+        # A aposta já foi debitada na abertura da mesa (escrow, mesmo padrão
+        # do Blackjack) — vitória paga a aposta de volta + o lucro (1:1);
+        # derrota não debita de novo (já foi debitada); empate devolve.
         if p_score > b_score:
-            modify_wallet(conn, uid, self.aposta, name)
+            modify_wallet(conn, uid, self.aposta * 2, name)
             result = f"🏆 Você venceu! +{self.aposta} Sachês\nMão: **{HAND_NAMES[p_score[0]]}**"
         elif p_score < b_score:
-            modify_wallet(conn, uid, -self.aposta, name)
             result = f"💀 O bot venceu. -{self.aposta} Sachês\nMão do bot: **{HAND_NAMES[b_score[0]]}**"
         else:
+            modify_wallet(conn, uid, self.aposta, name)
             result = "🤝 Empate! Aposta devolvida."
 
         embed = self._embed(reveal_bot=True)
@@ -192,6 +211,10 @@ async def poker(interaction: discord.Interaction, aposta: int):
     ok, msg = _check_bet(interaction, aposta)
     if not ok:
         return await interaction.response.send_message(msg, ephemeral=True)
+    # Escrow: debita a aposta ANTES de abrir a mesa (mesmo padrão do
+    # Blackjack), não só no showdown — fecha a janela em que o saldo fica
+    # "livre" durante toda a mão (até 60s) mesmo com a aposta comprometida.
+    modify_wallet(get_bot_instance().db_conn, interaction.user.id, -aposta, interaction.user.display_name)
     deck = _new_deck()
     random.shuffle(deck)
     view = PokerView(interaction.user.id, aposta, deck)
@@ -277,21 +300,25 @@ class BlackjackView(discord.ui.View):
         conn = get_bot_instance().db_conn
         uid = self.user_id
 
+        # A aposta (self.aposta, já dobrada se doubled=True) foi debitada
+        # integralmente no ato da aposta/dobra — nenhuma derrota pode debitar
+        # de novo aqui (bug encontrado nesta correção: as 3 ramificações de
+        # derrota debitavam -self.aposta outra vez, cobrando 2x o valor
+        # apostado em toda derrota). Vitória paga a aposta de volta + o
+        # lucro (1:1) sobre o valor JÁ dobrado — não existe mais caso
+        # especial pra `doubled`, já que self.aposta reflete o valor atual.
         if timeout:
             msg = "⏰ Tempo esgotado — derrota automática."
-            modify_wallet(conn, uid, -self.aposta)
         elif p_val > 21:
             msg = f"💥 Estourou ({p_val})! -{self.aposta} Sachês"
-            modify_wallet(conn, uid, -self.aposta)
         elif d_val > 21 or p_val > d_val:
-            win = self.aposta * 2 if not self.doubled else self.aposta
+            win = self.aposta * 2
             modify_wallet(conn, uid, win)
             msg = f"🏆 Você venceu! +{win} Sachês"
         elif p_val == d_val:
             modify_wallet(conn, uid, self.aposta)
             msg = f"🤝 Empate! Aposta devolvida (+{self.aposta} Sachês)"
         else:
-            modify_wallet(conn, uid, -self.aposta)
             msg = f"💀 Banca vence ({d_val}). -{self.aposta} Sachês"
 
         embed = self._embed(hide_dealer=False)
@@ -343,6 +370,25 @@ async def blackjack(interaction: discord.Interaction, aposta: int):
 
 # --- CRASH ---
 
+# House edge alvo: ~9% (faixa 8-10% "alto risco/recompensa" escolhida).
+# Fórmula "provably fair" padrão de jogos crash: P(crash_point >= m) =
+# (1 - house_edge) / m para m >= 1. Essa distribuição dá EV = -house_edge *
+# aposta CONSTANTE não importa em que multiplicador o jogador decida sacar
+# (diferente do range fixo antigo, que não tinha house edge configurável).
+CRASH_HOUSE_EDGE = 0.09
+# Teto prático do multiplicador: sem ele, um sorteio extremo de r muito
+# pequeno geraria um crash_point gigantesco e a rodada rodaria por muito
+# mais que os 120s de timeout da view (incrementos de ~0.1-0.5 a cada 0.5s).
+# Recorta só a cauda extrema (~1.8% de probabilidade com he=9%).
+CRASH_MAX_MULTIPLIER = 30.0
+
+
+def _draw_crash_point(house_edge: float = CRASH_HOUSE_EDGE) -> float:
+    r = random.uniform(1e-6, 1.0)
+    crash_point = (1 - house_edge) / r
+    return min(CRASH_MAX_MULTIPLIER, max(1.0, crash_point))
+
+
 class CrashView(discord.ui.View):
     def __init__(self, user_id: int, aposta: int, crash_point: float):
         super().__init__(timeout=120)
@@ -384,7 +430,7 @@ async def crash(interaction: discord.Interaction, aposta: int):
     modify_wallet(get_bot_instance().db_conn, interaction.user.id, -aposta, interaction.user.display_name)
 
     await interaction.response.defer()
-    crash_point = random.uniform(1.2, 10.0)
+    crash_point = _draw_crash_point()
     view = CrashView(interaction.user.id, aposta, crash_point)
     multiplier = 1.0
     msg_obj = await interaction.followup.send(
@@ -394,8 +440,16 @@ async def crash(interaction: discord.Interaction, aposta: int):
     )
     view.message = msg_obj
 
-    while multiplier < crash_point and not view.cashed_out:
-        multiplier += random.uniform(0.1, 0.5)
+    while not view.cashed_out:
+        proximo = multiplier + random.uniform(0.1, 0.5)
+        # Nunca deixa o multiplicador exposto/clicável passar do
+        # crash_point: se o próximo incremento ultrapassaria, o crash já
+        # aconteceu — quebra ANTES de publicar esse valor ou dar mais uma
+        # janela de 0.5s com o Cash Out ainda ativo além do ponto real de
+        # queda.
+        if proximo >= crash_point:
+            break
+        multiplier = proximo
         view.multiplier = multiplier
         try:
             await msg_obj.edit(
@@ -424,6 +478,14 @@ async def slots(interaction: discord.Interaction, aposta: int):
     if not ok:
         return await interaction.response.send_message(msg, ephemeral=True)
 
+    conn = get_bot_instance().db_conn
+    uid = interaction.user.id
+    # Escrow: debita a aposta ANTES de girar os rolos, não só depois da
+    # animação (~3s de sleeps). Sem isso, o saldo fica "livre" durante toda
+    # a janela de giro, permitindo múltiplas chamadas simultâneas passarem
+    # pela checagem de saldo antes de qualquer uma debitar.
+    modify_wallet(conn, uid, -aposta, interaction.user.display_name)
+
     await interaction.response.defer()
     symbols = ["🍒", "🍋", "🍊", "🍉", "🔔", "💎"]
 
@@ -437,17 +499,19 @@ async def slots(interaction: discord.Interaction, aposta: int):
         await interaction.edit_original_response(embed=embed)
         await asyncio.sleep(1)
 
+    # Tabela "alto risco" (RTP alvo ~80%, house edge ~20% — antes RTP≈40,3%,
+    # mais punitivo que qualquer slot real). Com 6 símbolos equiprováveis e
+    # 3 rolos independentes (216 combinações): 6 trincas (1 de cada símbolo),
+    # 60 combinações de "2 de 3" e 150 sem prêmio.
+    # RTP = (60*1 + 4*10 + 1*25 + 1*48) / 216 ≈ 80,1%.
     final = [random.choice(symbols) for _ in range(3)]
     premio = 0
     if final[0] == final[1] == final[2]:
-        mult = {"💎": 10, "🔔": 5}.get(final[0], 3)
+        mult = {"💎": 48, "🔔": 25}.get(final[0], 10)
         premio = aposta * mult
     elif final[0] == final[1] or final[1] == final[2]:
         premio = aposta
 
-    conn = get_bot_instance().db_conn
-    uid = interaction.user.id
-    modify_wallet(conn, uid, -aposta, interaction.user.display_name)
     if premio:
         modify_wallet(conn, uid, premio)
 

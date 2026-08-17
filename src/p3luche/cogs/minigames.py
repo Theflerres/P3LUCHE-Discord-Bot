@@ -16,9 +16,11 @@ from economy_db import (
     add_inventory_item,
     consume_fish,
     ensure_user,
+    get_cooldowns,
     get_inventory,
     get_wallet,
     modify_wallet,
+    set_cooldown,
     set_inventory_item,
 )
 from cogs.economia import SHOP_ITEMS, eco_group
@@ -213,6 +215,7 @@ class MemoriaView(discord.ui.View):
         self.revealed = [False] * 12
         self.first_pick: int | None = None
         self.pairs_found = 0
+        self.finished = False
         self.message: discord.Message | None = None
 
         for i in range(12):
@@ -233,6 +236,11 @@ class MemoriaView(discord.ui.View):
             async def callback(self, interaction: discord.Interaction):
                 if interaction.user.id != view.user_id:
                     return await interaction.response.send_message("❌ Não é seu jogo.", ephemeral=True)
+                # Guarda anti-replay (mesmo padrão de BlackjackView/CrashView):
+                # reforça a proteção já existente via `revealed` contra
+                # pagamento duplo se a vitória for processada mais de uma vez.
+                if view.finished:
+                    return await interaction.response.send_message("❌ Jogo já encerrado.", ephemeral=True)
                 if view.revealed[self.idx]:
                     return await interaction.response.send_message("❌ Já virada.", ephemeral=True)
 
@@ -248,6 +256,7 @@ class MemoriaView(discord.ui.View):
                         view.pairs_found += 1
                         view.first_pick = None
                         if view.pairs_found >= 6:
+                            view.finished = True
                             modify_wallet(
                                 get_bot_instance().db_conn, view.user_id, 150
                             )
@@ -285,8 +294,40 @@ class MemoriaView(discord.ui.View):
         return "**🐠 Aquário Memória**\n" + "\n".join(rows)
 
 
+# 300 Sachês garantidos por vitória mereciam custo real de entrada — sem
+# isso, o jogo pagava 20-48k Sachês/hora de graça (auditoria da Fase 4).
+# Mesmo cooldown base da vara inicial (vara_bambu, 5min/300s): 150 Sachês
+# garantidos ao completar o tabuleiro é equivalente a uma boa pescaria.
+MEMORIA_COOLDOWN_SECONDS = 300
+
+
 @eco_group.command(name="memoria", description="Jogo da memória do aquário.")
 async def memoria(interaction: discord.Interaction):
+    conn = get_bot_instance().db_conn
+    uid = interaction.user.id
+    ensure_user(conn, uid, interaction.user.display_name)
+
+    agora = datetime.now()
+    last_memoria = get_cooldowns(conn, uid)["last_memoria"]
+    if last_memoria:
+        try:
+            last_dt = datetime.strptime(last_memoria, "%Y-%m-%d %H:%M:%S.%f")
+            elapsed = (agora - last_dt).total_seconds()
+            if elapsed < MEMORIA_COOLDOWN_SECONDS:
+                wait = int(MEMORIA_COOLDOWN_SECONDS - elapsed)
+                ts = int((agora + timedelta(seconds=wait)).timestamp())
+                return await interaction.response.send_message(
+                    f"⏳ **Aquário Memória:** As cartas ainda estão sendo embaralhadas... Volte <t:{ts}:R>.",
+                    ephemeral=True,
+                )
+        except ValueError:
+            pass
+
+    # Reserva o cooldown ANTES de abrir o tabuleiro (mesmo padrão de
+    # pescar/explorar) — sem isso, duas chamadas em sequência rápida
+    # passariam pela checagem antes de qualquer uma reservar.
+    set_cooldown(conn, uid, "last_memoria", agora.strftime("%Y-%m-%d %H:%M:%S.%f"))
+
     pares = ["🐟", "🐠", "🐡", "🦑", "🐙", "🦀"]
     cartas = pares * 2
     random.shuffle(cartas)
@@ -302,6 +343,7 @@ class BattleView(discord.ui.View):
         self.opponent_id = opponent_id
         self.user_hp = user_hp
         self.opp_hp = opp_hp
+        self.finished = False
         self.message: discord.Message | None = None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -317,6 +359,11 @@ class BattleView(discord.ui.View):
         return embed
 
     async def _attack(self, interaction: discord.Interaction, atk_type: str):
+        # Guarda anti-replay (mesmo padrão de BlackjackView/CrashView):
+        # fecha o pagamento duplo por clique duplo no botão vencedor.
+        if self.finished:
+            return await interaction.response.send_message("❌ Batalha já encerrada.", ephemeral=True)
+
         opp_type = random.choice(list(TYPE_WEAKNESS.keys()))
         dmg_user = 25 if TYPE_WEAKNESS.get(atk_type) == opp_type else 10
         dmg_opp = random.randint(8, 20)
@@ -327,11 +374,13 @@ class BattleView(discord.ui.View):
         desc += f"💥 -{dmg_user} no oponente | -{dmg_opp} em você"
 
         if self.opp_hp <= 0:
+            self.finished = True
             modify_wallet(get_bot_instance().db_conn, self.user_id, 200)
             desc += "\n\n🏆 **Vitória! +200 Sachês**"
             for child in self.children:
                 child.disabled = True
         elif self.user_hp <= 0:
+            self.finished = True
             desc += "\n\n💀 **Derrota!**"
             for child in self.children:
                 child.disabled = True
@@ -362,14 +411,21 @@ async def batalhar(interaction: discord.Interaction, oponente: discord.Member):
 
     conn = get_bot_instance().db_conn
     inv = get_inventory(conn, interaction.user.id)
-    fish_count = sum(1 for k in inv if k in [f for fishes in FISH_TYPES.values() for f in fishes])
-    if fish_count < 1:
+    battle_fish = [f for fishes in FISH_TYPES.values() for f in fishes]
+    # O gate de "precisa de peixe" nunca era exercido: checava a presença
+    # mas não consumia nada (auditoria da Fase 4). Consome de fato 1 peixe
+    # válido antes de abrir a batalha — mesma isca gasta em pescar/craftar.
+    custo_peixe = next((f for f in battle_fish if inv.get(f, 0) > 0), None)
+    if not custo_peixe:
         return await interaction.response.send_message(
             "❌ Você precisa de peixes no inventário.", ephemeral=True
         )
+    consume_fish(conn, interaction.user.id, custo_peixe, 1)
 
     view = BattleView(interaction.user.id, oponente.id, 100, 100)
-    await interaction.response.send_message(embed=view._embed(), view=view)
+    embed = view._embed()
+    embed.set_footer(text=f"🐟 Peixe usado como isca de combate: {custo_peixe}")
+    await interaction.response.send_message(embed=embed, view=view)
     view.message = await interaction.original_response()
 
 
