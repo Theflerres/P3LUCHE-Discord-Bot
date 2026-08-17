@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 
 V4_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -83,6 +83,29 @@ CREATE TABLE IF NOT EXISTS auction_lots (
     highest_bidder INTEGER,
     ends_at TIMESTAMP,
     status TEXT DEFAULT 'active'
+);
+CREATE TABLE IF NOT EXISTS user_islands (
+    user_id INTEGER PRIMARY KEY REFERENCES users(user_id),
+    tier INTEGER DEFAULT 0,
+    layout_json TEXT DEFAULT '{}',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS user_island_structures (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER REFERENCES users(user_id),
+    structure_key TEXT NOT NULL,
+    level INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'idle',
+    timer_end TIMESTAMP,
+    state_json TEXT DEFAULT '{}',
+    UNIQUE(user_id, structure_key)
+);
+CREATE TABLE IF NOT EXISTS user_island_unlocks (
+    user_id INTEGER,
+    unlock_key TEXT,
+    unlocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, unlock_key)
 );
 """
 
@@ -596,3 +619,198 @@ def get_market_price(conn: sqlite3.Connection, fish_name: str, fallback: int) ->
         "SELECT current_price FROM market_prices WHERE fish_name = ?", (fish_name,)
     ).fetchone()
     return row["current_price"] if row else fallback
+
+
+# --- ILHA PESSOAL (Fase 6) ---
+# Peixe nunca entra aqui: construção/upgrade só consome Sachê (wallet) e
+# sucata (scrap), os mesmos dois recursos já usados em try_upgrade_rod.
+
+
+def get_island(conn: sqlite3.Connection, user_id: int) -> dict:
+    """Retorna a ilha do jogador, criando a linha (tier 0) no primeiro acesso."""
+    ensure_user(conn, user_id)
+    row = conn.execute("SELECT * FROM user_islands WHERE user_id = ?", (user_id,)).fetchone()
+    if not row:
+        conn.execute("INSERT OR IGNORE INTO user_islands (user_id) VALUES (?)", (user_id,))
+        conn.commit()
+        row = conn.execute("SELECT * FROM user_islands WHERE user_id = ?", (user_id,)).fetchone()
+    return {
+        "user_id": row["user_id"],
+        "tier": _coerce_int(row["tier"]),
+        "layout_json": row["layout_json"] or "{}",
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+
+
+def get_island_structures(conn: sqlite3.Connection, user_id: int) -> dict:
+    """Retorna {structure_key: {level, status, timer_end, state_json}} das
+    construções que já têm alguma linha (iniciadas em algum momento)."""
+    ensure_user(conn, user_id)
+    rows = conn.execute(
+        "SELECT structure_key, level, status, timer_end, state_json FROM user_island_structures WHERE user_id = ?",
+        (user_id,),
+    ).fetchall()
+    return {
+        r["structure_key"]: {
+            "level": _coerce_int(r["level"]),
+            "status": r["status"] or "idle",
+            "timer_end": r["timer_end"],
+            "state_json": r["state_json"] or "{}",
+        }
+        for r in rows
+    }
+
+
+def get_island_unlocks(conn: sqlite3.Connection, user_id: int) -> set:
+    ensure_user(conn, user_id)
+    rows = conn.execute(
+        "SELECT unlock_key FROM user_island_unlocks WHERE user_id = ?", (user_id,)
+    ).fetchall()
+    return {r["unlock_key"] for r in rows}
+
+
+def start_island_construction(
+    conn: sqlite3.Connection,
+    user_id: int,
+    structure_key: str,
+    target_level: int,
+    cost_saches: int,
+    cost_scrap: int,
+    build_hours: float,
+    required_tier: int = 0,
+) -> dict:
+    """Inicia (ou upa de nível) uma construção da ilha, de forma atômica.
+
+    Relê saldo/sucata, o nível/status ATUAIS da construção e o tier da ilha
+    dentro da MESMA transação (nunca um valor capturado na abertura do hub,
+    que pode ficar aberto por minutos) — mesmo raciocínio do fix de
+    duplicação do QTE de pesca e do try_upgrade_rod. O gate de tier
+    (`required_tier`) é reavaliado aqui, não só na UI, para não reabrir o
+    mesmo tipo de bug de checagem-fora-da-transação corrigido na Fase 3.
+    """
+    ensure_user(conn, user_id)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        island_row = conn.execute(
+            "SELECT tier FROM user_islands WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        island_tier = _coerce_int(island_row["tier"] if island_row else 0)
+        if island_tier < required_tier:
+            conn.commit()
+            return {"success": False, "reason": "locked", "tier": island_tier}
+
+        srow = conn.execute(
+            "SELECT wallet, scrap FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        wallet = _coerce_int(srow["wallet"] if srow else 0)
+        scrap = _coerce_int(srow["scrap"] if srow else 0)
+
+        struct_row = conn.execute(
+            "SELECT level, status FROM user_island_structures WHERE user_id = ? AND structure_key = ?",
+            (user_id, structure_key),
+        ).fetchone()
+        current_level = _coerce_int(struct_row["level"] if struct_row else 0)
+        status = struct_row["status"] if struct_row else "idle"
+
+        if status == "building":
+            conn.commit()
+            return {"success": False, "reason": "already_building"}
+        if status == "ready":
+            conn.commit()
+            return {"success": False, "reason": "pending_collect"}
+        if current_level >= target_level:
+            conn.commit()
+            return {"success": False, "reason": "already_built", "level": current_level}
+        if wallet < cost_saches or scrap < cost_scrap:
+            conn.commit()
+            return {
+                "success": False,
+                "reason": "insufficient_resources",
+                "wallet": wallet,
+                "scrap": scrap,
+            }
+
+        new_wallet = wallet - cost_saches
+        new_scrap = scrap - cost_scrap
+        timer_end = (datetime.now() + timedelta(hours=build_hours)).timestamp()
+
+        conn.execute("UPDATE users SET wallet = ?, scrap = ? WHERE user_id = ?", (new_wallet, new_scrap, user_id))
+        conn.execute(
+            """
+            INSERT INTO user_island_structures (user_id, structure_key, level, status, timer_end, state_json)
+            VALUES (?, ?, ?, 'building', ?, '{}')
+            ON CONFLICT(user_id, structure_key) DO UPDATE SET
+                status = 'building', timer_end = excluded.timer_end
+            """,
+            (user_id, structure_key, current_level, timer_end),
+        )
+        sync_user_to_economy(conn, user_id)
+        conn.commit()
+        return {"success": True, "reason": None, "timer_end": timer_end, "wallet": new_wallet, "scrap": new_scrap}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def finalize_island_construction(
+    conn: sqlite3.Connection,
+    user_id: int,
+    structure_key: str,
+    target_level: int,
+    is_core: bool,
+) -> dict:
+    """Conclui uma construção cujo timer já passou: sobe o nível para
+    `target_level` e, se for a estrutura-núcleo (`is_core`), também sobe o
+    tier da ilha e registra o desbloqueio (mesmo padrão de achievements).
+
+    Atômico: relê status/timer dentro da transação antes de confirmar —
+    evita finalizar duas vezes se o botão for clicado em duplicidade.
+    """
+    ensure_user(conn, user_id)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT level, status, timer_end FROM user_island_structures WHERE user_id = ? AND structure_key = ?",
+            (user_id, structure_key),
+        ).fetchone()
+        if not row or row["status"] != "building":
+            conn.commit()
+            return {"success": False, "reason": "not_building"}
+
+        timer_end = row["timer_end"] or 0
+        now_ts = datetime.now().timestamp()
+        if now_ts < timer_end:
+            conn.commit()
+            return {"success": False, "reason": "not_ready", "timer_end": timer_end}
+
+        conn.execute(
+            "UPDATE user_island_structures SET level = ?, status = 'idle', timer_end = NULL WHERE user_id = ? AND structure_key = ?",
+            (target_level, user_id, structure_key),
+        )
+        new_tier = None
+        if is_core:
+            # Upsert, não UPDATE puro: a linha em user_islands só é criada
+            # preguiçosamente por get_island() (ex.: na abertura do /ilha).
+            # Se finalize for chamado sem essa linha existir ainda, um
+            # UPDATE simples afetaria 0 linhas e o tier nunca subiria.
+            conn.execute(
+                """
+                INSERT INTO user_islands (user_id, tier, updated_at)
+                VALUES (?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    tier = excluded.tier,
+                    updated_at = excluded.updated_at
+                """,
+                (user_id, target_level),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO user_island_unlocks (user_id, unlock_key) VALUES (?, ?)",
+                (user_id, f"tier_{target_level}"),
+            )
+            new_tier = target_level
+        conn.commit()
+        return {"success": True, "reason": None, "level": target_level, "tier": new_tier}
+    except Exception:
+        conn.rollback()
+        raise

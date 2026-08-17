@@ -47,6 +47,13 @@ CREATOR_ID = 299323165937500160
 _error_log_channel_env = os.getenv("ERROR_LOG_CHANNEL_ID")
 ERROR_LOG_CHANNEL_ID = int(_error_log_channel_env) if _error_log_channel_env else None
 
+# Canal onde o banner pontual de mudança de clima da pescaria (Tempestade
+# Sombria / Brisa Dourada) é publicado. Configure via .env:
+# FISHING_CHANNEL_ID=<id_do_canal>. Sem essa variável, o bot não envia o
+# banner (o rich presence continua atualizando normalmente).
+_fishing_channel_env = os.getenv("FISHING_CHANNEL_ID")
+FISHING_CHANNEL_ID = int(_fishing_channel_env) if _fishing_channel_env else None
+
 # --- LIMITES MÚSICA ---
 MAX_SONG_SIZE_MB = 3000
 STANDBY_TIMEOUT_MINUTES = 20

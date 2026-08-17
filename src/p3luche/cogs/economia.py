@@ -23,9 +23,15 @@ from config import (
     CATCHES_LOCK,
     CATCHES_SINCE_RESTART,
     CATCHES_TTL_SECONDS,
+    FISHING_CHANNEL_ID,
 )
 from utils import get_local_file, log_to_gui
 from economy_constants import FISH_DB
+from cogs.pesca_visuals import (
+    resolve_fishing_asset,
+    resolve_qte_asset,
+    resolve_weather_asset,
+)
 from economy_db import (
     add_inventory_item,
     ensure_user,
@@ -719,9 +725,11 @@ class TensionQTEView(discord.ui.View):
                 if n == self.secret:
                     self.catch_ctx["valor"] = int(self.catch_ctx["valor"] * 1.5)
                     self.catch_ctx["qte_msg"] = "⚡ Você controlou a linha! Valor x1.5!"
+                    self.catch_ctx["qte_outcome"] = "sucesso"
                 else:
                     self.catch_ctx["valor"] = 0
                     self.catch_ctx["qte_msg"] = "❌ A linha arrebentou! O peixe escapou!"
+                    self.catch_ctx["qte_outcome"] = "falha"
                 await _finalize_pescar(interaction, self.catch_ctx, edit=True)
 
             btn.callback = callback
@@ -730,6 +738,7 @@ class TensionQTEView(discord.ui.View):
     async def on_timeout(self):
         self.catch_ctx["valor"] = 0
         self.catch_ctx["qte_msg"] = "❌ Tempo esgotado — o peixe escapou!"
+        self.catch_ctx["qte_outcome"] = "falha"
         if self.catch_ctx.get("qte_message"):
             try:
                 await _finalize_pescar_timeout(self.catch_ctx)
@@ -817,10 +826,26 @@ async def _finalize_pescar(interaction: discord.Interaction, ctx: dict, edit: bo
         bottle_msg = "\n🧴 **Você encontrou uma Garrafa Incrustada!** Use /ler_garrafa para ver o conteúdo."
         embed.description = (embed.description or "") + bottle_msg
 
+    # Apresentação: resultado de QTE (sucesso/falha) tem prioridade visual
+    # sobre a imagem padrão de tier/lixo, já que substitui a mesma captura.
+    qte_outcome = ctx.get("qte_outcome")
+    asset_path = resolve_qte_asset(qte_outcome) if qte_outcome else resolve_fishing_asset(
+        nome, tier_p, ctx.get("is_trash", False)
+    )
+    img_file, img_url = get_local_file(asset_path, os.path.basename(asset_path)) if asset_path else (None, None)
+    if img_file:
+        embed.set_thumbnail(url=img_url)
+
     if edit:
-        await interaction.response.edit_message(embed=embed, view=None)
+        if img_file:
+            await interaction.response.edit_message(embed=embed, view=None, attachments=[img_file])
+        else:
+            await interaction.response.edit_message(embed=embed, view=None)
     else:
-        await interaction.followup.send(embed=embed)
+        if img_file:
+            await interaction.followup.send(embed=embed, file=img_file)
+        else:
+            await interaction.followup.send(embed=embed)
 
 
 async def _finalize_pescar_timeout(ctx: dict):
@@ -860,8 +885,15 @@ async def _finalize_pescar_timeout(ctx: dict):
         description=ctx["qte_msg"],
         color=discord.Color.red(),
     )
+    asset_path = resolve_qte_asset("falha")
+    img_file, img_url = get_local_file(asset_path, os.path.basename(asset_path)) if asset_path else (None, None)
+    if img_file:
+        embed.set_image(url=img_url)
     try:
-        await msg.edit(embed=embed, view=None)
+        if img_file:
+            await msg.edit(embed=embed, view=None, attachments=[img_file])
+        else:
+            await msg.edit(embed=embed, view=None)
     except discord.HTTPException:
         pass
 
@@ -1204,7 +1236,13 @@ async def pescar(interaction: discord.Interaction):
             description=f"Tensão da linha! Memorize: **{secret}**\n*(some em 2 segundos...)*",
             color=discord.Color.orange(),
         )
-        msg = await interaction.followup.send(embed=qte_embed)
+        tensao_path = resolve_qte_asset("tensao")
+        tensao_file, tensao_url = get_local_file(tensao_path, os.path.basename(tensao_path)) if tensao_path else (None, None)
+        if tensao_file:
+            qte_embed.set_image(url=tensao_url)
+            msg = await interaction.followup.send(embed=qte_embed, file=tensao_file)
+        else:
+            msg = await interaction.followup.send(embed=qte_embed)
         catch_ctx["qte_message"] = msg
         await asyncio.sleep(2)
         view = TensionQTEView(user_id, secret, catch_ctx)
@@ -3023,11 +3061,44 @@ class EconomiaCog(commands.Cog):
         weights = [0.7, 0.2, 0.1]
         new_weather = random.choices(options, weights)[0]
         cursor = self.bot.db_conn.cursor()
+        prev_row = cursor.execute("SELECT current_weather FROM world_state WHERE id = 1").fetchone()
+        prev_weather = prev_row['current_weather'] if prev_row else None
         cursor.execute("UPDATE world_state SET current_weather = ? WHERE id = 1", (new_weather,))
         self.bot.db_conn.commit()
         status_text = f"P3LUCHE | Clima: {WEATHER_EFFECTS[new_weather]['name']}"
         await self.bot.change_presence(activity=discord.Game(name=status_text))
         print(f"[CLIMA] O tempo mudou para: {new_weather.upper()}")
+
+        if new_weather != prev_weather:
+            await self._send_weather_banner(new_weather)
+
+    async def _send_weather_banner(self, weather_key: str):
+        """Banner pontual (só na mudança de clima). Para 'normal' não há
+        asset — resolve_weather_asset já retorna None e este método sai sem
+        enviar nada, mantendo o comportamento de texto/status de sempre."""
+        asset_path = resolve_weather_asset(weather_key)
+        if not asset_path or not FISHING_CHANNEL_ID:
+            return
+        channel = self.bot.get_channel(FISHING_CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(FISHING_CHANNEL_ID)
+            except discord.HTTPException:
+                return
+        img_file, img_url = get_local_file(asset_path, os.path.basename(asset_path))
+        if not img_file:
+            return
+        w_stats = WEATHER_EFFECTS[weather_key]
+        embed = discord.Embed(
+            title=f"🌊 O clima mudou: {w_stats['name']}",
+            description=w_stats['desc'],
+            color=discord.Color.red() if weather_key == "bad" else discord.Color.gold(),
+        )
+        embed.set_image(url=img_url)
+        try:
+            await channel.send(embed=embed, file=img_file)
+        except discord.HTTPException:
+            pass
 
     @weather_cycle.before_loop
     async def before_weather_cycle(self):
