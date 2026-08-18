@@ -1052,5 +1052,109 @@ class NewAccountPescarFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(cd["last_fish"])
 
 
+class RodSelectEquipTests(unittest.IsolatedAsyncioTestCase):
+    """Regressão: jogador reportou não conseguir trocar de vara depois de
+    comprar uma nova. Causa raiz: RodSelect.callback só escrevia
+    current_rod na tabela legada `economy`, nunca em user_rods (v4) — e
+    ensure_user() só sincroniza legada->v4 nessa tabela com INSERT OR
+    IGNORE (só na criação da conta), então a troca "funcionava" (mensagem
+    de sucesso) mas /eco pescar continuava lendo a vara antiga da v4.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def _make_rod_select(self, user_id, owned_rods, current_rod_key, chosen_rod):
+        from cogs.economia import RodSelect
+
+        select = RodSelect(user_id, owned_rods, current_rod_key)
+        select._values = [chosen_rod]
+        return select
+
+    async def test_equipping_a_purchased_rod_updates_the_v4_table_pescar_actually_reads(self):
+        from economy_db import ensure_user, get_current_rod
+
+        conn = self._make_conn()
+        user_id = 5001
+        # Usuário já existente com vara_bambu equipada e vara_ouro comprada
+        # (já no inventário) — cenário exato do bug reportado.
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, wallet, current_rod, inventory) VALUES (?, ?, ?, ?, ?)",
+            (user_id, "Tester", 5000, "vara_bambu", json.dumps({"vara_ouro": 1})),
+        )
+        conn.commit()
+        # Materializa user_rods (v4) ANTES da troca, simulando um jogador
+        # que já pescou antes — crítico para o teste ser fiel ao bug real:
+        # sync_user_from_economy só faz INSERT OR IGNORE em user_rods, ou
+        # seja, só sincroniza da legada pra v4 na CRIAÇÃO da linha. Se a
+        # linha não existisse ainda neste ponto, a própria chamada de
+        # ensure_user() dentro de pescar() faria essa sincronização de
+        # graça na 1ª vez, mascarando o bug em vez de reproduzi-lo.
+        ensure_user(conn, user_id, "Tester")
+        self.assertEqual(get_current_rod(conn, user_id), "vara_bambu")
+
+        select = self._make_rod_select(user_id, ["vara_bambu", "vara_ouro"], "vara_bambu", "vara_ouro")
+        interaction = self._make_interaction(user_id)
+
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await select.callback(interaction)
+
+        # Antes do fix, isto ficava 'vara_bambu' (nunca sincronizado) mesmo
+        # com a mensagem de sucesso já tendo sido enviada.
+        self.assertEqual(get_current_rod(conn, user_id), "vara_ouro")
+        interaction.response.send_message.assert_awaited_once()
+
+    async def test_pescar_after_equipping_actually_uses_the_new_rod(self):
+        """Reprodução fim-a-fim do sintoma relatado: troca de vara, depois
+        pesca de verdade — o resultado precisa refletir a vara NOVA."""
+        from economy_db import ensure_user
+
+        conn = self._make_conn()
+        user_id = 5002
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, wallet, current_rod, inventory) VALUES (?, ?, ?, ?, ?)",
+            (user_id, "Tester", 5000, "vara_bambu", json.dumps({"vara_ouro": 1, "firewall": 1})),
+        )
+        conn.commit()
+        # Mesmo motivo do teste acima: materializa user_rods ANTES da troca,
+        # simulando um jogador que já pescou antes (senão o bug fica
+        # mascarado pelo INSERT OR IGNORE de 1ª sincronização).
+        ensure_user(conn, user_id, "Tester")
+
+        select = self._make_rod_select(user_id, ["vara_bambu", "vara_ouro"], "vara_bambu", "vara_ouro")
+        equip_interaction = self._make_interaction(user_id)
+
+        real_choice = economia.random.choice
+
+        def choose_low_tier(seq):
+            candidates = [item for item in seq if isinstance(item, tuple) and len(item) == 6 and 0 < item[4] <= 2]
+            return candidates[0] if candidates else real_choice(seq)
+
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await select.callback(equip_interaction)
+
+            pescar_interaction = self._make_interaction(user_id)
+            with patch.object(economia.random, "choice", side_effect=choose_low_tier):
+                await economia.pescar.callback(pescar_interaction)
+
+        pescar_interaction.followup.send.assert_awaited_once()
+        _, kwargs = pescar_interaction.followup.send.call_args
+        embed = kwargs.get("embed")
+        self.assertIsNotNone(embed)
+        detalhes_field = next(f for f in embed.fields if f.name == "Detalhes")
+        self.assertIn(
+            "Vara de Ouro",
+            detalhes_field.value,
+            "pescar() usou a vara antiga (vara_bambu) mesmo depois da troca — bug reportado não corrigido",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

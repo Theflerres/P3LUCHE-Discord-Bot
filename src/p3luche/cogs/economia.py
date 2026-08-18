@@ -1652,25 +1652,22 @@ class RodSelect(discord.ui.Select):
 
         new_rod = self.values[0]
         rod_name = ROD_STATS[new_rod]['name']
+        conn = get_bot_instance().db_conn
 
-        # Atualiza no Banco de Dados
-        cursor = get_bot_instance().db_conn.cursor()
-
-        # Garante que a vara equipada esteja presente no inventário (não deve 'sumir')
-        try:
-            row = cursor.execute("SELECT inventory FROM economy WHERE user_id = ?", (self.user_id,)).fetchone()
-            inv = json.loads(row['inventory']) if row and row['inventory'] else {}
-        except:
-            inv = {}
-
-        # Se equipando uma vara comprada, assegura que o item exista no inventário
+        # Garante que a vara equipada esteja presente no inventário (não deve
+        # 'sumir'). Lê/escreve pela camada v4 (user_inventory) — escrever só
+        # na tabela legada `economy` aqui não bastava: ensure_user() só
+        # sincroniza user_rods/user_inventory da legada pra v4 na CRIAÇÃO da
+        # conta (INSERT OR IGNORE), não a cada chamada. Era por isso que
+        # trocar de vara "funcionava" (mensagem de sucesso) mas /eco pescar
+        # continuava usando a vara antiga, lida da tabela v4 que nunca era
+        # atualizada.
         if new_rod != 'vara_bambu':
+            inv = get_inventory(conn, self.user_id)
             if inv.get(new_rod, 0) <= 0:
-                inv[new_rod] = 1
-                cursor.execute("UPDATE economy SET inventory = ? WHERE user_id = ?", (json.dumps(inv), self.user_id))
+                add_inventory_item(conn, self.user_id, new_rod, 1)
 
-        cursor.execute("UPDATE economy SET current_rod = ? WHERE user_id = ?", (new_rod, self.user_id))
-        get_bot_instance().db_conn.commit()
+        set_current_rod(conn, self.user_id, new_rod)
 
         await interaction.response.send_message(f"✅ **Pronto!** Você equipou a **{rod_name}**.", ephemeral=True)
 
