@@ -989,5 +989,68 @@ class PescarCooldownReservationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["fish_count"], 0)
 
 
+class NewAccountPescarFlowTests(unittest.IsolatedAsyncioTestCase):
+    """Fase 8: colapsa a criação de conta — a primeira chamada de
+    /eco pescar de um usuário nunca visto antes não pode mais parar em
+    '🆕 Conta criada! Tente pescar novamente.' Precisa criar a conta E
+    entregar o resultado da primeira pescaria na MESMA chamada.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Novato"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name),
+            response=SimpleNamespace(defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    async def test_first_ever_pescar_call_creates_account_and_delivers_catch(self):
+        conn = self._make_conn()
+        user_id = 4242
+        interaction = self._make_interaction(user_id)
+
+        # Vara padrão de conta nova (vara_bambu, tier 0) só sorteia peixes
+        # tier 0 — força "Sardinha" (peixe de verdade, fora de TRASH_ITEMS)
+        # em vez de deixar ao acaso, pra tornar o resultado determinístico
+        # sem precisar tocar em nenhuma outra regra de sorteio/valor.
+        real_choice = economia.random.choice
+
+        def choose_sardinha(seq):
+            for item in seq:
+                if isinstance(item, tuple) and len(item) == 6 and item[0] == "Sardinha":
+                    return item
+            return real_choice(seq)
+
+        # Pré-condição: usuário realmente não existe em nenhuma tabela ainda.
+        self.assertIsNone(conn.execute("SELECT 1 FROM economy WHERE user_id = ?", (user_id,)).fetchone())
+        self.assertIsNone(conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone())
+
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+             patch.object(economia.random, "choice", side_effect=choose_sardinha):
+            await economia.pescar.callback(interaction)
+
+        # A conta foi materializada na mesma chamada (users e economy).
+        self.assertIsNotNone(conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone())
+        self.assertIsNotNone(conn.execute("SELECT 1 FROM economy WHERE user_id = ?", (user_id,)).fetchone())
+
+        # Só UMA resposta foi enviada, e é o resultado da pescaria (embed
+        # com o peixe capturado) — não a antiga mensagem de texto "conta
+        # criada, tente de novo".
+        interaction.followup.send.assert_awaited_once()
+        _, kwargs = interaction.followup.send.call_args
+        embed = kwargs.get("embed")
+        self.assertIsNotNone(embed, "esperava o embed de resultado da pescaria na 1ª chamada")
+        self.assertIn("Sardinha", embed.fields[0].value)
+
+        # A pescaria de verdade rodou (cooldown reservado), não só a criação
+        # de conta.
+        from economy_db import get_cooldowns
+
+        cd = get_cooldowns(conn, user_id)
+        self.assertIsNotNone(cd["last_fish"])
+
+
 if __name__ == "__main__":
     unittest.main()

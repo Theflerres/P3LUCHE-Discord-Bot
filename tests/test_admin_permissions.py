@@ -55,10 +55,12 @@ class IsBotOwnerPredicateTests(unittest.IsolatedAsyncioTestCase):
 
 
 class AdminGroupRegistrationTests(unittest.IsolatedAsyncioTestCase):
-    """Regressão: /admin economia consultar|corrigir estão registrados sob
-    o subgrupo correto, com self vinculado (mesmo padrão de Group-como-
-    atributo-de-Cog já validado em /mod) e com is_bot_owner() efetivamente
-    anexado a cada comando.
+    """Regressão: todos os comandos /admin (Fase 7: economia, sistema, debug)
+    estão registrados sob o subgrupo correto, com self vinculado (mesmo
+    padrão de Group-como-atributo-de-Cog já validado em /mod) e com
+    is_bot_owner() efetivamente anexado a cada comando — inclusive os que
+    migraram de sistema.py e antes não tinham checagem nenhuma
+    (admin_quest) ou usavam uma lista de IDs hardcoded (admin_fix_time).
     """
 
     async def test_admin_economia_subgroup_has_expected_commands_and_checks(self):
@@ -74,20 +76,40 @@ class AdminGroupRegistrationTests(unittest.IsolatedAsyncioTestCase):
         leaf_names = sorted(
             c.name for c in admin.walk_commands() if isinstance(c, discord.app_commands.Command)
         )
-        self.assertEqual(leaf_names, ["consultar", "corrigir"])
+        self.assertEqual(
+            leaf_names,
+            [
+                "catches",
+                "consultar",
+                "corrigir",
+                "dar",
+                "falar",
+                "fix_cooldowns",
+                "inspecionar",
+                "quest",
+                "remover",
+                "resetar",
+                "resetar_tudo",
+            ],
+        )
 
         # Importante: verificar via a cópia registrada em bot.tree, não via
         # o atributo de classe original (AdminCog.economia_group) — a
         # injeção da Cog cria uma cópia com `binding` vinculado; a classe
         # original nunca é mutada e sempre teria binding=None.
-        economia_subgroup = admin.get_command("economia")
-        self.assertIsNotNone(economia_subgroup, "/admin economia não encontrado")
-
-        for name in ("consultar", "corrigir"):
-            cmd = economia_subgroup.get_command(name)
-            self.assertIsNotNone(cmd, f"/admin economia {name} não encontrado")
-            self.assertIs(cmd.binding, cog, f"/admin economia {name} sem binding correto de self")
-            self.assertTrue(cmd.checks, f"/admin economia {name} sem is_bot_owner() anexado")
+        subgroups = {
+            "economia": ["consultar", "corrigir", "dar", "remover", "resetar"],
+            "sistema": ["falar", "fix_cooldowns", "resetar_tudo"],
+            "debug": ["catches", "quest", "inspecionar"],
+        }
+        for group_name, command_names in subgroups.items():
+            subgroup = admin.get_command(group_name)
+            self.assertIsNotNone(subgroup, f"/admin {group_name} não encontrado")
+            for name in command_names:
+                cmd = subgroup.get_command(name)
+                self.assertIsNotNone(cmd, f"/admin {group_name} {name} não encontrado")
+                self.assertIs(cmd.binding, cog, f"/admin {group_name} {name} sem binding correto de self")
+                self.assertTrue(cmd.checks, f"/admin {group_name} {name} sem is_bot_owner() anexado")
 
         self.assertEqual(admin.default_permissions, discord.Permissions(administrator=True))
 
@@ -134,16 +156,23 @@ class EconomiaCorrigirFlowTests(unittest.IsolatedAsyncioTestCase):
 
     def _make_interaction(self, campo_value="wallet"):
         return SimpleNamespace(
-            user=SimpleNamespace(id=CREATOR_ID),
+            user=SimpleNamespace(id=CREATOR_ID, mention=f"<@{CREATOR_ID}>"),
             response=AsyncMock(),
             edit_original_response=AsyncMock(),
         )
+
+    def _make_fake_bot(self):
+        # _send_audit_log (Fase 7) chama bot.get_channel(AUDIT_CHANNEL_ID) —
+        # precisa devolver algo com .send() awaitable, senão o fluxo de
+        # corrigir/dar/remover/resetar quebra ao tentar logar a auditoria.
+        fake_channel = SimpleNamespace(send=AsyncMock())
+        return SimpleNamespace(get_channel=lambda cid: fake_channel)
 
     async def test_declined_confirmation_does_not_change_wallet(self):
         from cogs.admin import AdminCog, ConfirmView
 
         conn = self._make_conn()
-        cog = AdminCog(bot=SimpleNamespace())
+        cog = AdminCog(bot=self._make_fake_bot())
         interaction = self._make_interaction()
         usuario = SimpleNamespace(id=77, display_name="Alvo", mention="<@77>")
         campo = discord.app_commands.Choice(name="Carteira (wallet)", value="wallet")
@@ -164,7 +193,7 @@ class EconomiaCorrigirFlowTests(unittest.IsolatedAsyncioTestCase):
         from cogs.admin import AdminCog, ConfirmView
 
         conn = self._make_conn()
-        cog = AdminCog(bot=SimpleNamespace())
+        cog = AdminCog(bot=self._make_fake_bot())
         interaction = self._make_interaction()
         usuario = SimpleNamespace(id=77, display_name="Alvo", mention="<@77>")
         campo = discord.app_commands.Choice(name="Carteira (wallet)", value="wallet")

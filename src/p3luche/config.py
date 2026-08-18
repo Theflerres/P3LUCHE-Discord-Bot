@@ -54,6 +54,13 @@ ERROR_LOG_CHANNEL_ID = int(_error_log_channel_env) if _error_log_channel_env els
 _fishing_channel_env = os.getenv("FISHING_CHANNEL_ID")
 FISHING_CHANNEL_ID = int(_fishing_channel_env) if _fishing_channel_env else None
 
+# Canal onde a mensagem de boas-vindas (on_member_join, Fase 8) é publicada.
+# Configure via .env: WELCOME_CHANNEL_ID=<id_do_canal>. Sem essa variável, o
+# bot simplesmente não envia boas-vindas (sem cair de volta pra nenhum canal
+# por engano).
+_welcome_channel_env = os.getenv("WELCOME_CHANNEL_ID")
+WELCOME_CHANNEL_ID = int(_welcome_channel_env) if _welcome_channel_env else None
+
 # --- LIMITES MÚSICA ---
 MAX_SONG_SIZE_MB = 3000
 STANDBY_TIMEOUT_MINUTES = 20

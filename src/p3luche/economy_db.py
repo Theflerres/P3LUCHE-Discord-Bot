@@ -814,3 +814,131 @@ def finalize_island_construction(
     except Exception:
         conn.rollback()
         raise
+
+
+# --- RESET DE PROGRESSO (Fase 7 — /admin economia resetar e /admin sistema resetar_tudo) ---
+# Escopo decidido com o dono do bot: inclui saldo, sucata, inventário, vara
+# equipada + upgrades, armadilha AFK, cooldowns, rank/XP de guilda,
+# quest_progress, a ilha pessoal (Fase 6, construções incluídas) e a posição
+# no leaderboard de torneio (pontos vêm de atividade econômica, tratados
+# como parte do progresso, não como registro permanente).
+# Deliberadamente NÃO inclui: achievements (registro permanente de
+# conquistas — tratado como histórico independente do progresso econômico,
+# mesmo padrão de conquistas Steam/console) e fish_sales_history (ledger de
+# vendas — não é estado do jogador). No reset GLOBAL, achievements TAMBÉM é
+# esvaziado (ver reset_all_players), porque ali a operação é "começar do
+# zero" para o servidor inteiro, não só zerar a economia de um jogador.
+
+
+def reset_player_progress(conn: sqlite3.Connection, user_id: int) -> dict:
+    """Reset individual e destrutivo de UM jogador. Mantém a linha em
+    `users` (não deleta a conta) — zera os campos de progresso e apaga as
+    linhas nas tabelas de coleção (inventário, estruturas/desbloqueios da
+    ilha). Atômico (BEGIN IMMEDIATE): tudo-ou-nada.
+    """
+    ensure_user(conn, user_id)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "UPDATE users SET wallet = 0, fish_count = 0, guild_rank = 'F', guild_xp = 0, scrap = 0 WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.execute("DELETE FROM user_inventory WHERE user_id = ?", (user_id,))
+        conn.execute("UPDATE user_rods SET current_rod = 'vara_bambu' WHERE user_id = ?", (user_id,))
+        conn.execute("UPDATE rod_upgrades SET luck_level = 0, cd_level = 0 WHERE user_id = ?", (user_id,))
+        conn.execute(
+            "UPDATE user_trap SET trap_type = NULL, status = NULL, timer_end = NULL, durability = NULL WHERE user_id = ?",
+            (user_id,),
+        )
+        conn.execute(
+            """
+            UPDATE user_cooldowns SET last_fish = NULL, last_daily = NULL, last_explore = NULL,
+                daily_streak = 0, last_memoria = NULL
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        conn.execute(
+            """
+            UPDATE quest_progress SET current_chapter = 'inicio', quest_status = 'locked',
+                inventory = '{}', reputation = 0
+            WHERE user_id = ?
+            """,
+            (user_id,),
+        )
+        conn.execute("UPDATE user_islands SET tier = 0, layout_json = '{}' WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM user_island_structures WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM user_island_unlocks WHERE user_id = ?", (user_id,))
+        conn.execute("UPDATE persistent_catches SET catch_count = 0 WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM tournament_leaderboard WHERE user_id = ?", (user_id,))
+        sync_user_to_economy(conn, user_id)
+        conn.commit()
+        return {"success": True}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def reset_all_players(conn: sqlite3.Connection) -> dict:
+    """Reset GLOBAL e destrutivo de TODOS os jogadores (`/admin sistema
+    resetar_tudo`). Mantém as linhas nas tabelas singleton por jogador
+    (users, economy, user_rods, rod_upgrades, user_trap, user_cooldowns,
+    quest_progress, user_islands, persistent_catches) — zeradas via UPDATE
+    em massa, sem WHERE. Esvazia por completo as tabelas de coleção
+    (user_inventory, achievements, tournament_leaderboard,
+    user_island_structures, user_island_unlocks) e o registro de grupos
+    (parties), que ficariam órfãos/quebrados sem sentido após o reset.
+
+    Deliberadamente NÃO toca: fish_sales_history (ledger histórico),
+    market_prices/world_state (estado de mundo, não de jogador) e
+    auction_lots (leilão ativo, se houver, fica com estado inconsistente —
+    não rode este comando durante um leilão em andamento).
+
+    Atômico (BEGIN IMMEDIATE): tudo-ou-nada. Retorna quantos jogadores
+    foram afetados, para o log de auditoria.
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        players_row = conn.execute("SELECT COUNT(*) c FROM users").fetchone()
+        players_affected = players_row["c"] if players_row else 0
+
+        conn.execute(
+            "UPDATE users SET wallet = 0, fish_count = 0, guild_rank = 'F', guild_xp = 0, scrap = 0"
+        )
+        conn.execute(
+            """
+            UPDATE economy SET wallet = 0, fish_count = 0, guild_rank = 'F', guild_xp = 0, scrap = 0,
+                inventory = '{}', current_rod = 'vara_bambu', rod_upgrades = '{}', afk_trap = '{}',
+                last_fish = NULL, last_daily = NULL, last_explore = NULL, baits = 0
+            """
+        )
+        conn.execute("UPDATE user_rods SET current_rod = 'vara_bambu'")
+        conn.execute("UPDATE rod_upgrades SET luck_level = 0, cd_level = 0")
+        conn.execute("UPDATE user_trap SET trap_type = NULL, status = NULL, timer_end = NULL, durability = NULL")
+        conn.execute(
+            """
+            UPDATE user_cooldowns SET last_fish = NULL, last_daily = NULL, last_explore = NULL,
+                daily_streak = 0, last_memoria = NULL
+            """
+        )
+        conn.execute(
+            """
+            UPDATE quest_progress SET current_chapter = 'inicio', quest_status = 'locked',
+                inventory = '{}', reputation = 0
+            """
+        )
+        conn.execute("UPDATE user_islands SET tier = 0, layout_json = '{}'")
+        conn.execute("UPDATE persistent_catches SET catch_count = 0")
+
+        conn.execute("DELETE FROM user_inventory")
+        conn.execute("DELETE FROM achievements")
+        conn.execute("DELETE FROM tournament_leaderboard")
+        conn.execute("DELETE FROM user_island_structures")
+        conn.execute("DELETE FROM user_island_unlocks")
+        conn.execute("DELETE FROM parties")
+
+        conn.commit()
+        return {"success": True, "players_affected": players_affected}
+    except Exception:
+        conn.rollback()
+        raise

@@ -912,20 +912,18 @@ async def pescar(interaction: discord.Interaction):
 
     # 1. BUSCA DADOS COMPLETOS (camada v4)
     # A checagem de conta nova usa a tabela legada `economy` (não `users`)
-    # porque comandos ainda não migrados (saldo, rank...) só leem `economy`
-    # — precisa existir uma linha lá pro usuário não cair em loop de "conta
-    # criada" pra sempre.
+    # porque comandos ainda não migrados (saldo, rank...) só leem `economy`.
+    # Fase 8: não interrompe mais o primeiro contato do jogador com um
+    # "conta criada, tente de novo" — ensure_user() já deixa todas as
+    # tabelas v4 (users/user_rods/rod_upgrades/user_cooldowns) com as linhas
+    # e defaults corretos (wallet=0, vara_bambu, cooldown livre etc.), então
+    # o fluxo cai direto na primeira pescaria de verdade, na mesma chamada.
     is_new_account = not cursor.execute(
         "SELECT 1 FROM economy WHERE user_id = ?", (user_id,)
     ).fetchone()
-    if is_new_account:
-        ensure_user(conn, user_id, interaction.user.name)
-        sync_user_to_economy(conn, user_id)
-        return await interaction.followup.send("🆕 Conta criada! Tente pescar novamente.", ephemeral=True)
-
-    # Usuário já existia na tabela legada — garante que as tabelas v4 estão
-    # sincronizadas com o estado dela antes de ler.
     ensure_user(conn, user_id, interaction.user.name)
+    if is_new_account:
+        sync_user_to_economy(conn, user_id)
 
     row = cursor.execute("""
         SELECT u.wallet, u.fish_count, u.guild_rank, u.guild_xp, u.scrap,

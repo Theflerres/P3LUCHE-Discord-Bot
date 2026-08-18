@@ -1,8 +1,12 @@
 """
-Comandos gerais — ajuda, stats, apoiadores, mensagens manuais, debug e grupo /ia.
+Comandos gerais — ajuda, stats, apoiadores e grupo /ia.
+
+mensagem_manual, catches_inspect, catches_reset, admin_quest e admin_fix_time
+migraram para /admin sistema|debug (cogs/admin.py) na Fase 7 — de lá pra cá
+ganharam checagem de permissão via is_bot_owner() (admin_quest não tinha
+NENHUMA checagem antes; admin_fix_time usava uma lista de IDs hardcoded).
 """
 import json
-import time
 from datetime import datetime
 
 import discord
@@ -10,21 +14,8 @@ import psutil
 from discord import app_commands
 from discord.ext import commands
 
-from config import (
-    CATCHES_LOCK,
-    CATCHES_SINCE_RESTART,
-    CATCHES_TTL_SECONDS,
-    CREATOR_ID,
-    MOD_ROLE_IDS,
-    set_bot_instance,
-)
-
-
-def _cleanup_stale_catches() -> None:
-    now = time.time()
-    expired = [uid for uid, (_, ts) in CATCHES_SINCE_RESTART.items() if now - ts > CATCHES_TTL_SECONDS]
-    for uid in expired:
-        CATCHES_SINCE_RESTART.pop(uid, None)
+from config import MOD_ROLE_IDS, set_bot_instance
+from cogs.onboarding import ADD_APP_STEPS
 
 
 class HelpSelect(discord.ui.Select):
@@ -74,6 +65,15 @@ def create_member_embed(bot_ref):
         color=discord.Color.blue(),
     )
     embed.set_thumbnail(url=avatar_url)
+
+    embed.add_field(
+        name="⚠️ Comandos não aparecem ou não respondem?",
+        value=(
+            "Você provavelmente precisa autorizar o P3LUCHE pra sua própria conta, mesmo "
+            "já estando no servidor:\n\n" + ADD_APP_STEPS
+        ),
+        inline=False,
+    )
 
     eco_txt = (
         "`/eco pescar` - Tenta pegar peixes (ou lixo) para ganhar Sachês.\n"
@@ -143,7 +143,7 @@ def create_staff_embed(bot_ref, user):
     embed.add_field(name="🎧 Gestão de Mídia", value=music_admin, inline=False)
 
     extra_txt = (
-        "`/mensagem_manual [canal] [msg]` - O bot fala por você.\n"
+        "`/admin sistema falar [canal] [msg]` - O bot fala por você.\n"
         "`/stats` - Monitoramento de CPU/RAM e Latência.\n"
         "`/p3luche comandos` - Tradução, resumo e reescrita de texto via IA "
         "(restrito a Staff/Criador, assim como conversar por menção)."
@@ -275,107 +275,6 @@ class SistemaCog(commands.Cog):
         else:
             embed = create_member_embed(self.bot)
             await interaction.response.send_message(embed=embed, ephemeral=True)
-
-    @app_commands.command(name="mensagem_manual", description="Envia uma mensagem manual em um canal específico (Apenas Criador).")
-    @app_commands.describe(
-        canal="Selecione o canal onde a mensagem será enviada.",
-        mensagem="O conteúdo da mensagem a ser enviada.",
-    )
-    async def mensagem_manual(self, interaction: discord.Interaction, canal: discord.TextChannel, mensagem: str):
-        if interaction.user.id != CREATOR_ID:
-            await interaction.response.send_message(
-                "🚫 Acesso Negado. Apenas o meu criador pode usar este comando.",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer(ephemeral=True)
-
-        try:
-            await canal.send(mensagem)
-            await interaction.followup.send(
-                f"✅ Mensagem enviada com sucesso para o canal {canal.mention}!",
-                ephemeral=True,
-            )
-        except discord.Forbidden:
-            await interaction.followup.send(
-                f"❌ Erro: Não tenho permissão para falar no canal {canal.mention}.",
-                ephemeral=True,
-            )
-        except Exception as e:
-            await interaction.followup.send(f"❌ Erro ao enviar: {e}", ephemeral=True)
-
-    @app_commands.command(name="catches_inspect", description="Inspeciona contador de pescas desde o último restart (Apenas Criador).")
-    async def catches_inspect(self, interaction: discord.Interaction):
-        if interaction.user.id != CREATOR_ID:
-            return await interaction.response.send_message("🚫 Apenas o criador pode usar.", ephemeral=True)
-        async with CATCHES_LOCK:
-            _cleanup_stale_catches()
-            items = sorted(
-                ((uid, data[0]) for uid, data in CATCHES_SINCE_RESTART.items()),
-                key=lambda x: x[1],
-                reverse=True,
-            )
-        if not items:
-            return await interaction.response.send_message(
-                "Nenhuma pesca registrada desde o restart.",
-                ephemeral=True,
-            )
-        text = "\n".join([f"<@{uid}>: {cnt}" for uid, cnt in items[:50]])
-        await interaction.response.send_message(f"Contador de pescas (top 50):\n{text}", ephemeral=True)
-
-    @app_commands.command(name="catches_reset", description="Reseta contador de pescas desde o restart (Apenas Criador).")
-    @app_commands.describe(user="ID do usuário (opcional) para resetar somente esse usuário")
-    async def catches_reset(self, interaction: discord.Interaction, user: discord.User = None):
-        if interaction.user.id != CREATOR_ID:
-            return await interaction.response.send_message("🚫 Apenas o criador pode usar.", ephemeral=True)
-        async with CATCHES_LOCK:
-            if user:
-                removed = CATCHES_SINCE_RESTART.pop(user.id, None)
-                await interaction.response.send_message(
-                    f"Resetado contador de <@{user.id}> (antes: {removed}).",
-                    ephemeral=True,
-                )
-            else:
-                CATCHES_SINCE_RESTART.clear()
-                await interaction.response.send_message(
-                    "Resetado contador global de pescas desde restart.",
-                    ephemeral=True,
-                )
-
-    @app_commands.command(name="admin_quest", description="[DEBUG] Força o ganho da Garrafa para testes.")
-    async def admin_quest(self, interaction: discord.Interaction):
-        user_id = interaction.user.id
-        cursor = self.bot.db_conn.cursor()
-
-        row = cursor.execute("SELECT inventory FROM economy WHERE user_id = ?", (user_id,)).fetchone()
-        if not row:
-            return await interaction.response.send_message("Crie uma conta pescando primeiro.", ephemeral=True)
-
-        try:
-            inv = json.loads(row["inventory"])
-        except Exception:
-            inv = {}
-
-        inv["garrafa_incrustada"] = 1
-
-        cursor.execute("UPDATE quest_progress SET current_chapter = 'inicio' WHERE user_id = ?", (user_id,))
-        cursor.execute("UPDATE economy SET inventory = ? WHERE user_id = ?", (json.dumps(inv), user_id))
-        self.bot.db_conn.commit()
-
-        await interaction.response.send_message(
-            "🛠️ **DEBUG:** Garrafa adicionada e Quest resetada.\nTeste agora usando `/ler_garrafa`.",
-            ephemeral=True,
-        )
-
-    @app_commands.command(name="admin_fix_time", description="Reseta cooldowns bugados.")
-    async def admin_fix_time(self, interaction: discord.Interaction):
-        if interaction.user.id not in [299323165937500160, 541680099477422110]:
-            return await interaction.response.send_message("🚫 Admin only.", ephemeral=True)
-        cursor = self.bot.db_conn.cursor()
-        cursor.execute("UPDATE economy SET last_fish = NULL, last_explore = NULL")
-        self.bot.db_conn.commit()
-        await interaction.response.send_message("✅ Tempo resetado!", ephemeral=True)
 
     @app_commands.command(name="ler_garrafa", description="Abre a Garrafa Incrustada para ler a mensagem dentro.")
     async def ler_garrafa(self, interaction: discord.Interaction):
