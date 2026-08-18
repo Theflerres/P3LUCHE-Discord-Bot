@@ -9,7 +9,8 @@ ilha privada do jogador — conceitos separados por decisão de design.
 
 Nenhum benefício mecânico ou cosmético de construção é implementado ainda
 (pendente de decisão) — apenas existência, custo e desbloqueio de tier.
-Os nomes/tema do catálogo abaixo são PLACEHOLDER e precisam de revisão.
+Catálogo (nomes, tema e valores) definido pelo dono: tema náufrago/
+sobrevivência pessoal.
 """
 from __future__ import annotations
 
@@ -31,60 +32,61 @@ from economy_db import (
     start_island_construction,
 )
 
-# --- LORE DO HUB (placeholder — distinta de WORLD_LORE["island"]) ---
+# --- LORE DO HUB (distinta de WORLD_LORE["island"], a Ilha do Náufrago) ---
 ISLAND_HUB_LORE = {
-    "title": "🏝️ [PLACEHOLDER] Ilha Pessoal",
+    "title": "🏝️ Ilha Pessoal",
     "description": (
-        "[PLACEHOLDER] Um pedaço de terra que você reivindicou para si — "
-        "separado da Ilha do Náufrago da lore principal. Ninguém mais pisa "
-        "aqui."
+        "Seu próprio pedaço de terra, longe da Ilha do Náufrago da lore "
+        "principal. Aqui a sobrevivência é por sua conta: Sachê, sucata e "
+        "esforço próprio."
     ),
 }
 
-# --- CATÁLOGO DE CONSTRUÇÕES (placeholder — nomes/tema para revisão) ---
+# --- CATÁLOGO DE CONSTRUÇÕES (tema náufrago/sobrevivência pessoal) ---
 # "nucleo" é a estrutura-núcleo: evoluí-la sobe o tier geral da ilha
 # (progressão linear). As demais só ficam disponíveis a partir do tier
 # indicado em "unlock_tier" e, nesta fase, têm nível único (construir = feito,
-# sem upgrade) — apenas existência, sem benefício mecânico associado.
+# sem upgrade) — apenas existência, sem benefício mecânico associado (ainda
+# pendente de decisão, não é placeholder de nome/tema).
 ISLAND_STRUCTURES = {
     "nucleo": {
-        "name": "[PLACEHOLDER] Núcleo da Ilha",
-        "desc": "[PLACEHOLDER] Estrutura central. Evoluí-la aumenta o tier da ilha e libera novas construções.",
+        "name": "Acampamento",
+        "desc": "O centro da sua ilha pessoal. Evoluí-lo aumenta o tier da ilha e libera novas construções.",
         "is_core": True,
         "unlock_tier": 0,
         "max_level": 4,
-        "cost_saches_per_level": 500,
-        "cost_scrap_per_level": 50,
+        "cost_saches_per_level": 1500,
+        "cost_scrap_per_level": 150,
         "build_hours": 2,
     },
     "deposito": {
-        "name": "[PLACEHOLDER] Depósito",
-        "desc": "[PLACEHOLDER] Um espaço de armazenamento. Sem efeito mecânico por enquanto.",
+        "name": "Baú da Maré",
+        "desc": "Onde você guarda o que a maré traz. Ainda sem benefício mecânico associado.",
         "is_core": False,
         "unlock_tier": 1,
         "max_level": 1,
-        "cost_saches": 800,
-        "cost_scrap": 80,
+        "cost_saches": 2400,
+        "cost_scrap": 240,
         "build_hours": 3,
     },
     "oficina": {
-        "name": "[PLACEHOLDER] Oficina",
-        "desc": "[PLACEHOLDER] Uma bancada de trabalho. Sem efeito mecânico por enquanto.",
+        "name": "Bancada do Náufrago",
+        "desc": "Uma bancada de trabalho improvisada. Ainda sem benefício mecânico associado.",
         "is_core": False,
         "unlock_tier": 2,
         "max_level": 1,
-        "cost_saches": 1500,
-        "cost_scrap": 150,
+        "cost_saches": 4500,
+        "cost_scrap": 450,
         "build_hours": 5,
     },
     "farol": {
-        "name": "[PLACEHOLDER] Farol",
-        "desc": "[PLACEHOLDER] Um farol na ponta da ilha. Sem efeito mecânico por enquanto.",
+        "name": "Farol Pessoal",
+        "desc": "Um farol erguido à mão na ponta da ilha. Ainda sem benefício mecânico associado.",
         "is_core": False,
         "unlock_tier": 3,
         "max_level": 1,
-        "cost_saches": 2500,
-        "cost_scrap": 250,
+        "cost_saches": 7500,
+        "cost_scrap": 750,
         "build_hours": 8,
     },
 }
