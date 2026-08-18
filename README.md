@@ -2,16 +2,15 @@
 
 # 🧸 P3LUCHE
 
-### A Inteligência Artificial Definitiva para Gestão de Lore e Comunidades de RPG
+### Bot de Discord para economia de pesca, ilha pessoal, moderação e lore de RPG
 
-![Python](https://img.shields.io/badge/Python-3.13-3776AB?style=for-the-badge&logo=python&logoColor=white)
-![Tauri](https://img.shields.io/badge/Tauri-2.x-FFC131?style=for-the-badge&logo=tauri&logoColor=black)
-![Rust](https://img.shields.io/badge/Rust-Bridge-000000?style=for-the-badge&logo=rust&logoColor=white)
-![Gemini](https://img.shields.io/badge/Gemini-1.5%20Pro-4285F4?style=for-the-badge&logo=google&logoColor=white)
-![LLM](https://img.shields.io/badge/AI-H%C3%ADbrida-FF4B4B?style=for-the-badge)
-![Status](https://img.shields.io/badge/Status-Em%20Produ%C3%A7%C3%A3o-brightgreen?style=for-the-badge)
+![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
+![discord.py](https://img.shields.io/badge/discord.py-2.7.1-5865F2?style=for-the-badge&logo=discord&logoColor=white)
+![Gemini](https://img.shields.io/badge/Gemini-2.0%20Flash-4285F4?style=for-the-badge&logo=google&logoColor=white)
+![SQLite](https://img.shields.io/badge/SQLite3-Migrations%20autom%C3%A1ticas-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
+![Status](https://img.shields.io/badge/Status-Em%20Produção-brightgreen?style=for-the-badge)
 
-**Versão 6.0** · Desenvolvido por [@Theflerres](https://github.com/Theflerres)
+Desenvolvido por [@Theflerres](https://github.com/Theflerres)
 
 </div>
 
@@ -19,21 +18,24 @@
 
 ## O Projeto
 
-O **P3LUCHE** é a evolução definitiva do projeto [P3LUCHE](https://github.com/Theflerres/P3LUCHE-Discord-Bot). O que nasceu como um bot de automação para Discord agora é uma **aplicação desktop standalone** robusta para gerenciamento de lores complexas de RPG.
+O **P3LUCHE** é um bot de Discord (via [discord.py](https://discordpy.readthedocs.io/), arquitetura modular em Cogs) para um único servidor. Ele roda como um processo Python comum conectado ao Gateway do Discord — sem interface gráfica própria, sem suporte a múltiplos servidores.
 
-A **v6.0** marca a transição para uma interface nativa via Tauri, eliminando a dependência de IDEs e otimizando o consumo de recursos (RAM/CPU) com a ponte Rust. O backend Python continua operando como núcleo de inteligência, agora com suporte a **LLM local** para processamento completamente offline.
+O núcleo é um sistema de economia/pesca (Sachês, varas, clima, ilha pessoal), complementado por moderação com trilha de auditoria, um assistente de lore/RAG baseado em Gemini, e um sistema de música com catálogo próprio no Google Drive.
+
+> Existe também `peluchegpt/`, um protótipo de reescrita (FastAPI + desktop Tauri) — veja a nota no final deste documento. Ele **não** está conectado ao bot descrito aqui e não roda no estado atual do repositório.
 
 ---
 
 ## Sumário
 
-- [Stack Tecnológica](#-stack-tecnológica)
-- [Arquitetura Geral](#-arquitetura-geral)
-- [Módulos de Engenharia](#-módulos-de-engenharia)
+- [Stack Tecnológica](#️-stack-tecnológica)
+- [Funcionalidades](#-funcionalidades)
 - [Estrutura do Projeto](#-estrutura-do-projeto)
-- [Instalação e Configuração](#-instalação-e-configuração)
+- [Instalação e Configuração](#️-instalação-e-configuração)
 - [Variáveis de Ambiente](#-variáveis-de-ambiente)
-- [Executando o Projeto](#-executando-o-projeto)
+- [Executando o Projeto](#️-executando-o-projeto)
+- [Testes](#-testes)
+- [Sobre o protótipo peluchegpt/](#-sobre-o-protótipo-peluchegpt)
 - [Licença](#-licença)
 
 ---
@@ -42,123 +44,85 @@ A **v6.0** marca a transição para uma interface nativa via Tauri, eliminando a
 
 | Camada | Tecnologias |
 |---|---|
-| **Frontend (Desktop)** | Tauri 2.x, Rust, Node.js |
-| **Backend (Inteligência)** | Python 3.13, AsyncIO, Arquitetura Modular c/ Cogs |
-| **AI Híbrida** | Google Gemini 1.5 Pro + LLM Local (processamento offline) |
-| **Data Science** | NetworkX, Matplotlib, Pandas, SciPy |
-| **Banco de Dados** | SQLite3 (WAL mode, Soft Delete, Migrations automáticas) |
-| **Discord** | discord.py 2.7.1 (Slash Commands + Hot-Reload de Cogs) |
-| **Cloud & Storage** | Google Drive API, Google Auth |
+| **Discord** | discord.py 2.7.1 (Slash Commands, arquitetura modular em Cogs) |
+| **IA / Lore** | Google Gemini (`gemini-2.0-flash`, via `google-genai`) para RAG sobre a lore do servidor |
+| **Grafo de Lore** | NetworkX + Matplotlib (`/lore grafo`) |
+| **Banco de Dados** | SQLite3 — migrations automáticas no startup, soft delete (advertências, memórias, faixas de música) |
+| **Cloud & Storage** | Google Drive API (catálogo de músicas, backup do banco) |
 | **Mídia** | yt-dlp, PyNaCl, FFmpeg |
-| **Ingestão de Docs** | pypdf, python-docx, lxml |
+| **Ingestão de Docs (Lore)** | pypdf, python-docx, lxml |
 
 ---
 
-## 🏗️ Arquitetura Geral
+## 🎮 Funcionalidades
 
-```
-┌────────────────────────────────────────────────┐
-│              P3LUCHE Desktop                   │
-│         Interface Tauri (Rust + Node.js)       │
-│  ┌──────────────┐        ┌────────────────────┐│
-│  │  Bot Switch  │        │    Log Stream      ││
-│  │ Liga/Desliga │        │ Monitoramento RT   ││
-│  └──────┬───────┘        └────────┬───────────┘│
-└─────────┼────────────────────────┼─────────────┘
-          │   Ponte Nativa (Rust)  │
-          ▼                        ▼
-┌─────────────────────────────────────────────────┐
-│              Backend Python 3.13                │
-│  ┌──────────┐  ┌──────────┐  ┌───────────────┐  │
-│  │  lore_ai │  │  musica  │  │  moderacao    │  │
-│  │  Gemini  │  │ yt-dlp   │  │  Soft Delete  │  │
-│  │   RAG    │  │  GDrive  │  │  Auditoria    │  │
-│  └──────────┘  └──────────┘  └───────────────┘  │
-│       │              SQLite3 (WAL Mode)         │
-└───────┼─────────────────────────────────────────┘
-        ▼
-   Discord API / LLM Local
-```
+### Economia & Pesca
+`/eco pescar` sorteia peixes/lixo com valor variável conforme a vara equipada e o clima do momento (Céu Limpo, Tempestade Sombria ou Brisa Dourada, cada um com efeito próprio em sorte e chance de lixo). Inclui loja diária rotativa, upgrades de vara (sorte/cooldown), armadilha AFK, missões de grupo e um QTE de tensão para capturas de tier alto. Toda leitura/escrita de saldo, inventário e progressão passa por helpers atômicos (`BEGIN IMMEDIATE`) — sem condição de corrida em ações concorrentes.
 
----
+### Ilha Pessoal
+`/ilha` — cada jogador tem uma ilha privada e isolada (sem visita de outros jogadores), com progressão linear por tier. Construções custam Sachê + sucata e levam tempo real para ficar prontas (máquina de estados idle/building/pronta). Benefícios mecânicos das construções ainda não foram decididos/implementados — hoje é só progressão e existência.
 
-## 🔬 Módulos de Engenharia
+### Cassino & Minigames
+Corrida de peixes, jogo da memória, batalha naval e leilões (`/eco craftar`, `/eco corrida`, `/eco memoria`, `/eco batalhar`) estão ativos. O cog de cassino (`cogs/casino.py`) está **desativado** no momento (crash pendente de correção) — não carregado em produção.
 
-### 1. PelucheGPT Lore Assistant (RAG)
+### Música
+Dois sistemas complementares: um catálogo persistente no Google Drive (`/musica adicionar`, `buscar`, `biblioteca`, com edição/ocultação restrita a staff) e um player de fila em canal de voz (`/tocar`, `/cardapio`, `/fila`, `/pausar`, `/pular`), restrito a canais específicos.
 
-O bot atua como um "Bibliotecário Inteligente" do universo de RPG do servidor.
+### Moderação
+`/mod advertencia`, `/mod historico`, `/mod perdoar` — advertências nunca são deletadas fisicamente (soft delete: `status='revoked'` + quem revogou e quando), mantendo trilha de auditoria completa.
 
-- **Ingestão:** Aceita arquivos `.pdf`, `.docx` e `.txt` não estruturados
-- **Indexação semântica:** Recupera contexto relevante em tempo real antes de cada resposta
-- **Coerência:** A IA responde respeitando os fatos históricos do servidor, sem alucinar fora do corpus
+### Lore & IA
+Cada jogador registra a lore do seu personagem (`/lore player`); a IA (Gemini) responde por menção usando RAG sobre esse conteúdo, com um Bibliotecário-Chefe (staff) podendo editar lore de terceiros com histórico de versões (`/lore diff`). `/lore grafo` gera um grafo visual de conexões entre personagens via NetworkX.
 
-### 2. Visualização de Rede de Personagens (NetworkX)
+### Admin
+`/admin economia` (consultar/corrigir/dar/remover/resetar), `/admin sistema` (mensagens manuais, reset de cooldowns, reset global com backup automático + confirmação por modal + log de auditoria) e `/admin debug` (inspeção somente-leitura). Toda a camada é restrita ao Criador do bot via `is_bot_owner()` — nunca por lista de IDs hardcoded.
 
-Algoritmo local de custo zero em tokens que processa lore textual e mapeia relações entre personagens e facções como um grafo de rede.
-
-- **Input:** Milhares de linhas de lore dos jogadores
-- **Processamento:** Co-ocorrência + NER (reconhecimento de entidades)
-- **Output:** Grafo relacional exportado em 4K
-
-### 3. Governança de Dados & Auditoria (Soft Delete)
-
-Nenhuma informação é deletada fisicamente — o sistema segue princípios estritos de integridade de dados.
-
-- **Soft Delete:** Advertências e logs arquivados com `is_active=0`, mantendo trilha de auditoria
-- **Versionamento de Lore:** Snapshot automático antes de qualquer edição (similar ao Git)
-- **Diff Check:** Relatório visual de alterações linha a linha
-
-```diff
---- Versão Antiga (2024-10-15)
-+++ Versão Atual
-@@ -12,1 +12,1 @@
-- O personagem tem medo de altura.
-+ O personagem superou seu medo e agora pilota dragões.
-```
-
-### 4. Interface Desktop Standalone (Tauri)
-
-A GUI nativa elimina a dependência de terminais ou IDEs:
-
-- **Bot Switch:** Ligar/desligar o bot do Discord com um clique
-- **Log Stream:** Monitoramento em tempo real do processamento da IA e eventos do servidor
-- **Consumo otimizado:** A ponte Rust reduz o overhead significativamente em relação a soluções Electron
-
-### 5. AI Híbrida (Online + Offline)
-
-- **Online:** Google Gemini 1.5 Pro para consultas com acesso à internet
-- **Offline:** LLM Local como fallback — o sistema permanece funcional sem conexão externa
-
-### 6. Arquitetura Modular & Hot-Reload
-
-- **Separação de contextos (SoC):** cada domínio em um Cog isolado
-- **Hot-Reload:** módulos recarregáveis individualmente em runtime sem derrubar o WebSocket do bot
-- **Migrations automáticas:** o banco atualiza sua estrutura no startup sem intervenção manual
+### Onboarding
+Mensagem de boas-vindas em canal dedicado (opcional) e dica visível em `/ajuda` para o caso mais comum de "os comandos não aparecem": o usuário precisa clicar em **Adicionar App** para autorizar o bot para si mesmo, mesmo já estando no servidor — uma particularidade do modelo de permissões do Discord que não é detectável por código (a falha acontece inteiramente do lado do cliente, antes de qualquer interação chegar ao bot).
 
 ---
 
 ## 📁 Estrutura do Projeto
 
 ```
-peluchegpt/
-├── backend/                # Core Python
-│   ├── cogs/               # Módulos do bot (lore_ai, musica, moderacao, economia...)
-│   ├── main.py             # Ponto de entrada do bot
-│   ├── config.py           # Configurações globais
-│   ├── database.py         # Gerenciador de banco (conexão, migrate, WAL)
-│   └── utils.py            # Funções utilitárias compartilhadas
+P3-LUCH3/
+├── src/p3luche/             # Código-fonte real do bot
+│   ├── main.py              # Ponto de entrada (bot.run) — execute a partir daqui
+│   ├── config.py            # Constantes, IDs de canal, variáveis de ambiente
+│   ├── database.py          # Conexão SQLite + migrations automáticas
+│   ├── economy_db.py        # Helpers atômicos de economia/pesca/ilha (BEGIN IMMEDIATE)
+│   ├── economy_constants.py # Catálogo de peixes (FISH_DB)
+│   ├── permissions.py       # is_bot_owner() — única fonte de verdade de autorização admin
+│   ├── utils.py             # Helpers compartilhados (logging, sanitização, etc.)
+│   └── cogs/                # Um módulo por domínio
+│       ├── economia.py      # /eco (pesca, loja, guilda, clima)
+│       ├── ilha.py          # /ilha (ilha pessoal)
+│       ├── minigames.py     # /eco craftar|corrida|memoria|batalhar, leilões
+│       ├── casino.py        # Desativado (não carregado em main.py)
+│       ├── musica.py        # /musica (catálogo no Drive)
+│       ├── jukebox.py       # /tocar, /fila (player em canal de voz)
+│       ├── moderacao.py     # /mod (advertências com soft delete)
+│       ├── lore_ai.py       # /lore, /acervo, RAG com Gemini, grafo NetworkX
+│       ├── admin.py         # /admin (exclusivo do Criador)
+│       ├── onboarding.py    # Boas-vindas (on_member_join)
+│       ├── sistema.py       # /ajuda, /stats, /apoiadores, /ia
+│       ├── backup.py        # Backup diário do bot.db no Google Drive
+│       ├── logs.py          # Auditoria de eventos (mensagens, erros, conexão)
+│       └── erros.py         # Log de stack traces em canal privado
 │
-├── frontend/               # Interface Desktop (Tauri)
-│   ├── src-tauri/          # Ponte de comunicação nativa em Rust
-│   │   ├── src/            # Comandos Tauri e lógica de processo
-│   │   └── tauri.conf.json # Configuração do app desktop
-│   └── src/                # UI da aplicação (HTML/CSS/JS)
+├── assets/pesca/            # Imagens/GIFs usados nos embeds de pesca
+├── database/                # bot.db, credentials.json, logs (gitignorado)
+├── tests/                   # Suíte de testes automatizados (unittest)
 │
-├── database/               # Persistência local (ignorada no Git)
-│   └── peluchegpt.db       # SQLite — gerado automaticamente no primeiro run
+├── config.py, utils.py, database.py, economy_db.py,
+│   economy_constants.py, permissions.py, main.py    # Shims na raiz (`from src.p3luche.X import *`)
+├── cogs/                    # Redireciona __path__ para src/p3luche/cogs
+│                            # (os dois acima existem só para os testes
+│                            #  rodarem a partir da raiz do repo — não são
+│                            #  o código real, que vive em src/p3luche/)
 │
-├── requirements.txt        # Dependências Python
-├── .env                    # Variáveis de ambiente (não commitado)
+├── peluchegpt/              # Protótipo desconectado — ver seção própria
+├── requirements.txt
 └── README.md
 ```
 
@@ -168,104 +132,98 @@ peluchegpt/
 
 ### Pré-requisitos
 
-Certifique-se de ter instalado:
+- [Python 3.12+](https://www.python.org/downloads/)
+- [FFmpeg](https://ffmpeg.org/download.html) disponível no PATH (necessário para `/tocar`)
+- Um app no [Discord Developer Portal](https://discord.com/developers/applications) com o bot criado
+- (Opcional, só para música/backup) Um projeto no Google Cloud com a **Google Drive API** habilitada
+- (Opcional, só para lore/IA) Uma chave da **Gemini API** (Google AI Studio)
 
-- [Python 3.13+](https://www.python.org/downloads/)
-- [Node.js 18+](https://nodejs.org/)
-- [Rust (via rustup)](https://rustup.rs/)
-- [FFmpeg](https://ffmpeg.org/download.html) disponível no PATH
-- Conta de serviço no Google Cloud com as APIs habilitadas:
-  - **Google Drive API**
-  - **Gemini API** (Google AI Studio)
-
-### 1. Clone o repositório
+### 1. Clone e instale as dependências
 
 ```bash
 git clone https://github.com/Theflerres/P3LUCHE-Discord-Bot.git
 cd P3LUCHE-Discord-Bot
-```
-
-### 2. Configure o backend Python
-
-```bash
-cd backend
-python -m venv venv
+python -m venv .venv
 
 # Windows
-venv\Scripts\activate
+.venv\Scripts\activate
 # Linux / macOS
-source venv/bin/activate
+source .venv/bin/activate
 
 pip install -r requirements.txt
 ```
 
-### 3. Configure o frontend Tauri
+### 2. Configure as variáveis de ambiente
 
-```bash
-cd ../frontend
-npm install
-```
-
-### 4. Configure as variáveis de ambiente
-
-Crie o arquivo `.env` na raiz conforme a seção abaixo.
+Crie um arquivo `.env` na raiz do projeto — veja a seção abaixo para a lista completa.
 
 ---
 
 ## 🔑 Variáveis de Ambiente
 
-Crie um arquivo `.env` na raiz do projeto:
+Só `DISCORD_TOKEN` é obrigatória. Todas as outras são opcionais — cada uma tem um comportamento gracioso quando ausente (o recurso associado simplesmente fica desligado, sem erro).
 
 ```env
-# Token do bot (Discord Developer Portal)
+# Obrigatória — token do bot no Discord Developer Portal
 DISCORD_TOKEN=seu_token_aqui
 
-# Chave da API do Google Gemini (Google AI Studio)
-GEMINI_API_KEY=sua_chave_aqui
+# Opcional — habilita o assistente de lore/IA (Gemini). Sem ela, os
+# comandos de /lore que dependem de IA ficam indisponíveis.
+GEMINI_KEY=sua_chave_aqui
 
-# ID da pasta no Google Drive usada como cache de músicas
-GDRIVE_FOLDER_ID=id_da_pasta_aqui
+# Opcional — pasta do Drive usada como cache de músicas do Jukebox.
+# Sem ela, cai no fallback DRIVE_FOLDER_ID (constante em config.py).
+JUKEBOX_DRIVE_FOLDER_ID=id_da_pasta_aqui
 
-# Caminho para o arquivo de credenciais da conta de serviço Google
-GOOGLE_CREDENTIALS_PATH=credentials.json
+# Opcional — credenciais de Service Account do Google (JSON inline ou
+# caminho de arquivo). Sem ela, o Drive usa o fluxo OAuth legado
+# (client_secret.json + database/credentials.json).
+GOOGLE_CREDENTIALS_JSON=
 
-# (Opcional) Caminho ou endpoint do LLM Local para modo offline
-LOCAL_LLM_PATH=./models/model.gguf
+# Opcional — canal privado para stack traces técnicos. Sem ela, erros só
+# vão para database/bot_erros.log (nunca cai de volta num canal público).
+ERROR_LOG_CHANNEL_ID=
 
-# (Opcional) ID do servidor Discord principal
-GUILD_ID=id_do_servidor
+# Opcional — canal onde o banner de mudança de clima da pescaria é
+# publicado. Sem ela, o banner simplesmente não é enviado.
+FISHING_CHANNEL_ID=
+
+# Opcional — canal de boas-vindas para novos membros (on_member_join).
+# Sem ela, nenhuma mensagem de boas-vindas é enviada.
+WELCOME_CHANNEL_ID=
 ```
 
-> ⚠️ Nunca commite o `.env` ou o `credentials.json`. Eles já estão no `.gitignore`.
+Além do `.env`, dois arquivos de credenciais do Google (gitignorados) são necessários só para as funcionalidades de Drive: `client_secret.json` (OAuth) e `database/credentials.json` (token gerado no primeiro login — apagar e reautenticar se expirar/for revogado).
+
+> ⚠️ Nunca commite `.env`, `client_secret.json` ou `database/credentials.json`.
 
 ---
 
 ## ▶️ Executando o Projeto
 
-### Modo Desktop (Tauri)
-
 ```bash
-cd frontend
-npm run tauri dev       # Desenvolvimento
-npm run tauri build     # Gera o executável final (.exe / .dmg / .AppImage)
+python src/p3luche/main.py
 ```
 
-A interface desktop inicializa o backend Python automaticamente via ponte Rust.
+O bot irá conectar ao SQLite (executando migrations pendentes), carregar os Cogs listados em `src/p3luche/main.py`, sincronizar os Slash Commands com o Discord e iniciar os loops em background (clima, mercado, backup diário).
 
-### Modo Headless (apenas bot)
+> ⚠️ **Não use `python main.py` a partir da raiz do repositório** — esse arquivo é só um shim de import (`from src.p3luche.main import *`) para os testes funcionarem a partir da raiz; como ele é *importado* em vez de executado diretamente, o bloco `if __name__ == "__main__": bot.run(...)` nunca dispara. O bot "roda" sem erro nenhum e sai imediatamente, sem conectar a lugar nenhum — use sempre o comando acima.
 
-Para rodar o bot sem a interface desktop:
+---
+
+## 🧪 Testes
 
 ```bash
-cd backend
-python main.py
+python -m unittest discover -s tests
 ```
 
-O bot irá:
-1. Conectar ao banco SQLite e executar migrations pendentes
-2. Carregar todos os Cogs em ordem de dependência
-3. Sincronizar os Slash Commands com o Discord
-4. Verificar e popular o cache de músicas do Google Drive
+Suíte com testes automatizados cobrindo os helpers atômicos de economia/pesca/ilha, permissões admin, fluxo de reset (individual e global, incluindo o cenário de falha de backup) e conteúdo dos embeds de onboarding/ajuda.
+
+---
+
+## 🧩 Sobre o protótipo `peluchegpt/`
+
+O diretório `peluchegpt/` contém uma exploração de uma reescrita do projeto como aplicação desktop (backend FastAPI + frontend Tauri). **Não é o bot em produção** descrito neste README, e no estado atual do repositório não está funcional: `peluchegpt/backend/main.py` mistura import absoluto e relativo de um jeito que quebra ao ser executado (`from chat_engine import ...` junto com `from .config import ...`), não tem bloco de entrada (`uvicorn.run`), e seu schema de banco não é compatível com o do bot real. Documentado aqui só para clareza sobre o que está e o que não está em produção.
 
 ---
 
@@ -276,6 +234,5 @@ Distribuído sob a licença presente no arquivo [LICENSE](LICENSE).
 ---
 
 <div align="center">
-  Desenvolvido com 🖤 por <a href="https://github.com/Theflerres">@Theflerres</a><br/>
-  <sub>Evoluído a partir do <a href="https://github.com/Theflerres/P3LUCHE-Discord-Bot">P3LUCHE Discord Bot v3.0</a></sub>
+  Desenvolvido com 🖤 por <a href="https://github.com/Theflerres">@Theflerres</a>
 </div>

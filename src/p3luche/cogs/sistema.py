@@ -15,6 +15,8 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import MOD_ROLE_IDS, set_bot_instance
+from cogs.economia import WEATHER_EFFECTS
+from cogs.ilha import ISLAND_HUB_LORE
 from cogs.onboarding import ADD_APP_STEPS
 
 
@@ -59,9 +61,31 @@ class HelpView(discord.ui.View):
 
 def create_member_embed(bot_ref):
     avatar_url = bot_ref.user.avatar.url if bot_ref.user.avatar else None
+
+    # Status do cassino lido em tempo real (o cog só existe registrado no
+    # bot se cogs.casino estiver na lista de extensões carregadas em
+    # main.py) — evita a dica ficar desatualizada se isso mudar no futuro.
+    casino_ativo = bot_ref.get_cog("CasinoCog") is not None
+    casino_status = "" if casino_ativo else " (**desativado por enquanto**, corrigindo bugs)"
+    clima_nomes = ", ".join(w["name"] for w in WEATHER_EFFECTS.values())
+
+    overview = (
+        "Olá! Eu sou o **P3LUCHE** — aqui está o que dá pra fazer neste servidor:\n\n"
+        f"🎣 **Economia & Pesca** — pesque Sachês e itens com `/eco pescar`, evolua sua vara "
+        f"e sucata, e fique de olho no clima ({clima_nomes}), que muda o que você pesca.\n"
+        f"{ISLAND_HUB_LORE['title']} — construa e evolua sua própria ilha com `/ilha`, "
+        "em tiers, no seu próprio ritmo (sem visita de outros jogadores).\n"
+        f"🎰 **Cassino**{casino_status} — minijogos que apostam peixes e Sachês.\n"
+        "🎵 **Música** — toca e organiza um catálogo de músicas salvas com `/musica`.\n"
+        "🛡️ **Moderação** — advertências com trilha de auditoria (cargo de staff).\n"
+        "📜 **Lore & IA** — registre a história do seu personagem, veja o grafo de conexões "
+        "entre players e converse com a IA sobre a lore do servidor.\n\n"
+        "Comandos por categoria abaixo 👇"
+    )
+
     embed = discord.Embed(
         title="📘 Manual do Usuário - P3LUCHE v3.0",
-        description="Olá! Aqui está tudo o que você pode fazer para interagir comigo.",
+        description=overview,
         color=discord.Color.blue(),
     )
     embed.set_thumbnail(url=avatar_url)
