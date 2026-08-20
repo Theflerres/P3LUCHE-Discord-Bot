@@ -6,6 +6,7 @@ migraram para /admin sistema|debug (cogs/admin.py) na Fase 7 — de lá pra cá
 ganharam checagem de permissão via is_bot_owner() (admin_quest não tinha
 NENHUMA checagem antes; admin_fix_time usava uma lista de IDs hardcoded).
 """
+import asyncio
 import json
 from datetime import datetime
 
@@ -178,6 +179,234 @@ def create_staff_embed(bot_ref, user):
     return embed
 
 
+# --- PAINEL DE APOIADORES (hub com botões, no molde de CityHubView/IlhaHubView) ---
+# Cargos atribuídos manualmente pela staff após a doação — a detecção
+# continua sendo "tem o cargo ou não tem", só a apresentação mudou.
+SUPPORTER_ROLE_IDS = {
+    "vip": 1444466894445740253,
+    "veterano": 1313612976833429504,
+    "tita": 1453158945664270386,
+}
+# VIP e Veterano são mutuamente exclusivos pra fins de "tela principal" —
+# VIP tem prioridade, como pedido. Escudo da Tita NÃO entra nessa exclusão:
+# quem tem o cargo do Escudo sempre aparece na tela do Escudo, além de onde
+# mais aparecer. O selo 🛡️ na tela principal é um extra, nunca substitui a
+# presença na tela do Escudo (bug corrigido: a primeira versão tratava as
+# três categorias como mutuamente exclusivas entre si, o que esvaziava a
+# tela do Escudo pra qualquer pessoa que também fosse VIP ou Veterano).
+SUPPORTER_BADGE_EMOJI = {"vip": "💎", "veterano": "🏛️", "tita": "🛡️"}
+# Ordem de exibição na legenda — só veterano/tita aparecem como selo em
+# alguma tela (vip nunca é selo, sempre é tela principal quando presente).
+SUPPORTER_BADGE_ORDER = ("veterano", "tita")
+SUPPORTER_BADGE_LEGEND = {
+    "veterano": "🏛️ também é Apoiador Veterano",
+    "tita": "🛡️ também apoiou o Escudo da Tita",
+}
+
+
+def _member_role_ids(member) -> set:
+    return {r.id for r in member.roles}
+
+
+def categorize_supporters(members) -> dict:
+    """Recebe um iterável de membros (qualquer objeto com `.roles`, cada
+    role com `.id` — discord.Member de verdade em produção, ou um dublê
+    simples nos testes) e devolve {"vip": [...], "veterano": [...], "tita": [...]}.
+
+    VIP e Veterano são mutuamente exclusivos (VIP tem prioridade como tela
+    principal); o Escudo da Tita é aditivo — quem tem esse cargo SEMPRE
+    aparece na lista "tita", independente de também aparecer em vip/veterano
+    com um selo 🛡️ lá.
+    """
+    result = {"vip": [], "veterano": [], "tita": []}
+    for member in members:
+        role_ids = _member_role_ids(member)
+        has_vip = SUPPORTER_ROLE_IDS["vip"] in role_ids
+        has_veterano = SUPPORTER_ROLE_IDS["veterano"] in role_ids
+        has_tita = SUPPORTER_ROLE_IDS["tita"] in role_ids
+
+        primary = "vip" if has_vip else ("veterano" if has_veterano else None)
+        if primary is not None:
+            badges = []
+            if primary == "vip" and has_veterano:
+                badges.append(SUPPORTER_BADGE_EMOJI["veterano"])
+            if has_tita:
+                badges.append(SUPPORTER_BADGE_EMOJI["tita"])
+            result[primary].append((member, badges))
+
+        if has_tita:
+            result["tita"].append((member, []))
+
+    return result
+
+
+async def resolve_supporter_display(guild, bot, member) -> str:
+    """Confirma se `member` ainda está no servidor. Primeiro tenta pelo
+    cache local (`guild.get_member`, sem custo de rede — cobre a
+    esmagadora maioria dos apoiadores, que estão mesmo no servidor) e só
+    recorre a chamadas de rede (`fetch_member`, depois `fetch_user`) para
+    quem o cache não resolve mais — o caso raro que motivou a Opção B.
+
+    `get_member` é checado de novo aqui (não reaproveita o objeto `member`
+    capturado na varredura de guild.members) porque o cache pode ter sido
+    corrigido entre a categorização e a resolução (ex: o bot recebeu o
+    evento de saída bem nessa janela) — checar de novo, ao vivo mas ainda
+    local/gratuito, aproveita essa correção sem custo de rede.
+
+    Se a pessoa realmente saiu, ainda tenta mostrar o nome dela (busca
+    global de conta, funciona mesmo sem servidor em comum) marcado como
+    "saiu do servidor", em vez de simplesmente sumir com o registro —
+    apoiou, então o nome fica. Se nem a conta existir mais, cai num texto
+    genérico: nunca deixa um ID cru sem nome aparecer no painel.
+    """
+    if guild.get_member(member.id) is not None:
+        return member.mention
+
+    try:
+        await guild.fetch_member(member.id)
+        return member.mention
+    except discord.HTTPException:
+        pass
+
+    try:
+        user = await bot.fetch_user(member.id)
+        return f"{user.display_name} *(saiu do servidor)*"
+    except discord.HTTPException:
+        return "Apoiador (conta removida)"
+
+
+async def resolve_categorized_supporters(guild, bot, categorized: dict) -> dict:
+    """Troca cada (member, badges) por (texto_resolvido, badges) nas três
+    categorias — resolvido uma única vez por invocação do comando; navegar
+    entre as telas do hub reaproveita o resultado, sem checar de novo.
+
+    Resolve todo mundo em paralelo via asyncio.gather em vez de um por um
+    — o tempo total passa a ser o da chamada mais lenta, não a soma de
+    todas (relevante mesmo com o cache-first acima, já que quem cai no
+    caminho de rede ainda paga o custo daquela chamada específica)."""
+    flat = [
+        (category, member, badges)
+        for category, entries in categorized.items()
+        for member, badges in entries
+    ]
+    displays = await asyncio.gather(*(resolve_supporter_display(guild, bot, member) for _, member, _ in flat))
+
+    resolved = {"vip": [], "veterano": [], "tita": []}
+    for (category, _, badges), display in zip(flat, displays):
+        resolved[category].append((display, badges))
+    return resolved
+
+
+def _format_supporter_list(entries: list) -> str:
+    """`entries` é (display, badges) — `display` já vem resolvido (mention
+    normal, nome com marca de "saiu do servidor", ou o texto genérico de
+    conta removida). Esta função só formata, não decide mais nada."""
+    if not entries:
+        return "Ninguém... por enquanto. 😿"
+    lines = []
+    for display, badges in entries:
+        suffix = f" {''.join(badges)}" if badges else ""
+        lines.append(f"{display}{suffix}")
+    return "\n".join(lines)
+
+
+def _supporter_legend(entries: list) -> str | None:
+    """Legenda só aparece se algum selo realmente estiver em uso nesta tela."""
+    used = {badge_cat for _, badges in entries for badge_cat, emoji in SUPPORTER_BADGE_EMOJI.items() if emoji in badges}
+    if not used:
+        return None
+    return "\n".join(SUPPORTER_BADGE_LEGEND[cat] for cat in SUPPORTER_BADGE_ORDER if cat in used)
+
+
+def build_vip_embed(categorized: dict) -> discord.Embed:
+    entries = categorized["vip"]
+    embed = discord.Embed(
+        title="💎 Apoiadores Ativos",
+        description=(
+            f"**{len(entries)} apoiador(es)** mantendo o P3LUCHE vivo agora.\n\n"
+            + _format_supporter_list(entries)
+        ),
+        color=discord.Color.from_rgb(255, 105, 180),
+    )
+    embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/2904/2904973.png")
+    legend = _supporter_legend(entries)
+    if legend:
+        embed.add_field(name="Legenda", value=legend, inline=False)
+    embed.set_footer(text="Quer ajudar e ganhar destaque? Fale com a Staff!")
+    return embed
+
+
+def build_veteranos_embed(categorized: dict) -> discord.Embed:
+    entries = categorized["veterano"]
+    embed = discord.Embed(
+        title="🏛️ Apoiadores Veteranos",
+        description="Doadores da temporada anterior do FCN.\n\n" + _format_supporter_list(entries),
+        color=discord.Color.gold(),
+    )
+    legend = _supporter_legend(entries)
+    if legend:
+        embed.add_field(name="Legenda", value=legend, inline=False)
+    return embed
+
+
+def build_tita_embed(categorized: dict) -> discord.Embed:
+    entries = categorized["tita"]
+    embed = discord.Embed(
+        title="🛡️ Escudo da Tita",
+        description=(
+            f"**{len(entries)} pessoa(s)** ajudaram quando foi preciso.\n\n"
+            "Uma campanha especial, por tempo limitado, criada para ajudar uma das "
+            "artistas do servidor quando a Tita precisou. A campanha já se encerrou, "
+            "e as recompensas ficaram só naquele período — cada nome aqui é de quem "
+            "topou ajudar na hora que foi preciso.\n\n" + _format_supporter_list(entries)
+        ),
+        color=discord.Color.purple(),
+    )
+    # Quem tem o cargo do Escudo sempre cai aqui, mesmo sendo também VIP/
+    # Veterano (ver categorize_supporters) — mas nunca carrega selo NESTA
+    # tela, então sem legenda; o selo 🛡️ só aparece na tela principal dela.
+    return embed
+
+
+class ApoiadoresBackView(discord.ui.View):
+    """Botão único de volta, usado pelas subtelas (Veteranos/Tita)."""
+
+    def __init__(self, categorized: dict):
+        super().__init__(timeout=180)
+        self.categorized = categorized
+
+    @discord.ui.button(label="⬅️ Voltar", style=discord.ButtonStyle.secondary)
+    async def voltar_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(embed=build_vip_embed(self.categorized), view=ApoiadoresView(self.categorized))
+
+
+class ApoiadoresView(discord.ui.View):
+    """Hub de /apoiadores — tela inicial é sempre o VIP; os outros dois
+    botões abrem subtelas dedicadas, cada uma com um botão de volta. Painel
+    é público (mensagem não-ephemeral, como já era antes) — não há dado
+    privado de ninguém aqui, então a navegação não é travada a quem
+    disparou o comando, ao contrário dos hubs pessoais (CityHubView é por
+    localização, não por dono; IlhaHubView SIM trava por dono porque mexe
+    com saldo/construções de um jogador específico — este painel não mexe
+    com nada, só exibe)."""
+
+    def __init__(self, categorized: dict):
+        super().__init__(timeout=180)
+        self.categorized = categorized
+
+    @discord.ui.button(label="🏛️ Veteranos", style=discord.ButtonStyle.secondary)
+    async def veteranos_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=build_veteranos_embed(self.categorized), view=ApoiadoresBackView(self.categorized)
+        )
+
+    @discord.ui.button(label="🛡️ Escudo da Tita", style=discord.ButtonStyle.secondary)
+    async def tita_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.edit_message(
+            embed=build_tita_embed(self.categorized), view=ApoiadoresBackView(self.categorized)
+        )
+
+
 ia_group = app_commands.Group(name="ia", description="Configurações da mente do P3LUCHE.")
 
 
@@ -243,50 +472,18 @@ class SistemaCog(commands.Cog):
 
     @app_commands.command(name="apoiadores", description="Homenageia os nobres financiadores do P3LUCHE.")
     async def apoiadores(self, interaction: discord.Interaction):
-        ID_RECENTE = 1444466894445740253
-        ID_ANTIGO = 1313612976833429504
-        ID_TITA = 1453158945664270386
-
         guild = interaction.guild
         if not guild:
             return await interaction.response.send_message("❌ Use no servidor.", ephemeral=True)
 
-        recentes = []
-        antigos = []
-        herois_tita = []
+        # Defer: resolve_categorized_supporters faz uma checagem ao vivo por
+        # apoiador (fetch_member, e fetch_user pra quem já saiu) — pode
+        # passar da janela de 3s de uma interação não-deferida.
+        await interaction.response.defer()
 
-        for member in guild.members:
-            roles_id = [r.id for r in member.roles]
-            if ID_TITA in roles_id:
-                herois_tita.append(f"🛡️ {member.mention}")
-            if ID_RECENTE in roles_id:
-                recentes.append(f"💎 {member.mention}")
-            if ID_ANTIGO in roles_id:
-                antigos.append(f"🏛️ {member.mention}")
-
-        def format_list(lista):
-            return "\n".join(lista) if lista else "Ninguém... por enquanto. 😿"
-
-        embed = discord.Embed(
-            title="💖 Hall da Fama: Financiadores",
-            description="Graças a estes humanos incríveis, o P3LUCHE continua vivo e operante!",
-            color=discord.Color.from_rgb(255, 105, 180),
-        )
-        embed.set_thumbnail(url="https://cdn-icons-png.flaticon.com/512/2904/2904973.png")
-
-        if herois_tita:
-            embed.add_field(
-                name="🛡️ Escudo da Tita (Campanha Especial)",
-                value=f"{format_list(herois_tita)}\n*Ajudaram na saúde da nossa gatinha.*",
-                inline=False,
-            )
-
-        embed.add_field(name="💎 Apoiadores Ativos (VIP)", value=format_list(recentes), inline=False)
-        embed.add_field(name="🏛️ Apoiadores Veteranos", value=format_list(antigos), inline=False)
-
-        embed.set_footer(text="Quer ajudar e ganhar destaque? Fale com a Staff!")
-
-        await interaction.response.send_message(embed=embed)
+        categorized = categorize_supporters(guild.members)
+        resolved = await resolve_categorized_supporters(guild, self.bot, categorized)
+        await interaction.followup.send(embed=build_vip_embed(resolved), view=ApoiadoresView(resolved))
 
     @app_commands.command(name="ajuda", description="Mostra o manual de comandos.")
     async def ajuda(self, interaction: discord.Interaction):
