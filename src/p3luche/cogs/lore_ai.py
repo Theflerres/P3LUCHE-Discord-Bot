@@ -35,6 +35,7 @@ from config import (
     get_bot_instance,
     set_bot_instance,
 )
+from telemetry import record_interaction
 from utils import extract_text_from_attachment, log_to_gui, sanitize_text
 
 # ──────────────────────────────────────────────
@@ -302,8 +303,29 @@ class P3luchePersona(commands.Cog):
             self.status_rotation_loop.cancel()
 
     # ── Standby ──
-    async def register_activity(self):
+    async def register_activity(self, interaction=None):
+        """Marca atividade (acorda do standby) e alimenta a telemetria.
+
+        `interaction` é opcional porque o on_message também chama isto sem ter
+        um comando associado. Quando vem preenchido, o painel de status usa para
+        mostrar quem está usando o bot agora — reaproveitando este ponto único
+        em vez de criar um rastreamento paralelo.
+        """
         self.last_activity = datetime.now()
+
+        if interaction is not None:
+            try:
+                command = getattr(interaction, "command", None)
+                command_name = (
+                    getattr(command, "qualified_name", None)
+                    or getattr(command, "name", None)
+                    or "?"
+                )
+                user = getattr(interaction, "user", None)
+                record_interaction(getattr(user, "name", "?"), command_name)
+            except Exception:
+                pass  # telemetria nunca atrapalha o fluxo do bot
+
         if self.is_standby:
             self.is_standby = False
             log_to_gui("Acordando...", "WAKEUP")
@@ -343,7 +365,7 @@ class P3luchePersona(commands.Cog):
 
     @commands.Cog.listener()
     async def on_interaction(self, interaction):
-        await self.register_activity()
+        await self.register_activity(interaction)
 
     @status_rotation_loop.before_loop
     async def before_status(self): await self.bot.wait_until_ready()

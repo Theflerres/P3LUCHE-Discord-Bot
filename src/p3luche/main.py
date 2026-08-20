@@ -72,6 +72,7 @@ async def setup_hook():
         "cogs.backup",
         "cogs.erros",
         "cogs.logs",
+        "cogs.dashboard",
     ]
     for ext in extensions:
         try:
@@ -130,7 +131,22 @@ async def on_connect():
         log_to_gui("Reconectado e conexão com o banco reaberta.", "INFO")
 
 if __name__ == "__main__":
+    # O painel precisa envolver bot.run(): o Live do rich redireciona
+    # stdout/stderr, e o setup_logging() do discord.py (chamado lá dentro)
+    # captura sys.stderr no momento da construção do handler. Iniciar depois
+    # deixaria os logs do discord.py escapando por fora do painel.
+    # Desligado -> dashboard_session() é no-op e nada disso acontece.
     try:
-        bot.run(TOKEN)
+        from cogs.dashboard import dashboard_session
+    except Exception as e:  # painel indisponível nunca impede o bot de subir
+        print(f"[painel] indisponível ({e}); seguindo sem ele.")
+        dashboard_session = None
+
+    try:
+        if dashboard_session is None:
+            bot.run(TOKEN)
+        else:
+            with dashboard_session():
+                bot.run(TOKEN)
     except Exception as e:
         print(f"Erro fatal ao iniciar: {e}")

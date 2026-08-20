@@ -19,7 +19,19 @@ from config import LOG_FOLDER
 
 
 def log_to_gui(message, level="INFO"):
-    """Log colorido no terminal (ANSI)."""
+    """Log colorido no terminal (ANSI).
+
+    Erros e avisos também são espelhados para a telemetria, que alimenta o
+    painel de status do terminal. Isso não é um segundo pipeline de erro: é a
+    mesma telemetria que o handler do logger de `cogs/erros.py` alimenta, só que
+    a partir da outra via de log que o projeto já usa.
+
+    A distinção importa porque os dois caminhos são disjuntos — o `erros.py` só
+    vê exceções que escapam de handlers de comando/listener, enquanto quase todo
+    erro operacional (backup do Drive, FFmpeg, carga de extensão) é capturado
+    localmente por try/except e reportado só por aqui. Sem este espelhamento o
+    painel ficaria cego justamente para essa categoria.
+    """
     from datetime import datetime
 
     timestamp = datetime.now().strftime("%H:%M:%S")
@@ -35,6 +47,17 @@ def log_to_gui(message, level="INFO"):
     color_code = colors.get(level, "\033[97m")
 
     print(f"{color_code}[{timestamp}] [{level}] {message}{reset}")
+
+    if level in ("ERROR", "WARNING"):
+        try:
+            # Import local: `telemetry` não importa `utils`, mas `utils` é
+            # importado por quase todo módulo, e um import no topo criaria uma
+            # dependência desnecessária no caminho de carga.
+            import telemetry
+
+            telemetry.record_error(message, level)
+        except Exception:
+            pass  # telemetria nunca pode atrapalhar o log em si
 
 
 async def extract_text_from_attachment(attachment: discord.Attachment) -> str:
