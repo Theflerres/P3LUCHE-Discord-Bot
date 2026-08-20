@@ -125,7 +125,7 @@ def create_member_embed(bot_ref):
     )
     embed.add_field(name="📜 Roleplay & Comunidade", value=lore_txt, inline=False)
 
-    # Conversar por menção (@P3LUCHE) e registrar memórias são restritos a
+    # Registrar memórias por menção (@P3LUCHE "lembre-se que...") é restrito a
     # Staff/Criador (checagem em lore_ai.py:on_message) — não prometer isso
     # aqui para membros comuns, que nunca conseguiriam usar.
     ia_txt = "`/ia memoria_ver` - Veja o que eu sei sobre você (se algo já foi anotado)."

@@ -6,7 +6,6 @@
 
 ![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?style=for-the-badge&logo=python&logoColor=white)
 ![discord.py](https://img.shields.io/badge/discord.py-2.7.1-5865F2?style=for-the-badge&logo=discord&logoColor=white)
-![Gemini](https://img.shields.io/badge/Gemini-2.0%20Flash-4285F4?style=for-the-badge&logo=google&logoColor=white)
 ![SQLite](https://img.shields.io/badge/SQLite3-Migrations%20autom%C3%A1ticas-003B57?style=for-the-badge&logo=sqlite&logoColor=white)
 ![Status](https://img.shields.io/badge/Status-Em%20Produção-brightgreen?style=for-the-badge)
 
@@ -20,7 +19,7 @@ Desenvolvido por [@Theflerres](https://github.com/Theflerres)
 
 O **P3LUCHE** é um bot de Discord (via [discord.py](https://discordpy.readthedocs.io/), arquitetura modular em Cogs) para um único servidor. Ele roda como um processo Python comum conectado ao Gateway do Discord — sem interface gráfica própria, sem suporte a múltiplos servidores.
 
-O núcleo é um sistema de economia/pesca (Sachês, varas, clima, ilha pessoal), complementado por moderação com trilha de auditoria, um assistente de lore/RAG baseado em Gemini, e um sistema de música com catálogo próprio no Google Drive.
+O núcleo é um sistema de economia/pesca (Sachês, varas, clima, ilha pessoal), complementado por moderação com trilha de auditoria, um acervo de lore de RPG com versionamento e grafo de relações, e um sistema de música com catálogo próprio no Google Drive.
 
 > Existe também `peluchegpt/`, um protótipo de reescrita (FastAPI + desktop Tauri) — veja a nota no final deste documento. Ele **não** está conectado ao bot descrito aqui e não roda no estado atual do repositório.
 
@@ -45,7 +44,6 @@ O núcleo é um sistema de economia/pesca (Sachês, varas, clima, ilha pessoal),
 | Camada | Tecnologias |
 |---|---|
 | **Discord** | discord.py 2.7.1 (Slash Commands, arquitetura modular em Cogs) |
-| **IA / Lore** | Google Gemini (`gemini-2.0-flash`, via `google-genai`) para RAG sobre a lore do servidor |
 | **Grafo de Lore** | NetworkX + Matplotlib (`/lore grafo`) |
 | **Banco de Dados** | SQLite3 — migrations automáticas no startup, soft delete (advertências, memórias, faixas de música) |
 | **Cloud & Storage** | Google Drive API (catálogo de músicas, backup do banco) |
@@ -71,8 +69,8 @@ Dois sistemas complementares: um catálogo persistente no Google Drive (`/musica
 ### Moderação
 `/mod advertencia`, `/mod historico`, `/mod perdoar` — advertências nunca são deletadas fisicamente (soft delete: `status='revoked'` + quem revogou e quando), mantendo trilha de auditoria completa.
 
-### Lore & IA
-Cada jogador registra a lore do seu personagem (`/lore player`); a IA (Gemini) responde por menção usando RAG sobre esse conteúdo, com um Bibliotecário-Chefe (staff) podendo editar lore de terceiros com histórico de versões (`/lore diff`). `/lore grafo` gera um grafo visual de conexões entre personagens via NetworkX.
+### Lore
+Cada jogador registra a lore do seu personagem (`/lore player`), com um Bibliotecário-Chefe (staff) podendo editar lore de terceiros com histórico de versões (`/lore diff`). `/lore grafo` gera um grafo visual de conexões entre personagens via NetworkX, detectando o tipo de relação (aliado/inimigo/família/mestre) por palavras-chave no texto. Staff/criador ainda podem mencionar `@P3LUCHE` para anotar memórias rápidas (`/ia memoria_ver`, `/ia memoria_esquecer`).
 
 ### Admin
 `/admin economia` (consultar/corrigir/dar/remover/resetar), `/admin sistema` (mensagens manuais, reset de cooldowns, reset global com backup automático + confirmação por modal + log de auditoria) e `/admin debug` (inspeção somente-leitura). Toda a camada é restrita ao Criador do bot via `is_bot_owner()` — nunca por lista de IDs hardcoded.
@@ -102,7 +100,7 @@ P3-LUCH3/
 │       ├── musica.py        # /musica (catálogo no Drive)
 │       ├── jukebox.py       # /tocar, /fila (player em canal de voz)
 │       ├── moderacao.py     # /mod (advertências com soft delete)
-│       ├── lore_ai.py       # /lore, /acervo, RAG com Gemini, grafo NetworkX
+│       ├── lore_ai.py       # /lore, /acervo, grafo NetworkX, persona P3LUCHE
 │       ├── admin.py         # /admin (exclusivo do Criador)
 │       ├── onboarding.py    # Boas-vindas (on_member_join)
 │       ├── sistema.py       # /ajuda, /stats, /apoiadores, /ia
@@ -136,7 +134,6 @@ P3-LUCH3/
 - [FFmpeg](https://ffmpeg.org/download.html) disponível no PATH (necessário para `/tocar`)
 - Um app no [Discord Developer Portal](https://discord.com/developers/applications) com o bot criado
 - (Opcional, só para música/backup) Um projeto no Google Cloud com a **Google Drive API** habilitada
-- (Opcional, só para lore/IA) Uma chave da **Gemini API** (Google AI Studio)
 
 ### 1. Clone e instale as dependências
 
@@ -166,10 +163,6 @@ Só `DISCORD_TOKEN` é obrigatória. Todas as outras são opcionais — cada uma
 ```env
 # Obrigatória — token do bot no Discord Developer Portal
 DISCORD_TOKEN=seu_token_aqui
-
-# Opcional — habilita o assistente de lore/IA (Gemini). Sem ela, os
-# comandos de /lore que dependem de IA ficam indisponíveis.
-GEMINI_KEY=sua_chave_aqui
 
 # Opcional — pasta do Drive usada como cache de músicas do Jukebox.
 # Sem ela, cai no fallback DRIVE_FOLDER_ID (constante em config.py).

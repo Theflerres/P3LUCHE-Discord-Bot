@@ -77,10 +77,6 @@ class ModeracaoCog(commands.Cog):
             "SELECT COUNT(*) FROM warnings WHERE user_id = ? AND status = 'active'",
             (usuario.id,),
         ).fetchone()[0]
-        history = cursor.execute(
-            "SELECT reason FROM warnings WHERE user_id = ? AND status = 'active'",
-            (usuario.id,),
-        ).fetchall()
 
         suggestion = "Nenhuma ação automática sugerida."
         color = discord.Color.orange()
@@ -88,23 +84,6 @@ class ModeracaoCog(commands.Cog):
         if count >= 4:
             color = discord.Color.red()
             suggestion = "⚠️ **LIMITE DE 4 WARNS ATIVOS ATINGIDO.** Sugestão: **Ban/Kick**."
-
-            cog = self.bot.get_cog("P3luchePersona")
-            if cog and getattr(cog, "ai_client", None):
-                hist_str = ", ".join([h[0] for h in history])
-                try:
-                    prompt = (
-                        f"O usuário {usuario.name} atingiu 4 advertências ativas. "
-                        f"Histórico recente: {hist_str}. Última infração: {motivo}. "
-                        f"Como moderador robô, sugira uma punição curta e severa."
-                    )
-                    ai_resp = await cog.ai_client.aio.models.generate_content(
-                        model=cog.ai_model_name,
-                        contents=prompt,
-                    )
-                    suggestion = f"🤖 **Análise P3LUCHE:** {ai_resp.text}"
-                except Exception:
-                    pass
 
         embed = discord.Embed(
             title="🧾 REGISTRO DE ADVERTÊNCIA (Nota Fiscal)",

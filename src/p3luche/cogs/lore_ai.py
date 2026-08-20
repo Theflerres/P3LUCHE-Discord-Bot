@@ -1,9 +1,8 @@
 """
-Lore, IA (Gemini), acervo, grafo e personalidade P3LUCHE.
+Lore, acervo, grafo e personalidade P3LUCHE.
 Melhorias v2:
   - Tickets com aprovação de staff antes de salvar no banco
   - Grafo com detecção de tipo de relação + arestas coloridas
-  - P3LUCHE aberto a todos + roteamento inteligente + comandos práticos /p3luche
 """
 import asyncio
 import difflib
@@ -22,7 +21,6 @@ import networkx as nx
 import scipy  # noqa: F401
 from discord import app_commands
 from discord.ext import commands, tasks
-from google import genai
 
 from config import (
     CAT_ACTIVITIES,
@@ -31,7 +29,6 @@ from config import (
     EMOTE_CANSADO,
     EMOTE_FOGO,
     EMOTE_MEDO,
-    GEMINI_KEY,
     MOD_ROLE_IDS,
     STANDBY_TIMEOUT_MINUTES,
     USER_MUSIC_CHANNEL_ID,
@@ -288,25 +285,6 @@ class P3luchePersona(commands.Cog):
         # Cooldown por user_id: {user_id: último_timestamp}
         self._cooldowns: dict[int, float] = {}
 
-        self.persona_base = (
-            "Você é o P3LUCHE, o gato mascote do servidor. "
-            "Personalidade: Temperamental, imprevisível, felino. '8 ou 80'. "
-            "Diretrizes: SEJA BREVE. TOM: Sarcástico/Felino. ZERO TECH. "
-            "Se perguntarem de lore, use o contexto fornecido. "
-            "Para perguntas práticas (clima, tradução, resumo, etc), seja útil e direto."
-        )
-
-        if GEMINI_KEY:
-            try:
-                self.ai_client     = genai.Client(api_key=GEMINI_KEY)
-                self.ai_model_name = "gemini-2.0-flash"
-                log_to_gui(f"IA Conectada: Cliente Google GenAI (Modelo: {self.ai_model_name})", "SUCCESS")
-            except Exception as e:
-                log_to_gui(f"Erro ao configurar IA: {e}", "ERROR")
-                self.ai_client = None
-        else:
-            self.ai_client = None
-
         self.emote_fogo    = EMOTE_FOGO
         self.emote_medo    = EMOTE_MEDO
         self.emote_cansado = EMOTE_CANSADO
@@ -377,42 +355,6 @@ class P3luchePersona(commands.Cog):
         if not isinstance(error, commands.CommandNotFound):
             print(f"Erro: {error}")
 
-    # ── DB Helpers ──
-    def get_server_lore(self):
-        try:
-            r = self.bot.db_conn.cursor().execute(
-                "SELECT content FROM server_lore ORDER BY created_at DESC LIMIT 15"
-            ).fetchall()
-            return "\n".join([f"- {x[0]}" for x in r[::-1]]) if r else ""
-        except:
-            return ""
-
-    def get_all_players_with_lore(self):
-        try:
-            r = self.bot.db_conn.cursor().execute(
-                "SELECT DISTINCT target_name, character_name FROM player_lore"
-            ).fetchall()
-            return "\n".join([f"- {n} ({c or '?'})" for n, c in r]) if r else "Ninguém."
-        except:
-            return ""
-
-    def get_player_lore(self, tid):
-        try:
-            r = self.bot.db_conn.cursor().execute(
-                "SELECT content, character_name FROM player_lore WHERE target_id=? ORDER BY created_at DESC LIMIT 10",
-                (tid,),
-            ).fetchall()
-            return (f"PERSONAGEM: {r[0][1]}\n" + "\n".join([f"- {x[0]}" for x in r[::-1]])) if r else ""
-        except:
-            return ""
-
-    async def split_and_send(self, message, text):
-        if len(text) <= 2000:
-            await message.reply(text)
-        else:
-            for chunk in [text[i:i+1900] for i in range(0, len(text), 1900)]:
-                await message.channel.send(chunk)
-
     @tasks.loop(minutes=45)
     async def random_event_loop(self):
         if not self.allowed_channels or random.random() > 0.2:
@@ -440,7 +382,7 @@ class P3luchePersona(commands.Cog):
 
         await self.register_activity()
 
-        # Cooldown global (evita spam de tokens)
+        # Cooldown global (evita spam de menções)
         now = time.time()
         last = self._cooldowns.get(message.author.id, 0)
         if now - last < COOLDOWN_GERAL_SEGUNDOS:
@@ -457,10 +399,6 @@ class P3luchePersona(commands.Cog):
         is_creator = message.author.id == CREATOR_ID
         is_staff   = any(r.id in MOD_ROLE_IDS for r in message.author.roles)
 
-        if not is_creator and not is_staff:
-            await message.reply("🔒 IA restrita à Staff e ao criador.", delete_after=10)
-            return
-
         # ── Gravar memória (só staff/creator) ──
         if (is_staff or is_creator) and re.search(r"\b(lembre-se que|anote que)\b", content.lower()):
             try:
@@ -476,81 +414,9 @@ class P3luchePersona(commands.Cog):
                 log_to_gui(f"Erro ao salvar memória: {e}", "ERROR")
             return
 
-        if not self.ai_client:
-            return
-
-        async with message.channel.typing():
-            try:
-                # ── Detecta se é consulta de LORE ou pergunta GERAL ──
-                lore_keywords = ["lore", "personagem", "história", "mundo", "quem é", "o que aconteceu"]
-                is_lore_query = any(kw in content.lower() for kw in lore_keywords) or bool(message.mentions)
-
-                ctx_lore    = ""
-                user_memories = ""
-
-                if is_lore_query and (is_staff or is_creator):
-                    # Staff ou criador perguntando sobre lore → contexto completo
-                    ctx_lore = f"\n[SERVER LORE]:\n{self.get_server_lore()}"
-                    if any(x in content.lower() for x in ["quem", "lista", "lore"]):
-                        ctx_lore += f"\n[LISTA]:\n{self.get_all_players_with_lore()}"
-                    for m in message.mentions:
-                        if m.id != self.bot.user.id:
-                            lore = self.get_player_lore(m.id)
-                            if lore:
-                                ctx_lore += f"\n[LORE {m.name}]:\n{lore}"
-
-                    mem_rows = self.bot.db_conn.cursor().execute(
-                        "SELECT memory_text FROM user_memories WHERE user_id=? AND is_active=1 ORDER BY created_at DESC LIMIT 5",
-                        (message.author.id,),
-                    ).fetchall()
-                    if mem_rows:
-                        user_memories = "\n[O QUE SEI SOBRE VOCÊ]:\n" + "\n- ".join(
-                            [r["memory_text"] for r in mem_rows]
-                        )
-
-                # ── Persona ──
-                if is_creator:
-                    persona = (
-                        f"{self.persona_base}\n"
-                        "IMPORTANTE: O usuário atual é seu CRIADOR/PAI (theflerres). "
-                        "Com ele, seja doce, carinhoso e leal. Use emojis fofos."
-                    )
-                elif is_staff:
-                    persona = (
-                        f"{self.persona_base}\n"
-                        "IMPORTANTE: Usuário é Staff. Seja levemente mais prestativo, mas mantenha o sarcasmo felino."
-                    )
-                else:
-                    persona = (
-                        f"{self.persona_base}\n"
-                        "IMPORTANTE: Usuário comum. Sarcástico, '8 ou 80'. "
-                        "Se pedir informações de lore privada de outros jogadores, recuse elegantemente. "
-                        "Para perguntas práticas (tradução, resumo, dúvida geral), responda de forma útil e breve."
-                    )
-
-                prompt = (
-                    f"{persona}\n\n"
-                    f"{ctx_lore}\n"
-                    f"{user_memories}\n\n"
-                    f"USUÁRIO ({message.author.name}) DIZ: {content}\n"
-                    f"RESPOSTA DO P3LUCHE:"
-                )
-
-                response = await self.ai_client.aio.models.generate_content(
-                    model=self.ai_model_name, contents=prompt
-                )
-                await self.split_and_send(message, response.text)
-
-            except Exception as e:
-                if "429" in str(e):
-                    await message.reply("Cota excedida. (Gemma cansou)")
-                else:
-                    log_to_gui(f"Erro na IA: {e}", "ERROR")
-                    await message.reply("*Tosse bola de pelos* (Erro no processamento).")
-
 
 # ──────────────────────────────────────────────
-#  VIEWS DO ACERVO (inalteradas)
+#  VIEWS DO ACERVO
 # ──────────────────────────────────────────────
 
 class LorePaginationView(discord.ui.View):
@@ -583,41 +449,6 @@ class LorePaginationView(discord.ui.View):
         await self.update_buttons(interaction)
 
 
-class AskLoreModal(discord.ui.Modal, title="Consultar a Sabedoria Ancestral"):
-    def __init__(self, lore_content, persona_cog, target_name):
-        super().__init__()
-        self.lore_content = lore_content
-        self.persona_cog  = persona_cog
-        self.target_name  = target_name
-        self.question = discord.ui.TextInput(
-            label="Qual sua dúvida?",
-            placeholder=f"O que deseja saber sobre {target_name}?",
-            style=discord.TextStyle.paragraph, required=True, max_length=500,
-        )
-        self.add_item(self.question)
-
-    async def on_submit(self, interaction):
-        await interaction.response.defer(thinking=True)
-        try:
-            prompt = (
-                f"Você é o Guardião da Biblioteca P3LUCHE. Use APENAS o texto abaixo para responder.\n"
-                f"TEXTO FONTE ({self.target_name}):\n{self.lore_content[:25000]}\n\n"
-                f"PERGUNTA: {self.question.value}\n\n"
-                f"Resposta (seja direto e cite se a informação consta ou não no texto):"
-            )
-            if not self.persona_cog or not getattr(self.persona_cog, "ai_client", None):
-                return await interaction.followup.send("❌ IA offline.", ephemeral=True)
-            response = await self.persona_cog.ai_client.aio.models.generate_content(
-                model=self.persona_cog.ai_model_name, contents=prompt
-            )
-            embed = discord.Embed(title=f"❓ Pergunta sobre: {self.target_name}", color=discord.Color.gold())
-            embed.add_field(name="Dúvida",            value=self.question.value,    inline=False)
-            embed.add_field(name="Resposta do Arquivo", value=response.text[:1024], inline=False)
-            await interaction.followup.send(embed=embed)
-        except Exception as e:
-            await interaction.followup.send(f"❌ Erro ao consultar: {e}")
-
-
 class AcervoActionsView(discord.ui.View):
     def __init__(self, bot_ref, lore_type, target_id=None, target_name="Mundo"):
         super().__init__(timeout=300)
@@ -643,33 +474,6 @@ class AcervoActionsView(discord.ui.View):
             return await interaction.response.send_message("📭 O arquivo está vazio.", ephemeral=True)
         file = discord.File(BytesIO(full_text.encode("utf-8")), filename=f"Lore_{self.target_name.replace(' ','_')}.txt")
         await interaction.response.send_message(f"📂 Arquivo completo de **{self.target_name}**.", file=file, ephemeral=True)
-
-    @discord.ui.button(label="Pedir Resumo (IA)", style=discord.ButtonStyle.primary, emoji="📝")
-    async def summarize(self, interaction, button):
-        full_text = self.get_full_lore()
-        if not full_text:
-            return await interaction.response.send_message("📭 Nada para resumir.", ephemeral=True)
-        cog = self.bot.get_cog("P3luchePersona")
-        if not cog or not getattr(cog, "ai_client", None):
-            return await interaction.response.send_message("❌ IA offline.", ephemeral=True)
-        await interaction.response.defer(thinking=True)
-        try:
-            prompt   = f"Resumo estruturado em tópicos das informações mais importantes desta Lore ({self.target_name}):\n\n{full_text[:30000]}"
-            response = await cog.ai_client.aio.models.generate_content(model=cog.ai_model_name, contents=prompt)
-            embed    = discord.Embed(title=f"📝 Resumo: {self.target_name}", description=response.text[:4000], color=discord.Color.blue())
-            await interaction.followup.send(embed=embed)
-        except Exception as e:
-            await interaction.followup.send(f"Erro na IA: {e}")
-
-    @discord.ui.button(label="Fazer Pergunta Específica", style=discord.ButtonStyle.success, emoji="❓")
-    async def ask_specific(self, interaction, button):
-        full_text = self.get_full_lore()
-        if not full_text:
-            return await interaction.response.send_message("📭 Nada para consultar.", ephemeral=True)
-        cog = self.bot.get_cog("P3luchePersona")
-        if not cog or not getattr(cog, "ai_client", None):
-            return await interaction.response.send_message("❌ IA offline.", ephemeral=True)
-        await interaction.response.send_modal(AskLoreModal(full_text, cog, self.target_name))
 
     @discord.ui.button(label="Voltar", style=discord.ButtonStyle.danger, row=1)
     async def back(self, interaction, button):
@@ -1147,57 +951,6 @@ async def lore_server(interaction: discord.Interaction, arquivo: discord.Attachm
 p3luche_group = app_commands.Group(name="p3luche", description="Utilidades práticas do P3LUCHE")
 
 
-def _get_ai(interaction: discord.Interaction):
-    cog = interaction.client.get_cog("P3luchePersona")
-    return cog.ai_client if cog else None, cog.ai_model_name if cog else None
-
-
-def _can_use_ai_command(interaction: discord.Interaction) -> bool:
-    return interaction.user.id == CREATOR_ID or any(r.id in MOD_ROLE_IDS for r in interaction.user.roles)
-
-
-@p3luche_group.command(name="traduzir", description="Traduz um texto para o idioma desejado.")
-@app_commands.describe(texto="Texto a traduzir", idioma="Idioma de destino (ex: inglês, espanhol, japonês)")
-async def p3_traduzir(interaction: discord.Interaction, texto: str, idioma: str):
-    await interaction.response.defer(thinking=True)
-    if not _can_use_ai_command(interaction):
-        return await interaction.followup.send("🚫 IA restrita ao criador e à staff.", ephemeral=True)
-    ai_client, ai_model = _get_ai(interaction)
-    if not ai_client:
-        return await interaction.followup.send("❌ IA offline.")
-    try:
-        resp = await ai_client.aio.models.generate_content(
-            model=ai_model,
-            contents=f"Traduza o texto abaixo para {idioma}. Responda APENAS com a tradução, sem explicações.\n\nTexto: {texto}",
-        )
-        embed = discord.Embed(title=f"🌐 Tradução → {idioma}", color=discord.Color.blue())
-        embed.add_field(name="Original",  value=texto[:500],      inline=False)
-        embed.add_field(name="Traduzido", value=resp.text[:1000], inline=False)
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Erro: {e}")
-
-
-@p3luche_group.command(name="resumir", description="Resume um texto longo.")
-@app_commands.describe(texto="Texto a resumir")
-async def p3_resumir(interaction: discord.Interaction, texto: str):
-    await interaction.response.defer(thinking=True)
-    if not _can_use_ai_command(interaction):
-        return await interaction.followup.send("🚫 IA restrita ao criador e à staff.", ephemeral=True)
-    ai_client, ai_model = _get_ai(interaction)
-    if not ai_client:
-        return await interaction.followup.send("❌ IA offline.")
-    try:
-        resp = await ai_client.aio.models.generate_content(
-            model=ai_model,
-            contents=f"Resuma o texto abaixo em no máximo 3 parágrafos curtos. Seja direto.\n\nTexto: {texto[:8000]}",
-        )
-        embed = discord.Embed(title="📝 Resumo", description=resp.text[:2000], color=discord.Color.teal())
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Erro: {e}")
-
-
 @p3luche_group.command(name="enquete", description="Cria uma enquete rápida com reações.")
 @app_commands.describe(
     pergunta="A pergunta da enquete",
@@ -1218,31 +971,6 @@ async def p3_enquete(interaction: discord.Interaction, pergunta: str, opcoes: st
         await msg.add_reaction(emojis[i])
 
 
-@p3luche_group.command(name="reescrever", description="Reescreve um texto num tom diferente.")
-@app_commands.describe(
-    texto="Texto original",
-    tom="Tom desejado (ex: formal, casual, épico, engraçado, técnico)",
-)
-async def p3_reescrever(interaction: discord.Interaction, texto: str, tom: str):
-    await interaction.response.defer(thinking=True)
-    if not _can_use_ai_command(interaction):
-        return await interaction.followup.send("🚫 IA restrita ao criador e à staff.", ephemeral=True)
-    ai_client, ai_model = _get_ai(interaction)
-    if not ai_client:
-        return await interaction.followup.send("❌ IA offline.")
-    try:
-        resp = await ai_client.aio.models.generate_content(
-            model=ai_model,
-            contents=f"Reescreva o texto abaixo num tom {tom}. Responda APENAS com a reescrita.\n\nTexto: {texto[:3000]}",
-        )
-        embed = discord.Embed(title=f"✍️ Reescrito — tom: {tom}", color=discord.Color.purple())
-        embed.add_field(name="Original",  value=texto[:500],      inline=False)
-        embed.add_field(name="Resultado", value=resp.text[:1000], inline=False)
-        await interaction.followup.send(embed=embed)
-    except Exception as e:
-        await interaction.followup.send(f"❌ Erro: {e}")
-
-
 @p3luche_group.command(name="comandos", description="Lista tudo que o P3LUCHE sabe fazer.")
 async def p3_ajuda(interaction: discord.Interaction):
     embed = discord.Embed(
@@ -1250,7 +978,8 @@ async def p3_ajuda(interaction: discord.Interaction):
         color=discord.Color.gold(),
     )
     embed.add_field(name="💬 Mencione @P3LUCHE", value=(
-        "Pergunte ao bot sobre lore, mas atenção: a IA é exclusiva do Staff e do criador.\n"
+        "Se você for Staff ou o criador, pode dizer *\"lembre-se que...\"* ou *\"anote que...\"* "
+        "para eu guardar algo sobre você (`/ia memoria_ver` para consultar depois).\n"
         f"*Cooldown: {COOLDOWN_GERAL_SEGUNDOS}s entre mensagens.*"
     ), inline=False)
     embed.add_field(name="📚 Lore", value=(
@@ -1262,9 +991,6 @@ async def p3_ajuda(interaction: discord.Interaction):
         "`/lore diff` — Comparar versões"
     ), inline=False)
     embed.add_field(name="🛠️ Utilidades", value=(
-        "`/p3luche traduzir` — Traduz texto\n"
-        "`/p3luche resumir` — Resume texto\n"
-        "`/p3luche reescrever` — Muda o tom de um texto\n"
         "`/p3luche enquete` — Cria enquete com reações"
     ), inline=False)
     embed.set_footer(text="Staff: /acervo para a Biblioteca completa")

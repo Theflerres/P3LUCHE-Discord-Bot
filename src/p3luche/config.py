@@ -14,7 +14,6 @@ load_dotenv()
 
 # --- TOKENS & CHAVES ---
 TOKEN = os.getenv("DISCORD_TOKEN")
-GEMINI_KEY = os.getenv("GEMINI_KEY")
 
 if not TOKEN:
     print("ERRO CRÍTICO: DISCORD_TOKEN não definido no .env")

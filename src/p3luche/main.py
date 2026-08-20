@@ -5,6 +5,19 @@ carrega as cogs principais e inicializa a conexão com o banco SQLite.
 A configuração do ambiente é feita via módulos auxiliares, e o fluxo de
 startup inclui migrações de esquema e sincronização de comandos slash.
 """
+import sys
+
+# Reconfigura stdout/stderr para UTF-8 antes de qualquer outro import.
+# Sem isso, em consoles Windows presos ao codepage legado (cp1252/"charmap"),
+# qualquer print() ou log_to_gui() com emoji (ex: database.py, main.py)
+# derruba o processo com UnicodeEncodeError assim que o log dispara —
+# já aconteceu em produção. Corrige na fonte em vez de caçar emoji por emoji.
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError):
+        pass  # stream sem suporte a reconfigure (ex: capturada em testes)
+
 import asyncio
 import sqlite3
 import threading
