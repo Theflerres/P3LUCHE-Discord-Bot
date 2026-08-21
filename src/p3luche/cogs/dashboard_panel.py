@@ -148,12 +148,52 @@ def collect_economy(conn, now: datetime = None) -> dict:
     }
 
 
+class LatencyTracker:
+    """Acompanha `bot.latency` e desde quando aquele número está parado.
+
+    Existe por causa de uma confusão real: o gateway manda heartbeat a cada
+    ~41s, então `bot.latency` é um valor ÚNICO por batida que fica congelado no
+    intervalo inteiro. Mostrar só o número faz parecer uma medida contínua
+    "travada" num valor ruim — e a primeira batida ainda por cima é medida
+    durante o startup do bot, quando o loop está ocupado, saindo mais alta que
+    o regime. Exibir a idade da leitura e o mínimo observado deixa isso óbvio.
+    """
+
+    #: Quantas leituras distintas guardar para calcular o mínimo observado.
+    HISTORY = 20
+
+    def __init__(self):
+        self.value = None
+        self.measured_at = None
+        self._history = []
+
+    def update(self, latency_ms, now: datetime) -> None:
+        """Alimenta o rastreador. Só conta como leitura nova quando o valor muda."""
+        if latency_ms is None:
+            return
+        if latency_ms != self.value:
+            self.value = latency_ms
+            self.measured_at = now
+            self._history.append(latency_ms)
+            del self._history[: -self.HISTORY]
+
+    def age_seconds(self, now: datetime):
+        if self.measured_at is None:
+            return None
+        return max((now - self.measured_at).total_seconds(), 0.0)
+
+    @property
+    def observed_min(self):
+        return min(self._history) if self._history else None
+
+
 class DashboardData:
     """Agrega os coletores respeitando os TTLs de cada um."""
 
     def __init__(self, process=None, process_start: datetime = None):
         self.process = process
         self.process_start = process_start or datetime.now()
+        self.latency = LatencyTracker()
         self._process_cache = None
         self._process_cache_at = None
         self._economy_cache = None
@@ -248,18 +288,43 @@ def _section(title: str, rows: list, accent: str) -> Group:
     return Group(Text(title, style=f"bold {accent}"), table)
 
 
-def build_connection_section(connection: dict, accent: str) -> Group:
+def format_gateway_latency(tracker: "LatencyTracker", now: datetime) -> Text:
+    """Latência do gateway deixando explícito que é uma amostra periódica.
+
+    Formato: `137 ms · há 12s · mín 133`. O "há Xs" é o antídoto para achar que
+    o número está travado: ele só muda quando chega um heartbeat novo (~41s).
+    """
+    if tracker.value is None:
+        return Text("aguardando 1º heartbeat…", style="dim")
+
+    text = Text(f"{tracker.value} ms")
+    age = tracker.age_seconds(now)
+    if age is not None:
+        text.append(f" · há {int(age)}s", style="dim")
+    if tracker.observed_min is not None and tracker.observed_min != tracker.value:
+        text.append(f" · mín {tracker.observed_min}", style="dim")
+    return text
+
+
+def build_connection_section(connection: dict, accent: str, latency_tracker=None,
+                             now: datetime = None) -> Group:
     status = (
         Text("● conectado", style="bright_green")
         if connection.get("connected")
         else Text("● reconectando", style="bright_yellow")
     )
-    latency = connection.get("latency_ms")
+
+    if latency_tracker is not None:
+        gateway = format_gateway_latency(latency_tracker, now or datetime.now())
+    else:
+        latency = connection.get("latency_ms")
+        gateway = Text(f"{latency} ms" if latency is not None else "n/d")
+
     return _section(
         "CONEXÃO",
         [
             ("uptime", format_uptime(connection.get("uptime") or timedelta())),
-            ("gateway", f"{latency} ms" if latency is not None else "n/d"),
+            ("gateway", gateway),
             ("status", status),
         ],
         accent,
@@ -325,12 +390,13 @@ def build_errors_section(errors: list, count_hour: int, accent: str) -> Group:
     return _section(title, rows, accent)
 
 
-def build_dashboard(frame, rng, connection, stats, economy, interactions, errors, error_count_hour):
+def build_dashboard(frame, rng, connection, stats, economy, interactions, errors,
+                    error_count_hour, latency_tracker=None, now: datetime = None):
     """Monta o painel completo: TV à esquerda, dados à direita."""
     accent = ERROR_COLOR if frame.is_error else NORMAL_COLOR
 
     info = Group(
-        build_connection_section(connection, accent),
+        build_connection_section(connection, accent, latency_tracker, now),
         Text(""),
         build_process_section(stats, accent),
         Text(""),

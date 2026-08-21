@@ -136,8 +136,11 @@ if __name__ == "__main__":
     # captura sys.stderr no momento da construção do handler. Iniciar depois
     # deixaria os logs do discord.py escapando por fora do painel.
     # Desligado -> dashboard_session() é no-op e nada disso acontece.
+    # Importado de dashboard_runtime, NÃO de cogs.dashboard: o load_extension
+    # re-executa o módulo da extensão num objeto novo, então a sessão iniciada
+    # aqui ficaria numa cópia que o cog nunca enxerga (o painel não desenhava).
     try:
-        from cogs.dashboard import dashboard_session
+        from cogs.dashboard_runtime import dashboard_session
     except Exception as e:  # painel indisponível nunca impede o bot de subir
         print(f"[painel] indisponível ({e}); seguindo sem ele.")
         dashboard_session = None

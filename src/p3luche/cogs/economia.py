@@ -4,7 +4,6 @@ Economia Scrap Seas — pescaria, loja, guilda, exploração, AFK traps e clima.
 """
 import sqlite3
 import threading
-import asyncio
 import json
 import os
 import random
@@ -29,7 +28,6 @@ from utils import get_local_file, log_to_gui
 from economy_constants import FISH_DB
 from cogs.pesca_visuals import (
     resolve_fishing_asset,
-    resolve_qte_asset,
     resolve_weather_asset,
 )
 from economy_db import (
@@ -700,53 +698,7 @@ async def comprar(interaction: discord.Interaction, item: str):
     await interaction.response.send_message(f"✅ **Compra realizada!**\n{emoji_tipo} **{data['name']}** foi guardado na sua mochila.\nUse `/eco saldo` para ver ou usar.", ephemeral=True)
 
 
-class TensionQTEView(discord.ui.View):
-    """QTE de tensão da linha para peixes Tier 3+."""
-
-    def __init__(self, user_id: int, secret: str, catch_ctx: dict):
-        super().__init__(timeout=15)
-        self.user_id = user_id
-        self.secret = secret
-        self.catch_ctx = catch_ctx
-        options = [secret]
-        while len(options) < 3:
-            candidate = str(random.randint(100, 999))
-            if candidate not in options:
-                options.append(candidate)
-        random.shuffle(options)
-        for num in options:
-            btn = discord.ui.Button(label=num, style=discord.ButtonStyle.primary)
-
-            async def callback(interaction: discord.Interaction, n=num):
-                if interaction.user.id != self.user_id:
-                    return await interaction.response.send_message("❌ Não é sua pesca.", ephemeral=True)
-                for child in self.children:
-                    child.disabled = True
-                if n == self.secret:
-                    self.catch_ctx["valor"] = int(self.catch_ctx["valor"] * 1.5)
-                    self.catch_ctx["qte_msg"] = "⚡ Você controlou a linha! Valor x1.5!"
-                    self.catch_ctx["qte_outcome"] = "sucesso"
-                else:
-                    self.catch_ctx["valor"] = 0
-                    self.catch_ctx["qte_msg"] = "❌ A linha arrebentou! O peixe escapou!"
-                    self.catch_ctx["qte_outcome"] = "falha"
-                await _finalize_pescar(interaction, self.catch_ctx, edit=True)
-
-            btn.callback = callback
-            self.add_item(btn)
-
-    async def on_timeout(self):
-        self.catch_ctx["valor"] = 0
-        self.catch_ctx["qte_msg"] = "❌ Tempo esgotado — o peixe escapou!"
-        self.catch_ctx["qte_outcome"] = "falha"
-        if self.catch_ctx.get("qte_message"):
-            try:
-                await _finalize_pescar_timeout(self.catch_ctx)
-            except discord.HTTPException:
-                pass
-
-
-async def _finalize_pescar(interaction: discord.Interaction, ctx: dict, edit: bool = False):
+async def _finalize_pescar(interaction: discord.Interaction, ctx: dict):
     """Persiste captura e envia embed final."""
     conn = get_bot_instance().db_conn
     user_id = ctx["user_id"]
@@ -770,11 +722,13 @@ async def _finalize_pescar(interaction: discord.Interaction, ctx: dict, edit: bo
     if used_bait and inv.get("isca", 0) <= 0:
         inv.pop("isca", None)
 
-    # Aplica a pescaria como DELTA em cima do estado fresco do banco (pode
-    # ter mudado durante o QTE, que fica aberto por até ~17s), em vez de
-    # sobrescrever com o snapshot antigo. modify_wallet/add_inventory_item
-    # já releem o valor atual dentro de sua própria transação atômica —
-    # não há mais necessidade de reler/computar o diff manualmente aqui.
+    # Aplica a pescaria como DELTA em cima do estado fresco do banco, em vez de
+    # sobrescrever com o snapshot lido no início de pescar(). Entre a leitura do
+    # snapshot e este ponto há awaits, e qualquer outro comando do mesmo usuário
+    # (ex: /eco comprar) pode ter alterado saldo/inventário nesse meio —
+    # sobrescrever com o snapshot reverteria essa mudança e duplicaria saldo.
+    # modify_wallet/add_inventory_item já releem o valor atual dentro de sua
+    # própria transação atômica, então não é preciso computar o diff aqui.
     novo_saldo = modify_wallet(conn, user_id, valor, interaction.user.name)
 
     inv_before = ctx["inv_before"]
@@ -816,8 +770,6 @@ async def _finalize_pescar(interaction: discord.Interaction, ctx: dict, edit: bo
     embed.set_footer(
         text=f"Saldo: {novo_saldo} | Iscas: {iscas_restantes} | Clima: {weather_icon} {w_stats['name']}"
     )
-    if ctx.get("qte_msg"):
-        embed.description = ctx["qte_msg"]
     if mission_msg:
         embed.description = (embed.description or "") + mission_msg
         if mission_completed:
@@ -826,76 +778,16 @@ async def _finalize_pescar(interaction: discord.Interaction, ctx: dict, edit: bo
         bottle_msg = "\n🧴 **Você encontrou uma Garrafa Incrustada!** Use /ler_garrafa para ver o conteúdo."
         embed.description = (embed.description or "") + bottle_msg
 
-    # Apresentação: resultado de QTE (sucesso/falha) tem prioridade visual
-    # sobre a imagem padrão de tier/lixo, já que substitui a mesma captura.
-    qte_outcome = ctx.get("qte_outcome")
-    asset_path = resolve_qte_asset(qte_outcome) if qte_outcome else resolve_fishing_asset(
-        nome, tier_p, ctx.get("is_trash", False)
-    )
+    # Todo tier usa o asset genérico do seu tier (ou o de lixo).
+    asset_path = resolve_fishing_asset(nome, tier_p, ctx.get("is_trash", False))
     img_file, img_url = get_local_file(asset_path, os.path.basename(asset_path)) if asset_path else (None, None)
     if img_file:
         embed.set_thumbnail(url=img_url)
 
-    if edit:
-        if img_file:
-            await interaction.response.edit_message(embed=embed, view=None, attachments=[img_file])
-        else:
-            await interaction.response.edit_message(embed=embed, view=None)
-    else:
-        if img_file:
-            await interaction.followup.send(embed=embed, file=img_file)
-        else:
-            await interaction.followup.send(embed=embed)
-
-
-async def _finalize_pescar_timeout(ctx: dict):
-    msg = ctx.get("qte_message")
-    if not msg:
-        return
-    interaction = ctx["interaction"]
-    ctx["valor"] = 0
-    ctx["qte_msg"] = "❌ Tempo esgotado — o peixe escapou!"
-    conn = get_bot_instance().db_conn
-    user_id = ctx["user_id"]
-    inv = ctx["inv"]
-
-    # Mesmo tratamento de _finalize_pescar: aplica só o delta consumido
-    # nesta pescaria (linha arrebentou, sem ganho de saldo) em cima do
-    # estado fresco, em vez de sobrescrever com o snapshot pré-QTE.
-    inv_before = ctx["inv_before"]
-    for key in set(inv_before) | set(inv):
-        delta = inv.get(key, 0) - inv_before.get(key, 0)
-        if delta != 0:
-            add_inventory_item(conn, user_id, key, delta)
-
-    # Regrava o mesmo agora_str já reservado no início de pescar() —
-    # idempotente, mantém a semântica original.
-    set_cooldown(conn, user_id, "last_fish", ctx["agora_str"])
-    conn.execute(
-        """
-        UPDATE users SET fish_count = fish_count + 1, guild_xp = ?, guild_rank = ?, user_name = ?
-        WHERE user_id = ?
-        """,
-        (ctx["new_xp_total"], ctx["current_rank"], interaction.user.name, user_id),
-    )
-    sync_user_to_economy(conn, user_id)
-    conn.commit()
-    embed = discord.Embed(
-        title="⚠️ PEIXE FORTE!",
-        description=ctx["qte_msg"],
-        color=discord.Color.red(),
-    )
-    asset_path = resolve_qte_asset("falha")
-    img_file, img_url = get_local_file(asset_path, os.path.basename(asset_path)) if asset_path else (None, None)
     if img_file:
-        embed.set_image(url=img_url)
-    try:
-        if img_file:
-            await msg.edit(embed=embed, view=None, attachments=[img_file])
-        else:
-            await msg.edit(embed=embed, view=None)
-    except discord.HTTPException:
-        pass
+        await interaction.followup.send(embed=embed, file=img_file)
+    else:
+        await interaction.followup.send(embed=embed)
 
 
 @eco_group.command(name="pescar", description="Pesca usando itens da sua mochila.")
@@ -942,7 +834,8 @@ async def pescar(interaction: discord.Interaction):
     inv = get_inventory(conn, user_id)
     # Snapshot do inventário no momento da leitura: usado para persistir a
     # pescaria como DELTA (ganho/perda), não como substituição total do
-    # estado — evita apagar mudanças feitas em outros comandos durante o QTE.
+    # estado — evita apagar mudanças feitas por outros comandos do mesmo
+    # usuário entre esta leitura e a gravação final.
     inv_before = dict(inv)
 
     current_rod_key = row['current_rod'] if row['current_rod'] else 'vara_bambu'
@@ -972,14 +865,12 @@ async def pescar(interaction: discord.Interaction):
                 return await interaction.followup.send(f"⏳ **{rod_data['name']}:** Descansando... Volte <t:{ts}:R>.", ephemeral=True)
         except ValueError: pass
 
-    # Reserva o cooldown IMEDIATAMENTE após a checagem passar, antes de
-    # qualquer processamento longo (o QTE de Tier 3+ pode manter esta
-    # pescaria em aberto por ~17s). Sem isso, uma segunda chamada de
-    # /eco pescar do mesmo usuário nessa janela leria o last_fish antigo,
-    # passaria pela checagem acima e abriria um segundo fluxo em paralelo,
-    # duplicando a captura dentro do intervalo de um único cooldown.
-    # _finalize_pescar/_finalize_pescar_timeout regravam o mesmo valor no
-    # final (agora_str não muda), então isto é idempotente.
+    # Reserva o cooldown IMEDIATAMENTE após a checagem passar, ANTES de
+    # qualquer await. Sem isso, uma segunda chamada de /eco pescar do mesmo
+    # usuário, enquanto a primeira ainda está suspensa em algum await antes de
+    # gravar, leria o last_fish antigo, passaria pela checagem acima e abriria
+    # um segundo fluxo em paralelo — duplicando a captura dentro do intervalo
+    # de um único cooldown. Não mova isto para depois do processamento.
     set_cooldown(conn, user_id, "last_fish", agora_str)
 
     # 5. CONSUMO DE ITENS
@@ -1202,10 +1093,9 @@ async def pescar(interaction: discord.Interaction):
             else:
                 cursor.execute("INSERT OR IGNORE INTO quest_progress (user_id, current_chapter) VALUES (?, 'garrafa_encontrada')", (user_id,))
                 
-    # 10. QTE TENSÃO (Tier 3+) ou salva direto
+    # 10. SALVA E ENTREGA O RESULTADO
     catch_ctx = {
         "user_id": user_id,
-        "interaction": interaction,
         "inv": inv,
         "inv_before": inv_before,
         "valor": valor,
@@ -1227,28 +1117,7 @@ async def pescar(interaction: discord.Interaction):
         "is_trash": is_trash,
     }
 
-    if tier_p >= 3 and not is_trash:
-        secret = str(random.randint(100, 999))
-        qte_embed = discord.Embed(
-            title="⚠️ PEIXE FORTE!",
-            description=f"Tensão da linha! Memorize: **{secret}**\n*(some em 2 segundos...)*",
-            color=discord.Color.orange(),
-        )
-        tensao_path = resolve_qte_asset("tensao")
-        tensao_file, tensao_url = get_local_file(tensao_path, os.path.basename(tensao_path)) if tensao_path else (None, None)
-        if tensao_file:
-            qte_embed.set_image(url=tensao_url)
-            msg = await interaction.followup.send(embed=qte_embed, file=tensao_file)
-        else:
-            msg = await interaction.followup.send(embed=qte_embed)
-        catch_ctx["qte_message"] = msg
-        await asyncio.sleep(2)
-        view = TensionQTEView(user_id, secret, catch_ctx)
-        qte_embed.description = "⚠️ **Qual era o número?** Escolha rápido!"
-        await msg.edit(embed=qte_embed, view=view)
-        return
-
-    await _finalize_pescar(interaction, catch_ctx, edit=False)
+    await _finalize_pescar(interaction, catch_ctx)
 
 # --- VIEW DE ESCOLHA DE EXPLORAÇÃO (ILHA vs CIDADE) ---
 class ExplorationView(discord.ui.View):
@@ -1398,8 +1267,7 @@ async def explorar(interaction: discord.Interaction):
         if view.choice is None:
             # Custo/cooldown já foram reservados antes da view abrir (pro
             # fix da race acima) — sem escolha, o drone "se perde" em vez de
-            # reembolsar, mesma filosofia do QTE de pesca (cooldown gasto
-            # mesmo se o jogador não reage a tempo).
+            # reembolsar (cooldown gasto mesmo se o jogador não reage a tempo).
             await interaction.followup.send(
                 "📡 O drone perdeu o sinal sem ordens claras e voltou vazio. (Custo e cooldown consumidos.)",
                 ephemeral=True,
@@ -2708,8 +2576,8 @@ class GaldinoView(discord.ui.View):
 
         # Os botões abaixo NÃO usam scrap/custo capturados aqui em cima —
         # try_upgrade_rod relê sucata e nível na hora do clique e recalcula o
-        # custo a partir do nível fresco (mesmo padrão do fix do QTE de
-        # pesca: nunca confiar em estado capturado na abertura da view, que
+        # custo a partir do nível fresco (mesmo padrão do fix de duplicação
+        # da pesca: nunca confiar em estado capturado na abertura da view, que
         # fica aberta por até 180s e pode ser clicada mais de uma vez).
         view = discord.ui.View()
         async def up_luck(inter):

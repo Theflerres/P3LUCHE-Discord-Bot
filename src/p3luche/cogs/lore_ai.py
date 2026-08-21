@@ -16,9 +16,6 @@ from datetime import datetime
 from io import BytesIO
 
 import discord
-import matplotlib.pyplot as plt
-import networkx as nx
-import scipy  # noqa: F401
 from discord import app_commands
 from discord.ext import commands, tasks
 
@@ -96,6 +93,16 @@ def _generate_graph_image(nodes: list, edges: list, node_colors: dict) -> BytesI
     """
     edges: lista de (origem, destino, cor_aresta, label_relação)
     """
+    # Imports locais de propósito: matplotlib (~610ms), networkx (~334ms) e
+    # scipy (~146ms) somavam ~1s de bloqueio do event loop no startup do bot,
+    # dentro do load_extension, mesmo para quem nunca usa /lore grafo. Aqui o
+    # custo só é pago na primeira chamada do comando — e como esta função roda
+    # via asyncio.to_thread, ele nem sequer acontece no loop. Python cacheia o
+    # módulo em sys.modules, então as chamadas seguintes não repetem o custo.
+    import matplotlib.pyplot as plt
+    import networkx as nx
+    import scipy  # noqa: F401  (spring_layout usa scipy quando disponível)
+
     G = nx.Graph()
     G.add_nodes_from(nodes)
     for u, v, color, label in edges:

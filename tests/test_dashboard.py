@@ -4,6 +4,7 @@ Cobrem o que é lógica: coleta de dados (com psutil/banco mockados), invariante
 da arte ASCII e a máquina de estado da animação. Não testam a renderização
 visual em si — só um smoke test garantindo que a composição não explode.
 """
+import os
 import random
 import sqlite3
 import unittest
@@ -15,7 +16,9 @@ from cogs import dashboard_animation as anim
 from cogs import dashboard_art as art
 from cogs.dashboard_panel import (
     DashboardData,
+    LatencyTracker,
     build_dashboard,
+    format_gateway_latency,
     collect_connection,
     collect_economy,
     collect_process_stats,
@@ -585,6 +588,171 @@ class ShouldRedrawTests(unittest.TestCase):
                 current_second=self.second, last_second=None,
             )
         )
+
+
+class ExtensionReloadTests(unittest.TestCase):
+    """Regressão do painel que nunca desenhava.
+
+    `bot.load_extension` não reaproveita o módulo já importado — ele faz
+    `module_from_spec` + `exec_module`, criando um objeto NOVO e re-executando o
+    arquivo. Estado guardado nos globais da extensão passa a existir em duas
+    cópias: o `main.py` escrevia numa e o cog lia da outra (sempre None).
+    """
+
+    def _reexecute_like_load_extension(self, module_name):
+        import importlib.util
+
+        spec = importlib.util.find_spec(module_name)
+        fresh = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fresh)
+        return fresh
+
+    def test_live_session_survives_extension_reexecution(self):
+        from cogs import dashboard_runtime as runtime
+
+        sentinel = object()
+        original = runtime._live
+        runtime._live = sentinel
+        try:
+            fresh = self._reexecute_like_load_extension("cogs.dashboard")
+            self.assertIs(
+                fresh.get_live(),
+                sentinel,
+                "o cog re-executado perdeu a sessão iniciada pelo main.py",
+            )
+        finally:
+            runtime._live = original
+
+    def test_extension_module_does_not_own_the_live_state(self):
+        """Se `_live` voltar a morar na extensão, o bug volta junto."""
+        from cogs import dashboard
+
+        self.assertFalse(
+            hasattr(dashboard, "_live"),
+            "estado do Live não pode viver no módulo de extensão — use dashboard_runtime",
+        )
+
+    def test_process_start_is_stable_across_reexecution(self):
+        from cogs import dashboard_runtime as runtime
+
+        fresh = self._reexecute_like_load_extension("cogs.dashboard")
+        self.assertIs(fresh.PROCESS_START, runtime.PROCESS_START)
+
+
+class IsEnabledTests(unittest.TestCase):
+    def setUp(self):
+        from cogs import dashboard_runtime as runtime
+
+        self.runtime = runtime
+        self._original = os.environ.get(runtime.ENV_FLAG)
+
+    def tearDown(self):
+        if self._original is None:
+            os.environ.pop(self.runtime.ENV_FLAG, None)
+        else:
+            os.environ[self.runtime.ENV_FLAG] = self._original
+
+    def test_env_flag_name_is_the_documented_one(self):
+        self.assertEqual(self.runtime.ENV_FLAG, "P3LUCHE_DASHBOARD")
+
+    def test_truthy_values_enable_it(self):
+        for value in ("1", "true", "TRUE", "on", "yes", "sim"):
+            with self.subTest(value=value):
+                os.environ[self.runtime.ENV_FLAG] = value
+                self.assertTrue(self.runtime.is_enabled())
+
+    def test_falsy_values_disable_it_even_on_a_tty(self):
+        for value in ("0", "false", "off", "no", ""):
+            with self.subTest(value=value):
+                os.environ[self.runtime.ENV_FLAG] = value
+                self.assertFalse(self.runtime.is_enabled())
+
+    def test_powershell_style_value_with_whitespace_is_accepted(self):
+        os.environ[self.runtime.ENV_FLAG] = " 1 "
+        self.assertTrue(self.runtime.is_enabled())
+
+
+class LatencyTrackerTests(unittest.TestCase):
+    """O gateway só manda heartbeat a cada ~41s, então bot.latency fica
+    congelado entre batidas. O rastreador existe para o painel poder mostrar
+    HÁ QUANTO TEMPO aquela leitura está parada — foi a ausência disso que fez
+    um valor normal parecer um problema de performance.
+    """
+
+    def setUp(self):
+        self.tracker = LatencyTracker()
+        self.t0 = datetime(2026, 8, 21, 12, 0, 0)
+
+    def test_starts_without_a_reading(self):
+        self.assertIsNone(self.tracker.value)
+        self.assertIsNone(self.tracker.age_seconds(self.t0))
+
+    def test_records_first_reading(self):
+        self.tracker.update(137, self.t0)
+        self.assertEqual(self.tracker.value, 137)
+        self.assertEqual(self.tracker.age_seconds(self.t0), 0)
+
+    def test_age_grows_while_the_value_stays_frozen(self):
+        self.tracker.update(137, self.t0)
+        # Painel redesenha a cada segundo com o MESMO valor: não é leitura nova.
+        for offset in range(1, 40):
+            self.tracker.update(137, self.t0 + timedelta(seconds=offset))
+        self.assertEqual(self.tracker.age_seconds(self.t0 + timedelta(seconds=39)), 39)
+
+    def test_new_heartbeat_resets_the_age(self):
+        self.tracker.update(137, self.t0)
+        self.tracker.update(141, self.t0 + timedelta(seconds=41))
+        self.assertEqual(self.tracker.value, 141)
+        self.assertEqual(self.tracker.age_seconds(self.t0 + timedelta(seconds=41)), 0)
+
+    def test_tracks_the_observed_minimum(self):
+        for value, offset in ((178, 0), (141, 41), (137, 82)):
+            self.tracker.update(value, self.t0 + timedelta(seconds=offset))
+        self.assertEqual(self.tracker.observed_min, 137)
+
+    def test_history_is_bounded(self):
+        for i in range(LatencyTracker.HISTORY + 30):
+            self.tracker.update(100 + i, self.t0 + timedelta(seconds=i))
+        self.assertLessEqual(len(self.tracker._history), LatencyTracker.HISTORY)
+
+    def test_none_latency_is_ignored(self):
+        self.tracker.update(137, self.t0)
+        self.tracker.update(None, self.t0 + timedelta(seconds=5))
+        self.assertEqual(self.tracker.value, 137)
+
+    def test_age_never_goes_negative(self):
+        self.tracker.update(137, self.t0)
+        self.assertEqual(self.tracker.age_seconds(self.t0 - timedelta(seconds=10)), 0)
+
+
+class FormatGatewayLatencyTests(unittest.TestCase):
+    def setUp(self):
+        self.tracker = LatencyTracker()
+        self.t0 = datetime(2026, 8, 21, 12, 0, 0)
+
+    def test_shows_waiting_before_the_first_heartbeat(self):
+        rendered = format_gateway_latency(self.tracker, self.t0).plain
+        self.assertIn("aguardando", rendered)
+
+    def test_shows_value_and_age(self):
+        self.tracker.update(137, self.t0)
+        rendered = format_gateway_latency(self.tracker, self.t0 + timedelta(seconds=12)).plain
+        self.assertIn("137 ms", rendered)
+        self.assertIn("há 12s", rendered)
+
+    def test_shows_observed_minimum_when_current_reading_is_above_it(self):
+        """O caso que importa: a batida atual veio alta (ex.: a primeira, medida
+        durante o startup) e o mínimo observado mostra o piso real."""
+        self.tracker.update(137, self.t0)
+        self.tracker.update(178, self.t0 + timedelta(seconds=41))
+        rendered = format_gateway_latency(self.tracker, self.t0 + timedelta(seconds=45)).plain
+        self.assertIn("178 ms", rendered)
+        self.assertIn("mín 137", rendered)
+
+    def test_omits_minimum_when_it_equals_the_current_value(self):
+        self.tracker.update(137, self.t0)
+        rendered = format_gateway_latency(self.tracker, self.t0).plain
+        self.assertNotIn("mín", rendered)
 
 
 class BuildDashboardSmokeTests(unittest.TestCase):

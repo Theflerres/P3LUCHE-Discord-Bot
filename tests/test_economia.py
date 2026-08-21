@@ -95,14 +95,17 @@ def _make_pescar_conn():
 
 
 class FinalizePescarDeltaTests(unittest.IsolatedAsyncioTestCase):
-    """Regressão para o fix de duplicação de saldo/inventário no QTE de pesca.
+    """Regressão para o fix de duplicação de saldo/inventário na pesca.
 
     Cenário: o snapshot (`inv_before`) é capturado no início de `/eco pescar`,
-    mas o QTE (Tier 3+) deixa a escrita final pendente por até ~15-17s. Se,
-    durante essa janela, outro comando (ex.: /eco comprar, já migrado pra v4)
-    alterar saldo/inventário no banco, `_finalize_pescar` NÃO pode sobrescrever
-    essa mudança com o snapshot antigo — precisa aplicar a pescaria como
-    delta em cima do estado v4 fresco (via modify_wallet/add_inventory_item).
+    mas a escrita final só acontece depois — e há awaits no meio. Se, nessa
+    janela, outro comando (ex.: /eco comprar, já migrado pra v4) alterar
+    saldo/inventário no banco, `_finalize_pescar` NÃO pode sobrescrever essa
+    mudança com o snapshot antigo — precisa aplicar a pescaria como delta em
+    cima do estado v4 fresco (via modify_wallet/add_inventory_item).
+
+    (A janela era bem maior quando o QTE existia, mas o fix não dependia dele:
+    qualquer await entre a leitura e a gravação reabre a mesma corrida.)
     """
 
     def _make_conn(self):
@@ -115,7 +118,7 @@ class FinalizePescarDeltaTests(unittest.IsolatedAsyncioTestCase):
             response=SimpleNamespace(edit_message=AsyncMock()),
         )
 
-    async def test_external_purchase_during_qte_window_is_not_reverted(self):
+    async def test_external_purchase_during_open_catch_is_not_reverted(self):
         conn = self._make_conn()
         user_id = 42
 
@@ -124,13 +127,13 @@ class FinalizePescarDeltaTests(unittest.IsolatedAsyncioTestCase):
         modify_wallet(conn, user_id, 1000, "Tester")
         add_inventory_item(conn, user_id, "isca", 5)
 
-        # Snapshot capturado no início de pescar(), antes do QTE abrir.
+        # Snapshot capturado no início de pescar().
         inv_before = {"isca": 5}
         # Estado local após o consumo de 1 isca pela tentativa de pesca
-        # (mutação em memória feita antes do QTE, como no código real).
+        # (mutação em memória feita antes da gravação, como no código real).
         inv_after_local = {"isca": 4}
 
-        # --- Ação externa durante a janela do QTE (ex: /eco comprar, v4) ---
+        # --- Ação externa antes da gravação final (ex: /eco comprar, v4) ---
         # Gasta 300 e ganha um item novo; NÃO mexe em "isca".
         modify_wallet(conn, user_id, -300)
         add_inventory_item(conn, user_id, "novo_item", 1)
@@ -160,13 +163,13 @@ class FinalizePescarDeltaTests(unittest.IsolatedAsyncioTestCase):
 
         interaction = self._make_interaction()
         with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
-            await economia._finalize_pescar(interaction, ctx, edit=False)
+            await economia._finalize_pescar(interaction, ctx)
 
         # O gasto externo (300) continua valendo: saldo = 700 (pós-compra) + 300 (peixe).
         # Sem o fix, seria 1000 (saldo antigo do snapshot) + 300 = 1300, revertendo a compra.
         self.assertEqual(get_wallet(conn, user_id), 1000)
         final_inv = get_inventory(conn, user_id)
-        # O item comprado durante a janela do QTE não pode desaparecer.
+        # O item comprado durante a captura em aberto não pode desaparecer.
         self.assertEqual(final_inv.get("novo_item"), 1)
         # A isca consumida pela pescaria (delta -1) é aplicada sobre o estado
         # fresco (5, não o snapshot antigo), resultando em 4 — não em "resetar"
@@ -183,45 +186,49 @@ class FinalizePescarDeltaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(legacy_inv.get("novo_item"), 1)
         self.assertEqual(legacy_inv.get("isca"), 4)
 
-    async def test_timeout_path_also_preserves_external_mutation(self):
+    async def test_high_tier_catch_pays_plain_value_without_bonus_or_penalty(self):
+        """O QTE foi removido: tier 3+ paga o valor cheio, sem x1.5 de acerto
+        nem zeragem por erro/timeout."""
         conn = self._make_conn()
         user_id = 77
 
         ensure_user(conn, user_id, "Tester")
-        modify_wallet(conn, user_id, 500, "Tester")
         add_inventory_item(conn, user_id, "isca", 2)
-
-        inv_before = {"isca": 2}
-        inv_after_local = {"isca": 1}
-
-        # Ação externa durante a espera do QTE que acaba estourando o tempo.
-        add_inventory_item(conn, user_id, "presente", 3)
 
         ctx = {
             "user_id": user_id,
-            "interaction": self._make_interaction(),
-            "inv": inv_after_local,
-            "inv_before": inv_before,
-            "qte_message": SimpleNamespace(edit=AsyncMock()),
-            "agora_str": "2026-08-13 12:05:00.000000",
+            "inv": {"isca": 1},
+            "inv_before": {"isca": 2},
+            "valor": 400,
+            "nome": "Leviatã",
+            "emoji": "🐉",
+            "tier_p": 4,
+            "frase": "Grande demais pro balde.",
+            "rod_data": {"name": "Vara Teste", "luck": 1},
+            "actual_cd": 300,
+            "mission_msg": "",
+            "mission_completed": False,
+            "quest_trigger": False,
             "new_xp_total": 0,
             "current_rank": "F",
+            "used_bait": True,
+            "agora_str": "2026-08-13 12:05:00.000000",
+            "w_key": "normal",
+            "w_stats": {"name": "Normal", "luck_mod": 1},
+            "is_trash": False,
         }
 
+        interaction = self._make_interaction()
         with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
-            await economia._finalize_pescar_timeout(ctx)
+            await economia._finalize_pescar(interaction, ctx)
 
-        final_inv = get_inventory(conn, user_id)
-        self.assertEqual(final_inv.get("presente"), 3)
-        self.assertEqual(final_inv.get("isca"), 1)
+        # Exatamente o valor sorteado: nem 600 (x1.5) nem 0 (linha arrebentada).
+        self.assertEqual(get_wallet(conn, user_id), 400)
 
-        legacy = conn.execute(
-            "SELECT inventory, last_fish FROM economy WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        legacy_inv = json.loads(legacy["inventory"])
-        self.assertEqual(legacy_inv.get("presente"), 3)
-        self.assertEqual(legacy_inv.get("isca"), 1)
-        self.assertEqual(legacy["last_fish"], "2026-08-13 12:05:00.000000")
+    async def test_no_qte_entrypoints_remain(self):
+        """Guarda contra o QTE voltar por engano."""
+        for attr in ("TensionQTEView", "_finalize_pescar_timeout"):
+            self.assertFalse(hasattr(economia, attr), f"{attr} deveria ter sido removido")
 
 
 class ComprarTests(unittest.IsolatedAsyncioTestCase):
@@ -897,26 +904,26 @@ class PescarCooldownReservationTests(unittest.IsolatedAsyncioTestCase):
             followup=SimpleNamespace(send=AsyncMock(return_value=SimpleNamespace(edit=AsyncMock()))),
         )
 
-    async def test_second_pescar_during_open_qte_window_is_rejected_by_cooldown(self):
-        """Reproduz o cenário real: a 1ª chamada engata um peixe Tier 3+ e
-        fica com o QTE aberto (suspensa em `await asyncio.sleep`, tal como
-        aconteceria por até ~17s aguardando o clique do jogador). Enquanto
-        ela está suspensa nesse ponto — ou seja, ANTES de `_finalize_pescar`
-        rodar —, a 2ª chamada do mesmo usuário deve ser rejeitada pela
-        checagem de cooldown, porque o cooldown já foi reservado no início
-        da 1ª chamada, e não apenas no final (que só aconteceria quando o
-        jogador resolvesse o QTE).
+    async def test_second_pescar_before_first_finishes_is_rejected_by_cooldown(self):
+        """Reproduz o cenário real: a 1ª chamada engata um peixe e fica
+        suspensa num await ANTES de `_finalize_pescar` gravar. Enquanto ela
+        está pendurada aí, a 2ª chamada do mesmo usuário deve ser rejeitada
+        pela checagem de cooldown, porque o cooldown já foi reservado no
+        INÍCIO da 1ª chamada, e não apenas no final.
+
+        O ponto de suspensão original era o `asyncio.sleep(2)` do QTE. Com o
+        QTE removido, a suspensão é forçada dentro do próprio
+        `_finalize_pescar` — o que a propriedade exige é justamente que a
+        reserva já tenha acontecido antes dele, independente de qual await
+        segure a chamada.
         """
         conn = self._make_conn()
         user_id = 999
 
-        # Vara de tier alto + Firewall (zera a chance de lixo) garante que a
-        # 1ª chamada sempre sorteia um peixe real; o patch de random.choice
-        # abaixo garante que esse peixe seja especificamente Tier 3+, para
-        # acionar o QTE de forma determinística (sem depender de sorte).
-        # Inserida direto na tabela legada pra simular um usuário que já
-        # existia antes desta migração — pescar() precisa sincronizar isso
-        # pra v4 sozinho antes de ler.
+        # Firewall zera a chance de lixo, garantindo que a 1ª chamada sempre
+        # sorteie um peixe real. Inserida direto na tabela legada pra simular
+        # um usuário que já existia antes desta migração — pescar() precisa
+        # sincronizar isso pra v4 sozinho antes de ler.
         conn.execute(
             "INSERT INTO economy (user_id, user_name, wallet, current_rod, inventory) VALUES (?, ?, ?, ?, ?)",
             (user_id, "Tester", 1000, "vara_void", json.dumps({"firewall": 1})),
@@ -926,49 +933,41 @@ class PescarCooldownReservationTests(unittest.IsolatedAsyncioTestCase):
         interaction1 = self._make_interaction(user_id)
         interaction2 = self._make_interaction(user_id)
 
-        real_choice = economia.random.choice
-        real_sleep = asyncio.sleep  # capturado ANTES de patchear: economia.asyncio
-        # é o mesmo objeto módulo `asyncio` global, então patchear seu atributo
-        # `sleep` afeta todo mundo (inclusive este helper) — sem capturar a
-        # função real antes, o helper chamaria a si mesmo indefinidamente.
+        finalize_entered = asyncio.Event()
+        release_finalize = asyncio.Event()
 
-        def choose_tier3_plus(seq):
-            candidates = [item for item in seq if isinstance(item, tuple) and len(item) == 6 and item[4] >= 3]
-            return candidates[0] if candidates else real_choice(seq)
-
-        async def instant_yield(*_args, **_kwargs):
-            # Substitui o `await asyncio.sleep(2)` do QTE por um yield real
-            # (cede o loop uma vez), só para o teste não esperar 2s de verdade
-            # — continua sendo um ponto de suspensão genuíno para a 2ª
-            # chamada interlear, exatamente como aconteceria na espera real.
-            await real_sleep(0)
+        async def hanging_finalize(_interaction, _ctx):
+            # Prende a 1ª pescaria exatamente no ponto onde ela gravaria o
+            # resultado, deixando a 2ª chamada interlear enquanto isso.
+            finalize_entered.set()
+            await release_finalize.wait()
 
         with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
-             patch.object(economia.random, "choice", side_effect=choose_tier3_plus), \
-             patch.object(economia.asyncio, "sleep", side_effect=instant_yield):
+             patch.object(economia, "_finalize_pescar", side_effect=hanging_finalize):
             task1 = asyncio.create_task(economia.pescar.callback(interaction1))
-            # Cede o loop uma vez: task1 roda sincronamente (mocks não geram
-            # suspensão real) até o único ponto de suspensão genuína dentro
-            # dela — o `asyncio.sleep` do QTE — e fica pendurada ali, com o
-            # cooldown já reservado mas a pescaria ainda não finalizada.
-            await asyncio.sleep(0)
+            await asyncio.wait_for(finalize_entered.wait(), timeout=5)
 
-            self.assertFalse(task1.done(), "esperava a 1ª chamada suspensa no QTE, não finalizada")
+            self.assertFalse(task1.done(), "esperava a 1ª chamada suspensa antes de gravar")
 
-            # 2ª chamada do MESMO usuário enquanto a 1ª ainda está com o QTE aberto.
-            await economia.pescar.callback(interaction2)
+            # 2ª chamada do MESMO usuário enquanto a 1ª ainda não gravou.
+            # O wait_for não é decorativo: sem a reserva de cooldown, esta
+            # chamada NÃO é rejeitada, entra no fluxo de captura e trava no
+            # mesmo `_finalize_pescar` suspenso — sem timeout, a regressão se
+            # manifestaria como um teste pendurado para sempre em vez de uma
+            # falha legível.
+            try:
+                await asyncio.wait_for(economia.pescar.callback(interaction2), timeout=5)
+            except asyncio.TimeoutError:
+                release_finalize.set()
+                await task1
+                self.fail(
+                    "a 2ª pescaria não foi barrada pelo cooldown e abriu um "
+                    "segundo fluxo de captura em paralelo — a reserva de "
+                    "cooldown no início de pescar() foi perdida"
+                )
 
+            release_finalize.set()
             await task1
-
-        # 1ª chamada: chegou a abrir o QTE (mensagem de tensão), não terminou
-        # com erro.
-        self.assertTrue(interaction1.followup.send.called)
-        call1_kwargs = interaction1.followup.send.call_args.kwargs
-        self.assertIn("embed", call1_kwargs)
-        # (o embed é reutilizado por referência e sua description é mutada
-        # depois pelo próprio código ao editar a mensagem do QTE; o title
-        # não é mutado, então é o campo estável para checar aqui.)
-        self.assertIn("PEIXE FORTE", call1_kwargs["embed"].title or "")
 
         # 2ª chamada: rejeitada pela checagem normal de cooldown — não abriu
         # um segundo fluxo de captura em paralelo.
@@ -980,8 +979,8 @@ class PescarCooldownReservationTests(unittest.IsolatedAsyncioTestCase):
 
         # O cooldown foi reservado pela 1ª chamada (last_fish já gravado),
         # mesmo com a pescaria dela ainda não finalizada (fish_count == 0,
-        # pois o QTE nunca foi resolvido neste teste). Checa tanto a v4
-        # quanto a tabela legada (têm que estar em sincronia).
+        # pois _finalize_pescar foi interceptado). Checa tanto a v4 quanto a
+        # tabela legada (têm que estar em sincronia).
         row = conn.execute(
             "SELECT fish_count, last_fish FROM economy WHERE user_id = ?", (user_id,)
         ).fetchone()

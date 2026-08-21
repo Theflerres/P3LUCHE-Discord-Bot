@@ -558,8 +558,10 @@ async def process_slash_music_addition(interaction: discord.Interaction, youtube
 
         video_id = extract_youtube_id(youtube_url)
         thumbnail_url = get_best_thumbnail(video_id) if video_id else None
+        # to_thread: get_thumbnail_dominant_color faz requests.get (até 5s) e
+        # decodifica imagem — direto no loop, travava o bot inteiro nesse tempo.
         color = (
-            get_thumbnail_dominant_color(thumbnail_url)
+            await asyncio.to_thread(get_thumbnail_dominant_color, thumbnail_url)
             if thumbnail_url
             else discord.Color.blurple()
         )

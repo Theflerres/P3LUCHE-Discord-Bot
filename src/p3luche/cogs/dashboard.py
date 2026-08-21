@@ -13,7 +13,14 @@ mudar no `log_to_gui`.
 Por isso o `Live` precisa começar ANTES de `bot.run()`: o `setup_logging()` do
 discord.py cria um StreamHandler que captura `sys.stderr` no momento da
 construção — se o redirect não estiver de pé ainda, os logs dele escapam do
-painel e embaralham a tela. Ver `dashboard_session()` em `main.py`.
+painel e embaralham a tela. Ver `dashboard_session()` em `cogs/dashboard_runtime.py`.
+
+Onde mora o estado
+------------------
+O `Live` fica em `cogs/dashboard_runtime.py`, e este módulo o consulta via
+`get_live()`. Isso NÃO é indireção gratuita: `load_extension` re-executa o
+módulo de extensão num objeto novo, então estado guardado aqui existiria em duas
+cópias e o cog leria sempre a errada. Ver a explicação completa lá.
 
 Desligar
 --------
@@ -23,18 +30,16 @@ CI não tenta desenhar painel nenhum. `P3LUCHE_DASHBOARD=1` força ligado.
 
 Segurança
 ---------
-Qualquer falha aqui é engolida: o painel some, o bot continua. Nenhum caminho
-deste módulo pode propagar exceção para o bot.
+Uma falha de render desliga o painel e reporta uma vez; o bot continua. Nenhum
+caminho deste módulo pode propagar exceção para o bot.
 """
-import contextlib
-import os
 import random
-import sys
 from datetime import datetime
 
 from discord.ext import commands, tasks
 
 import telemetry
+from utils import log_to_gui
 from cogs.dashboard_animation import TVAnimation
 from cogs.dashboard_panel import (
     ACTIVITY_WINDOW_SECONDS,
@@ -43,75 +48,14 @@ from cogs.dashboard_panel import (
     collect_connection,
     should_redraw,
 )
+from cogs.dashboard_runtime import PROCESS_START, get_live
 
 #: Frame rate da animação. Baixo de propósito — o glitch de CRT funciona bem
 #: assim e o custo por frame fica irrelevante perto do resto do bot.
 FPS = 8
 
-ENV_FLAG = "P3LUCHE_DASHBOARD"
-
 #: Quantos erros recentes listar no painel.
 ERROR_LIST_SIZE = 3
-
-_live = None
-_error_handler = None
-_process_start = datetime.now()
-
-
-def is_enabled() -> bool:
-    """Painel ligado? Variável explícita vence; senão, só em terminal real."""
-    raw = os.getenv(ENV_FLAG)
-    if raw is not None:
-        return raw.strip().lower() in ("1", "true", "on", "yes", "sim")
-    try:
-        return bool(sys.stdout.isatty())
-    except Exception:
-        return False
-
-
-@contextlib.contextmanager
-def dashboard_session():
-    """Mantém o painel vivo enquanto o bot roda. No-op se estiver desligado.
-
-    Usado por `main.py` envolvendo `bot.run()`. Se qualquer coisa falhar ao
-    iniciar, cede o controle sem painel — o bot roda normalmente.
-    """
-    global _live, _error_handler
-
-    if not is_enabled():
-        yield None
-        return
-
-    try:
-        from rich.console import Console
-        from rich.live import Live
-
-        console = Console()
-        _live = Live(
-            console=console,
-            auto_refresh=False,      # quem controla o frame rate é o cog
-            redirect_stdout=True,    # logs do log_to_gui aparecem acima do painel
-            redirect_stderr=True,    # idem para o logging do discord.py
-            vertical_overflow="visible",
-        )
-        _error_handler = telemetry.attach_error_capture()
-        _live.start()
-    except Exception as exc:
-        _live = None
-        print(f"[painel] desativado (falha ao iniciar: {exc})")
-        yield None
-        return
-
-    try:
-        yield _live
-    finally:
-        try:
-            _live.stop()
-        except Exception:
-            pass
-        telemetry.detach_error_capture(_error_handler)
-        _live = None
-        _error_handler = None
 
 
 class DashboardCog(commands.Cog):
@@ -132,12 +76,20 @@ class DashboardCog(commands.Cog):
         except Exception:
             process = None
 
-        self.data = DashboardData(process=process, process_start=_process_start)
+        self.data = DashboardData(process=process, process_start=PROCESS_START)
         self._last_second = None
         self._was_glitching = False
+        self._render_failed = False
 
     async def cog_load(self):
-        if _live is not None and not self.refresh_loop.is_running():
+        if get_live() is None:
+            log_to_gui(
+                "Painel: sessão não iniciada (P3LUCHE_DASHBOARD desligado ou "
+                "saída não é um terminal) — cog carregado sem desenhar.",
+                "INFO",
+            )
+            return
+        if not self.refresh_loop.is_running():
             self.refresh_loop.start()
 
     def cog_unload(self):
@@ -148,12 +100,20 @@ class DashboardCog(commands.Cog):
     async def refresh_loop(self):
         try:
             self._render_once()
-        except Exception:
-            # Painel quebrado não pode derrubar nem travar o bot.
-            pass
+        except Exception as exc:
+            # Painel quebrado não pode derrubar nem travar o bot — mas engolir
+            # em silêncio esconde a falha para sempre (foi exatamente assim que
+            # um painel que nunca desenhava passou despercebido). Reporta a
+            # primeira falha e só então silencia, para não poluir 8x por segundo.
+            if not self._render_failed:
+                self._render_failed = True
+                log_to_gui(f"Painel desativado após erro no render: {exc!r}", "ERROR")
+                self.refresh_loop.cancel()
 
     def _render_once(self) -> None:
-        live = _live
+        # Sempre via get_live(): o estado vive em `dashboard_runtime`, que não é
+        # extensão e por isso não é re-executado pelo load_extension.
+        live = get_live()
         if live is None:
             return
 
@@ -166,6 +126,12 @@ class DashboardCog(commands.Cog):
             self.animation.notify_error(last_error.timestamp())
 
         frame = self.animation.tick(now.timestamp())
+
+        connection = collect_connection(self.bot, now, PROCESS_START)
+        # Alimentado todo frame, mas só registra leitura nova quando o valor
+        # muda — é assim que o painel sabe há quanto tempo aquele número está
+        # parado (o gateway só manda heartbeat a cada ~41s).
+        self.data.latency.update(connection["latency_ms"], now)
 
         # Em repouso o painel só muda quando o segundo vira; redesenhar a 8 fps
         # ali seria queimar CPU reimprimindo a mesma tela.
@@ -181,7 +147,9 @@ class DashboardCog(commands.Cog):
         renderable = build_dashboard(
             frame=frame,
             rng=self.rng,
-            connection=collect_connection(self.bot, now, _process_start),
+            connection=connection,
+            latency_tracker=self.data.latency,
+            now=now,
             stats=self.data.process_stats(now),
             economy=self.data.economy(getattr(self.bot, "db_conn", None), now),
             interactions=telemetry.recent_interactions(ACTIVITY_WINDOW_SECONDS, now),

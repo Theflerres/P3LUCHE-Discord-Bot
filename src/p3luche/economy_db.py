@@ -471,7 +471,7 @@ def try_upgrade_rod(
 
     O custo é recalculado a partir do nível ATUAL lido dentro da transação
     (nunca de um valor capturado antes, ex.: na abertura de uma view) —
-    mesmo raciocínio do fix de duplicação do QTE de pesca.
+    mesmo raciocínio do fix de duplicação da pesca.
     """
     if upgrade_type not in ("luck", "cd"):
         raise ValueError(f"upgrade_type inválido: {upgrade_type!r}")
@@ -685,7 +685,7 @@ def start_island_construction(
     Relê saldo/sucata, o nível/status ATUAIS da construção e o tier da ilha
     dentro da MESMA transação (nunca um valor capturado na abertura do hub,
     que pode ficar aberto por minutos) — mesmo raciocínio do fix de
-    duplicação do QTE de pesca e do try_upgrade_rod. O gate de tier
+    duplicação da pesca e do try_upgrade_rod. O gate de tier
     (`required_tier`) é reavaliado aqui, não só na UI, para não reabrir o
     mesmo tipo de bug de checagem-fora-da-transação corrigido na Fase 3.
     """

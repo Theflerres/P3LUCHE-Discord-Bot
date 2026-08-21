@@ -2,7 +2,6 @@ import unittest
 
 from cogs.pesca_visuals import (
     resolve_fishing_asset,
-    resolve_qte_asset,
     resolve_weather_asset,
 )
 
@@ -25,18 +24,23 @@ class ResolveFishingAssetTests(unittest.TestCase):
         self.assertEqual(asset, "assets/pesca/tier0.png")
 
 
-class ResolveQteAssetTests(unittest.TestCase):
-    def test_tensao_state(self):
-        self.assertEqual(resolve_qte_asset("tensao"), "assets/pesca/qte_tensao.gif")
+class TierAssetsAreTheOnlyCatchVisualsTests(unittest.TestCase):
+    """O QTE foi removido: peixes de tier alto não têm mais asset próprio de
+    tensão/sucesso/falha — usam o asset genérico do tier, como todos os outros.
+    """
 
-    def test_sucesso_state(self):
-        self.assertEqual(resolve_qte_asset("sucesso"), "assets/pesca/qte_sucesso.png")
+    def test_no_qte_resolver_remains(self):
+        from cogs import pesca_visuals
 
-    def test_falha_state_covers_both_error_and_timeout(self):
-        self.assertEqual(resolve_qte_asset("falha"), "assets/pesca/qte_falha.png")
+        self.assertFalse(hasattr(pesca_visuals, "resolve_qte_asset"))
+        self.assertFalse(hasattr(pesca_visuals, "QTE_VISUALS"))
 
-    def test_unknown_state_returns_none(self):
-        self.assertIsNone(resolve_qte_asset("inexistente"))
+    def test_high_tier_catch_uses_its_plain_tier_asset(self):
+        for tier in (3, 4):
+            with self.subTest(tier=tier):
+                asset = resolve_fishing_asset("Peixe Lendário", tier, False)
+                self.assertNotIn("qte", asset)
+                self.assertIn(f"tier{tier}", asset)
 
 
 class ResolveWeatherAssetTests(unittest.TestCase):

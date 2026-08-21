@@ -175,12 +175,33 @@ def get_best_thumbnail(video_id):
     return f"https://img.youtube.com/vi/{video_id}/maxresdefault.jpg"
 
 
+#: Lado do quadrado para o qual a thumbnail é reduzida antes de contar cores.
+#: 50x50 = 2500 pixels, o suficiente para a cor dominante e barato de processar.
+_THUMBNAIL_SAMPLE_SIZE = 50
+
+
 def get_thumbnail_dominant_color(url):
+    """Cor dominante da thumbnail. SÍNCRONA — chame via asyncio.to_thread.
+
+    Faz I/O de rede (requests, até 5s) e decodifica imagem; chamar direto de
+    uma coroutine trava o event loop inteiro do bot por todo esse tempo.
+    """
     try:
         response = requests.get(url, timeout=5)
-        img = Image.open(BytesIO(response.content)).convert("RGB").resize((50, 50))
-        pixels = list(img.getdata())
-        return discord.Color.from_rgb(*max(set(pixels), key=pixels.count))
+        img = (
+            Image.open(BytesIO(response.content))
+            .convert("RGB")
+            .resize((_THUMBNAIL_SAMPLE_SIZE, _THUMBNAIL_SAMPLE_SIZE))
+        )
+        # getcolors faz uma passada só e já devolve (contagem, cor) — O(n).
+        # A versão anterior era `max(set(pixels), key=pixels.count)`, que
+        # varria a lista inteira uma vez POR cor distinta: com 2500 pixels
+        # quase todos distintos, isso é ~6 milhões de comparações.
+        colors = img.getcolors(maxcolors=_THUMBNAIL_SAMPLE_SIZE ** 2)
+        if not colors:
+            return discord.Color.blurple()
+        _count, dominant = max(colors, key=lambda item: item[0])
+        return discord.Color.from_rgb(*dominant)
     except Exception:
         return discord.Color.blurple()
 
