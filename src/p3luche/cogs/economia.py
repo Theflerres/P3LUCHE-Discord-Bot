@@ -25,7 +25,7 @@ from config import (
     FISHING_CHANNEL_ID,
 )
 from utils import get_local_file, log_to_gui
-from economy_constants import FISH_DB
+from economy_constants import FISH_DB, TRASH_ITEMS, TRASH_ROLL_RATIO
 from cogs.pesca_visuals import (
     resolve_fishing_asset,
     resolve_weather_asset,
@@ -939,7 +939,16 @@ async def pescar(interaction: discord.Interaction):
         pool = [p for p in FISH_DB if p[4] >= 2]
         if not pool: pool = [p for p in FISH_DB if p[4] > 0]
     elif roll <= trash_chance: 
-        pool = [p for p in FISH_DB if p[4] == 0] # Lixo
+        # O tier 0 mistura lixo e peixe inicial, então sortear uniformemente
+        # entre eles amarraria a taxa de lixo à quantidade de linhas de cada
+        # tipo no FISH_DB. Separamos os dois e usamos TRASH_ROLL_RATIO, para
+        # que adicionar peixe ou lixo novo na tabela não mexa no balanceamento.
+        lixo_pool = [p for p in FISH_DB if p[4] == 0 and p[0] in TRASH_ITEMS]
+        iniciais_pool = [p for p in FISH_DB if p[4] == 0 and p[0] not in TRASH_ITEMS]
+        if lixo_pool and iniciais_pool:
+            pool = lixo_pool if random.random() < TRASH_ROLL_RATIO else iniciais_pool
+        else:
+            pool = lixo_pool or iniciais_pool
         if not pool: pool = [("Bota Velha", 0, 5, "👢", 0, "Que nojo!")]
     else: 
         # Modifica o Tier Máximo com base no bônus do clima
@@ -955,7 +964,6 @@ async def pescar(interaction: discord.Interaction):
     nome, v_min, v_max, emoji, tier_p, frase = catch_data
     
     # Cálculo de Valor (Aplicando Clima)
-    TRASH_ITEMS = ["Bota Velha", "Lata Vazia", "Alga", "Pilha Velha"]
     is_trash = nome in TRASH_ITEMS
 
     # Fórmula: ValorBase * SorteVara * Upgrade * Clima
@@ -1559,6 +1567,18 @@ class ExplorationView(discord.ui.View):
         self.choice = "city"
         await interaction.response.defer()
         self.stop()
+
+
+# Explicação mostrada quando o player seleciona uma isca no menu de consumo.
+# Iscas não têm ação manual: o efeito é aplicado dentro de /eco pescar.
+BAIT_USAGE_HINTS = {
+    "isca": "🪱 **Isca Minhoca:** Mantenha na mochila. Ela é usada automaticamente quando você pesca — corta o lixo pela metade e aumenta o valor da captura.",
+    "isca_brilhante": "✨ **Isca Brilhante:** Não precisa usar aqui! Deixe na mochila e use `/eco pescar` — ela é gasta sozinha e dá 20% de chance de vir um peixe de Tier 2.",
+    "isca_fedorenta": "🦠 **Isca Fedorenta:** Não precisa usar aqui! Deixe na mochila e use `/eco pescar` — ela é gasta sozinha e reduz bastante a chance de vir lixo.",
+    "isca_eletrica": "⚡ **Isca Elétrica:** Não precisa usar aqui! Deixe na mochila e use `/eco pescar` — ela é gasta sozinha e garante um peixe de Tier 2 ou maior.",
+}
+
+
 class ConsumeSelect(discord.ui.Select):
     # CORREÇÃO AQUI: Adicionei 'user_id' de volta nos parênteses para não dar erro
     def __init__(self, user_id, items_dict):
@@ -1643,8 +1663,13 @@ class ConsumeSelect(discord.ui.Select):
             msg = f"ℹ️ **{item_data['name']}**: Este item é passivo! Mantenha ele no inventário e ele será usado automaticamente na próxima pescaria."
 
         # 5. ISCAS (Avisar que é automático)
-        elif item_key == "isca":
-             msg = "🪱 **Isca:** Mantenha na mochila. Ela é usada automaticamente quando você pesca para reduzir o lixo."
+        # Todas as iscas entram aqui, não só a comum: elas aparecem no dropdown
+        # por serem type 'consumable', mas quem gasta e aplica o efeito é
+        # /eco pescar. Sem cobrir as especiais elas caíam no else abaixo e o
+        # player levava "não pode ser usado através deste menu" — parecia item
+        # quebrado, e ninguém descobria que bastava pescar.
+        elif item_key in BAIT_USAGE_HINTS:
+            msg = BAIT_USAGE_HINTS[item_key]
 
         # 6. ELSE (Segurança)
         else:
@@ -2542,9 +2567,8 @@ class GaldinoView(discord.ui.View):
         row = cursor.execute("SELECT inventory, scrap FROM economy WHERE user_id = ?", (self.user_id,)).fetchone()
         inv = json.loads(row['inventory']) if row['inventory'] else {}
         
-        trash_list = ["Bota Velha", "Lata Vazia", "Alga", "Pilha Velha"]
         gain = 0
-        for t in trash_list:
+        for t in TRASH_ITEMS:
             if t in inv:
                 gain += inv[t] * 5
                 del inv[t]
@@ -2614,15 +2638,14 @@ class GaldinoView(discord.ui.View):
         # ==========================================================
         if not trap_data:
             # Conta os lixos
-            lixo_types = ["Lata Vazia", "Bota Velha", "Alga", "Pilha Velha"]
-            total_trash = sum(inv.get(t, 0) for t in lixo_types)
+            total_trash = sum(inv.get(t, 0) for t in TRASH_ITEMS)
             meta = 50
 
             if total_trash < meta:
                 # Texto da Quest Incompleta
                 intro_text = get_dialogue("galdino", "afk_machine_intro") # "Aquilo? Protótipos..."
                 embed.description = f"{intro_text}\n\n📊 **Progresso:** {total_trash}/{meta} Lixos na mochila."
-                embed.set_footer(text="Dica: Pesque lixo (Latas, Botas, Algas) para completar.")
+                embed.set_footer(text="Dica: Pesque lixo (Latas, Botas, Pneus, Sacolas, Espinhas) para completar.")
                 await interaction.response.send_message(embed=embed, ephemeral=True)
             else:
                 # Quest Completa -> Botão de Craftar
@@ -2635,7 +2658,7 @@ class GaldinoView(discord.ui.View):
                 async def craft_callback(inter):
                     # Consome 50 lixos
                     removidos = 0
-                    for t in lixo_types:
+                    for t in TRASH_ITEMS:
                         while inv.get(t, 0) > 0 and removidos < meta:
                             inv[t] -= 1
                             removidos += 1
