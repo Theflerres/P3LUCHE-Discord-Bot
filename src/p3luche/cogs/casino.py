@@ -1,10 +1,9 @@
 """
 Casino P3LUCHE — poker, blackjack, crash e slots.
 
-DESABILITADO: correções da Fase 4 (escrow, bug do Dobrar, overshoot do
-crash, house edge/RTP de crash e slots) já aplicadas e testadas — cog
-segue fora de main.py aguardando decisão explícita de reativação em
-produção (não é mais o bug de lucro excessivo do crash, já corrigido).
+ATIVO: reativado em main.py após as correções da Fase 4 (escrow, bug do
+Dobrar, overshoot do crash, house edge/RTP de crash e slots), todas
+cobertas por tests/test_casino.py.
 """
 from __future__ import annotations
 

@@ -6,10 +6,14 @@ import json
 import os
 import sqlite3
 
+from config import DB_PATH
 from economy_constants import FISH_DB
 from economy_db import V4_TABLES_SQL, seed_market_prices, sync_user_to_economy
 
-DB_PATH = os.path.join(os.getcwd(), "database", "bot.db")
+# DB_PATH vem do config (terceiro binding removido): antes este módulo derivava
+# o caminho de os.getcwd() por conta própria, ignorando qualquer override de
+# config.DB_PATH — era por aqui que a migração escrevia no banco de produção
+# mesmo com os testes repontados para um banco temporário.
 
 
 def _add_column_safe(cursor: sqlite3.Cursor, table: str, column_def: str) -> None:

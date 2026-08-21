@@ -5,6 +5,8 @@ necessárias ao bot e algumas estruturas compartilhadas usadas por diferentes co
 """
 import asyncio
 import os
+import sys
+import tempfile
 import threading
 
 import discord
@@ -22,7 +24,31 @@ if not TOKEN:
 LOG_FOLDER = os.path.join(os.getcwd(), "database")
 os.makedirs(LOG_FOLDER, exist_ok=True)
 
-DB_PATH = os.path.join(LOG_FOLDER, "bot.db")
+# Fonte única do caminho do banco. O override por env existe para que testes
+# (e qualquer execução descartável) apontem para um arquivo temporário sem
+# nunca tocar o database/bot.db de produção. Ler do ambiente no import garante
+# que os dois módulos de config — o real e o shim da raiz, que faz
+# "from src.p3luche.config import *" e copia os nomes — resolvam o mesmo valor;
+# repontar só um deles em runtime deixa o outro apontando para produção.
+def _rodando_sob_test_runner() -> bool:
+    """Detecta unittest/pytest para nunca resolver o banco de produção em teste."""
+    argv0 = (sys.argv[0] or "").replace("\\", "/").lower()
+    base = os.path.basename(argv0)
+    if "unittest" in argv0 or base.startswith("pytest") or base == "py.test":
+        return True
+    return "pytest" in sys.modules or "unittest" in sys.modules
+
+
+if os.getenv("P3LUCHE_DB_PATH"):
+    DB_PATH = os.getenv("P3LUCHE_DB_PATH")
+elif _rodando_sob_test_runner():
+    # Trava de segurança. tests/__init__.py define P3LUCHE_DB_PATH, mas o
+    # unittest só importa esse pacote quando o top-level dir é a raiz
+    # (-t .); com "discover -s tests" ele trata tests/ como top-level e pula
+    # o __init__. Sem este ramo a suíte cairia silenciosamente no banco real.
+    DB_PATH = os.path.join(tempfile.mkdtemp(prefix="p3luche-tests-"), "bot_test.db")
+else:
+    DB_PATH = os.path.join(LOG_FOLDER, "bot.db")
 CREATOR_NAME = "theflerres"
 DRIVE_FOLDER_ID = "1U8-Pz2YamB1OSP-wAaT8Wzw-3VOKM8Hc"
 # Pasta exclusiva do Jukebox no Drive (evita misturar com outros fluxos de áudio).
