@@ -1,4 +1,5 @@
 import asyncio
+import math
 import re
 import sqlite3
 import unittest
@@ -354,10 +355,14 @@ class CrashOvershootTests(unittest.IsolatedAsyncioTestCase):
         # fixo os instantes seriam multiplo + latencia acumulada, e os valores
         # sairiam fora dessa grade.
         for m in publicados:
-            instante = (m - 1.0) / taxa
-            self.assertAlmostEqual(instante % casino.CRASH_TICK_SECONDS, 0.0, places=6)
+            instante = math.log(m) / casino.CRASH_GROWTH_K
+            resto = instante % casino.CRASH_TICK_SECONDS
+            # Distancia ate o multiplo mais proximo: o resto pode cair logo
+            # abaixo do tick por arredondamento de ponto flutuante.
+            fora_da_grade = min(resto, casino.CRASH_TICK_SECONDS - resto)
+            self.assertAlmostEqual(fora_da_grade, 0.0, places=6)
         # A edicao de 3s custa ticks: alguns sao pulados, nao enfileirados.
-        ticks_totais = int(((11.0 - 1.0) / taxa) / casino.CRASH_TICK_SECONDS)
+        ticks_totais = int((math.log(11.0) / casino.CRASH_GROWTH_K) / casino.CRASH_TICK_SECONDS)
         self.assertLess(len(publicados), ticks_totais)
 
     async def test_cashout_still_possible_before_crash_and_pays_shown_multiplier(self):
@@ -479,15 +484,28 @@ class CrashOvershootTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_wallet(conn, uid), 1000)
 
     def test_cadencia_e_duracao_cabem_nos_limites(self):
-        """~5 edições / 5s por canal, e a rodada mais longa tem que caber no
+        """~5 edicoes / 5s por canal, e a rodada mais longa tem que caber no
         timeout de 120s da view.
         """
         self.assertGreaterEqual(casino.CRASH_TICK_SECONDS, 1.0)
-        duracao_maxima = (casino.CRASH_MAX_MULTIPLIER - 1.0) / casino.CRASH_RATE_MIN
+        duracao_maxima = math.log(casino.CRASH_MAX_MULTIPLIER) / casino.CRASH_GROWTH_K
         self.assertLess(duracao_maxima, 120)
-        # Velocidade média preservada (era ~0.6x por segundo).
-        media = (casino.CRASH_RATE_MIN + casino.CRASH_RATE_MAX) / 2
-        self.assertAlmostEqual(media, 0.6)
+
+    def test_rodada_mediana_mostra_varias_atualizacoes(self):
+        """Regressao do "o numero some": com subida linear a 0.6x/s, a rodada
+        mediana (1.82x, dado o house edge de 9%) durava 1.4s e terminava
+        ANTES do primeiro tick — mais da metade das partidas ia de 1.00x
+        direto para CRASH, sem nenhum numero no meio.
+        """
+        mediana = (1 - casino.CRASH_HOUSE_EDGE) / 0.5
+        duracao = math.log(mediana) / casino.CRASH_GROWTH_K
+        atualizacoes = int(duracao / casino.CRASH_TICK_SECONDS)
+        self.assertGreaterEqual(atualizacoes, 5)
+
+        # E os primeiros passos precisam ser pequenos: e onde quase toda
+        # rodada vive, entao um salto grande ali reproduz o mesmo sintoma.
+        primeiro = math.exp(casino.CRASH_GROWTH_K * casino.CRASH_TICK_SECONDS)
+        self.assertLess(primeiro - 1.0, 0.15)
 
 
 class CrashHouseEdgeFormulaTests(unittest.TestCase):

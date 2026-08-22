@@ -8,6 +8,7 @@ cobertas por tests/test_casino.py.
 from __future__ import annotations
 
 import asyncio
+import math
 import random
 import time
 
@@ -389,13 +390,29 @@ CRASH_MAX_MULTIPLIER = 30.0
 # do início da rodada (`inicio + n*TICK`), nunca a partir do fim da edição
 # anterior. Um loop de atraso fixo ("edita, depois dorme 2s") soma a latência
 # da edição ao intervalo — com edição de ~2s o jogador via 4s entre números.
-CRASH_TICK_SECONDS = 2.0
+# 1.5s = 3.33 edições por 5s, com folga sob o limite. Descer abaixo de ~1s
+# encostaria no teto e passaria a render 429 — e um contador realmente fluido
+# (vários quadros por segundo) é impossível: no Discord a mensagem só muda por
+# requisição HTTP, então a cadência máxima é essa, não uma escolha de código.
+CRASH_TICK_SECONDS = 1.5
 
-# Subida do multiplicador por segundo, sorteada por rodada. Média de 0.6/s
-# mantém a mesma velocidade de antes; o piso de 0.4/s garante que o teto de
-# 30x leve (30-1)/0.4 ≈ 72s, dentro do timeout de 120s da view.
-CRASH_RATE_MIN = 0.4
-CRASH_RATE_MAX = 0.8
+# Crescimento EXPONENCIAL: multiplicador(t) = e^(k*t).
+#
+# Antes a subida era linear (~0.6x/s), e isso não conversava com a distribuição
+# do crash_point, que se concentra embaixo: com house edge de 9% a mediana é
+# 1.82x, que a 0.6x/s chegava em 1.4s. Ou seja, MAIS DA METADE das rodadas
+# terminava antes do primeiro tick — o jogador via 1.00x e, em seguida, CRASH,
+# sem nenhum número no meio. Era essa a sensação de "o número some".
+#
+# Exponencial dá passos pequenos no começo (1.00 → 1.09 → 1.18), que é onde
+# quase toda rodada vive, e acelera depois. A rodada mediana passa a durar ~11s
+# com ~7 atualizações. Não muda EV nem house edge: a distribuição do
+# crash_point continua idêntica, só o tempo até chegar lá é outro.
+#
+# k=0.055 põe o teto de 30x em ~62s, dentro do timeout de 120s da view.
+# Aumentar k deixa as rodadas mais rápidas e mais picotadas; diminuir, o
+# contrário.
+CRASH_GROWTH_K = 0.055
 
 
 def _draw_crash_point(house_edge: float = CRASH_HOUSE_EDGE) -> float:
@@ -516,10 +533,9 @@ async def crash(interaction: discord.Interaction, aposta: int):
     await interaction.response.defer()
     crash_point = _draw_crash_point()
     view = CrashView(interaction.user.id, aposta, crash_point)
-    taxa = random.uniform(CRASH_RATE_MIN, CRASH_RATE_MAX)
     # O multiplicador é função do relógio, não de incrementos acumulados: uma
     # edição lenta ou pulada não desloca mais a rodada nem o ponto de queda.
-    crash_em = (crash_point - 1.0) / taxa
+    crash_em = math.log(crash_point) / CRASH_GROWTH_K
 
     _crash_rounds_ativos.add(interaction.user.id)
     pendente = None
@@ -554,7 +570,7 @@ async def crash(interaction: discord.Interaction, aposta: int):
                 continue
             # Só atualiza o valor pago depois de decidir publicá-lo: o saque
             # nunca paga um número que o jogador não chegou a ver.
-            view.multiplier = 1.0 + taxa * proximo
+            view.multiplier = math.exp(CRASH_GROWTH_K * proximo)
             pendente = asyncio.create_task(_edit_multiplier(msg_obj, view.multiplier, medida))
 
         await _drenar(pendente)
