@@ -262,7 +262,7 @@ class CrashOvershootTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(casino, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
              patch.object(casino, "_draw_crash_point", return_value=2.0), \
              patch.object(casino.random, "uniform", return_value=0.5), \
-             patch.object(casino.asyncio, "sleep", new=AsyncMock()):
+             patch.object(casino, "_crash_wait", new=AsyncMock()):
             await casino.crash.callback(interaction, 100)
 
         shown_multipliers = []
@@ -293,6 +293,80 @@ class CrashOvershootTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(view.cashed_out)
         self.assertEqual(get_wallet(conn, 1), int(100 * 1.8))
+
+    async def test_cashout_depois_do_crash_e_recusado(self):
+        """Regressão: entre o crash e a edição final da mensagem (janela que
+        sob rate limit durava segundos) o botão continuava vivo e pagava o
+        multiplicador pré-crash. `ended` fecha essa janela.
+        """
+        view = casino.CrashView(1, 100, crash_point=2.0)
+        view.multiplier = 1.9
+        view.ended.set()
+        conn = _make_conn()
+        ensure_user(conn, 1, "Tester")
+
+        interaction = _make_interaction(1)
+        with patch.object(casino, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await view.cashout.callback(interaction)
+
+        self.assertFalse(view.cashed_out)
+        self.assertEqual(get_wallet(conn, 1), 0)
+        interaction.response.edit_message.assert_not_called()
+        self.assertIn("crashou", interaction.response.send_message.call_args.args[0])
+
+    async def test_saque_interrompe_o_loop_antes_da_proxima_edicao(self):
+        """O saque marca `ended` de forma síncrona, então o loop nem chega a
+        emitir a edição seguinte, que sobrescreveria a confirmação do saque.
+        """
+        conn = _make_conn()
+        uid = 121
+        ensure_user(conn, uid, "Tester")
+        modify_wallet(conn, uid, 1000, "Tester")
+
+        interaction = _make_interaction(uid)
+        msg = SimpleNamespace(edit=AsyncMock())
+        interaction.followup.send = AsyncMock(return_value=msg)
+
+        async def saca_no_primeiro_tick(view, _seconds):
+            view.cashed_out = True
+            view.ended.set()
+
+        with patch.object(casino, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+             patch.object(casino, "_draw_crash_point", return_value=50.0), \
+             patch.object(casino.random, "uniform", return_value=0.5), \
+             patch.object(casino, "_crash_wait", new=saca_no_primeiro_tick):
+            await casino.crash.callback(interaction, 100)
+
+        self.assertEqual(msg.edit.call_count, 1)
+        self.assertNotIn("CRASH", msg.edit.call_args.kwargs.get("content", ""))
+        self.assertNotIn(uid, casino._crash_rounds_ativos)
+
+    async def test_rodada_simultanea_do_mesmo_jogador_e_recusada(self):
+        """Rodadas paralelas do mesmo usuário multiplicavam as requisições no
+        mesmo bucket de canal — origem do travamento em DM.
+        """
+        conn = _make_conn()
+        uid = 122
+        ensure_user(conn, uid, "Tester")
+        modify_wallet(conn, uid, 1000, "Tester")
+
+        interaction = _make_interaction(uid)
+        casino._crash_rounds_ativos.add(uid)
+        try:
+            with patch.object(casino, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+                await casino.crash.callback(interaction, 100)
+        finally:
+            casino._crash_rounds_ativos.discard(uid)
+
+        self.assertIn("em andamento", interaction.response.send_message.call_args.args[0])
+        self.assertEqual(get_wallet(conn, uid), 1000)
+
+    def test_cadencia_de_edicao_respeita_o_rate_limit_do_discord(self):
+        """~5 edições / 5s por canal. O tick antigo (0.5s) era 4x acima."""
+        self.assertGreaterEqual(casino.CRASH_TICK_SECONDS, 1.0)
+        # Velocidade de subida por segundo preservada (era 0.2-1.0/s).
+        self.assertAlmostEqual(casino.CRASH_STEP_MIN / casino.CRASH_TICK_SECONDS, 0.2)
+        self.assertAlmostEqual(casino.CRASH_STEP_MAX / casino.CRASH_TICK_SECONDS, 1.0)
 
 
 class CrashHouseEdgeFormulaTests(unittest.TestCase):

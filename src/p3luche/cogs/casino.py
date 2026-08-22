@@ -377,9 +377,25 @@ async def blackjack(interaction: discord.Interaction, aposta: int):
 CRASH_HOUSE_EDGE = 0.09
 # Teto prático do multiplicador: sem ele, um sorteio extremo de r muito
 # pequeno geraria um crash_point gigantesco e a rodada rodaria por muito
-# mais que os 120s de timeout da view (incrementos de ~0.1-0.5 a cada 0.5s).
+# mais que os 120s de timeout da view (~0.6 de subida por segundo).
 # Recorta só a cauda extrema (~1.8% de probabilidade com he=9%).
 CRASH_MAX_MULTIPLIER = 30.0
+
+# Cadência de atualização da mensagem. O Discord limita edições de mensagem
+# a ~5 requisições / 5s POR CANAL (em DM o bucket é o canal da DM). O valor
+# antigo (0.5s) mandava 2 edições/s — 4x acima do limite — então o
+# rate limiter do discord.py passava a dormir para respeitar os 429: o
+# multiplicador congelava, edições atrasadas chegavam fora de ordem (o
+# número "sumia"/voltava) e, com várias rodadas simultâneas, a fila HTTP
+# global do bot atrasava até o clique do Cash Out demorar segundos para
+# registrar. 2.0s deixa ~2.5x de folga no bucket do canal.
+CRASH_TICK_SECONDS = 2.0
+# Incremento por tick. Calibrado para manter a MESMA velocidade de subida
+# por segundo de antes (uniform(0.1, 0.5) a cada 0.5s = 0.2-1.0 por segundo),
+# de modo que a duração da rodada e a sensação do jogo não mudam — só a
+# quantidade de requisições HTTP cai 4x.
+CRASH_STEP_MIN = 0.4
+CRASH_STEP_MAX = 2.0
 
 
 def _draw_crash_point(house_edge: float = CRASH_HOUSE_EDGE) -> float:
@@ -397,6 +413,11 @@ class CrashView(discord.ui.View):
         self.cashed_out = False
         self.multiplier = 1.0
         self.message: discord.Message | None = None
+        # Fecha a rodada (saque OU crash). Serve para dois fins:
+        # 1) o loop acorda na hora do saque em vez de dormir o tick inteiro;
+        # 2) marca o fim ANTES de qualquer await, fechando a janela em que o
+        #    botão ainda estava clicável depois do crash real.
+        self.ended = asyncio.Event()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if interaction.user.id != self.user_id:
@@ -406,9 +427,14 @@ class CrashView(discord.ui.View):
 
     @discord.ui.button(label="💰 Cash Out", style=discord.ButtonStyle.success)
     async def cashout(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if self.cashed_out:
-            return await interaction.response.send_message("❌ Já sacou.", ephemeral=True)
+        if self.ended.is_set():
+            aviso = "❌ Já sacou." if self.cashed_out else "💥 Tarde demais — o avião já crashou."
+            return await interaction.response.send_message(aviso, ephemeral=True)
+        # Encerra a rodada de forma síncrona, antes do primeiro await: o loop
+        # não chega a disparar mais nenhuma edição que sobrescreveria a
+        # confirmação do saque.
         self.cashed_out = True
+        self.ended.set()
         for child in self.children:
             child.disabled = True
         winnings = int(self.aposta * self.multiplier)
@@ -420,52 +446,87 @@ class CrashView(discord.ui.View):
         self.stop()
 
 
+async def _crash_wait(view: CrashView, seconds: float) -> None:
+    """Espera o próximo tick, mas acorda imediatamente se o jogador sacar."""
+    try:
+        await asyncio.wait_for(view.ended.wait(), timeout=seconds)
+    except asyncio.TimeoutError:
+        pass
+
+
+# Uma rodada de crash por jogador. Sem isso, o mesmo usuário podia abrir
+# várias rodadas em paralelo e cada uma somava requisições no mesmo bucket
+# de canal (e no limite global do bot), recriando o travamento.
+_crash_rounds_ativos: set[int] = set()
+
+
 @casino_group.command(name="crash", description="Avião sobe até crashar — saque a tempo!")
 @app_commands.describe(aposta="Valor em Sachês")
 async def crash(interaction: discord.Interaction, aposta: int):
     ok, msg = _check_bet(interaction, aposta)
     if not ok:
         return await interaction.response.send_message(msg, ephemeral=True)
+    if interaction.user.id in _crash_rounds_ativos:
+        return await interaction.response.send_message(
+            "⏳ Você já tem uma rodada de crash em andamento — termine ela primeiro.",
+            ephemeral=True,
+        )
     modify_wallet(get_bot_instance().db_conn, interaction.user.id, -aposta, interaction.user.display_name)
 
     await interaction.response.defer()
     crash_point = _draw_crash_point()
     view = CrashView(interaction.user.id, aposta, crash_point)
     multiplier = 1.0
-    msg_obj = await interaction.followup.send(
-        f"🚀 Avião decolando! Multiplicador: **{multiplier:.2f}x**",
-        view=view,
-        wait=True,
-    )
-    view.message = msg_obj
-
-    while not view.cashed_out:
-        proximo = multiplier + random.uniform(0.1, 0.5)
-        # Nunca deixa o multiplicador exposto/clicável passar do
-        # crash_point: se o próximo incremento ultrapassaria, o crash já
-        # aconteceu — quebra ANTES de publicar esse valor ou dar mais uma
-        # janela de 0.5s com o Cash Out ainda ativo além do ponto real de
-        # queda.
-        if proximo >= crash_point:
-            break
-        multiplier = proximo
-        view.multiplier = multiplier
-        try:
-            await msg_obj.edit(
-                content=f"🚀 Multiplicador: **{multiplier:.2f}x**",
-                view=view,
-            )
-        except discord.HTTPException:
-            break
-        await asyncio.sleep(0.5)
-
-    if not view.cashed_out:
-        for child in view.children:
-            child.disabled = True
-        await msg_obj.edit(
-            content=f"💥 **CRASH** em {crash_point:.2f}x! Você perdeu {aposta} Sachês.",
+    _crash_rounds_ativos.add(interaction.user.id)
+    try:
+        msg_obj = await interaction.followup.send(
+            f"🚀 Avião decolando! Multiplicador: **{multiplier:.2f}x**",
             view=view,
+            wait=True,
         )
+        view.message = msg_obj
+
+        while not view.ended.is_set():
+            proximo = multiplier + random.uniform(CRASH_STEP_MIN, CRASH_STEP_MAX)
+            # Nunca deixa o multiplicador exposto/clicável passar do
+            # crash_point: se o próximo incremento ultrapassaria, o crash já
+            # aconteceu — quebra ANTES de publicar esse valor ou dar mais uma
+            # janela de tick com o Cash Out ainda ativo além do ponto real de
+            # queda.
+            if proximo >= crash_point:
+                break
+            multiplier = proximo
+            view.multiplier = multiplier
+            # Recheca na borda do await: o saque pode ter entrado enquanto o
+            # tick dormia, e uma edição em voo sobrescreveria a confirmação.
+            if view.ended.is_set():
+                break
+            try:
+                await msg_obj.edit(
+                    content=f"🚀 Multiplicador: **{multiplier:.2f}x**",
+                    view=view,
+                )
+            except discord.HTTPException:
+                break
+            await _crash_wait(view, CRASH_TICK_SECONDS)
+
+        if not view.cashed_out:
+            # Marca o fim antes do await da edição final: durante essa
+            # janela (que sob rate limit podia durar segundos) o botão
+            # continuava vivo e pagava o multiplicador pré-crash.
+            view.ended.set()
+            for child in view.children:
+                child.disabled = True
+            try:
+                await msg_obj.edit(
+                    content=f"💥 **CRASH** em {crash_point:.2f}x! Você perdeu {aposta} Sachês.",
+                    view=view,
+                )
+            except discord.HTTPException:
+                pass
+            view.stop()
+    finally:
+        _crash_rounds_ativos.discard(interaction.user.id)
 
 
 # --- SLOTS ---
