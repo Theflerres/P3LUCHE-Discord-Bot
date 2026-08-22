@@ -40,6 +40,7 @@ from economy_db import (
     get_scrap,
     get_wallet,
     log_fish_sale,
+    modify_scrap,
     modify_wallet,
     seed_market_prices,
     set_cooldown,
@@ -1425,65 +1426,152 @@ async def explorar(interaction: discord.Interaction):
 
     get_bot_instance().db_conn.commit()
 
+# A vara inicial não é comprável nem fica guardada no inventário: ela é
+# implícita (default de user_rods.current_rod e sempre injetada em
+# `owned_rods` no /eco saldo). Não existe flag nem tier exclusivo marcando-a
+# — o tier 0 é compartilhado com a vara_treino —, então a identificação é
+# pela chave literal mesmo. Presenteá-la deixaria o remetente sem como pescar
+# caso uma cópia tenha ido parar no inventário dele por algum fluxo legado.
+INITIAL_ROD_KEY = "vara_bambu"
+GIFT_BLOCKED_KEYS = frozenset({INITIAL_ROD_KEY})
+
+
+def _item_display_name(key: str) -> str:
+    """Nome que o jogador vê na mochila para uma chave de inventário."""
+    return SHOP_ITEMS.get(key, {}).get("name", key)
+
+
+def _resolve_gift_key(raw: str, inv: dict) -> str | None:
+    """Traduz o que o jogador digitou para a chave interna do item.
+
+    Aceita a chave interna ('caixa_misteriosa'), o nome de exibição
+    ('Caixa Misteriosa' — o que o /eco saldo mostra, e por isso o que o
+    jogador tenta digitar) e chaves livres de inventário que não existem na
+    loja (peixes, lixo). Sem isso o comando só aceitava a chave interna e
+    respondia "Item inválido" para o nome exibido na própria mochila.
+    """
+    if raw in SHOP_ITEMS:
+        return raw
+    alvo = raw.strip().casefold()
+    for key, data in SHOP_ITEMS.items():
+        if data["name"].casefold() == alvo:
+            return key
+    for key in inv:
+        if key.casefold() == alvo:
+            return key
+    return None
+
+
+def _owned_inventory_key(inv: dict, key: str) -> str | None:
+    """Sob qual chave o remetente realmente guarda esse item, se guarda.
+
+    O keyspace do inventário está partido em produção: /eco comprar sempre
+    gravou pela chave interna, enquanto o presentear gravava itens flex pelo
+    nome de exibição. Cópias antigas existem sob as duas grafias, então a
+    remoção precisa achar a que o jogador tem de fato — a entrega, essa, é
+    sempre pela chave interna (ver mais abaixo), o que vai convergindo o
+    keyspace conforme os itens circulam.
+    """
+    if inv.get(key, 0) > 0:
+        return key
+    display = _item_display_name(key)
+    if display != key and inv.get(display, 0) > 0:
+        return display
+    return None
+
+
+async def _presentear_autocomplete(interaction: discord.Interaction, current: str):
+    """Sugere só o que o remetente tem na mochila — presentear exige posse.
+
+    A lista não inclui itens da loja: sugerir algo que o jogador não possui
+    levaria direto a uma recusa, já que o comando não compra nada.
+    """
+    try:
+        conn = get_bot_instance().db_conn
+        inv = get_inventory(conn, interaction.user.id)
+    except Exception:
+        inv = {}
+
+    termo = (current or "").strip().casefold()
+    vistos = set()
+    escolhas = []
+
+    for key, qtd in sorted(inv.items(), key=lambda kv: _item_display_name(kv[0]).casefold()):
+        if qtd <= 0 or key in GIFT_BLOCKED_KEYS:
+            continue
+        interno = _resolve_gift_key(key, inv) or key
+        if interno in vistos or interno in GIFT_BLOCKED_KEYS:
+            continue
+        rotulo = f"{_item_display_name(interno)} (x{qtd})"
+        if not termo or termo in rotulo.casefold() or termo in interno.casefold():
+            vistos.add(interno)
+            escolhas.append(app_commands.Choice(name=rotulo[:100], value=interno))
+
+    return escolhas[:25]
+
+
 @eco_group.command(name="presentear", description="Dê um item a um amigo.")
+@app_commands.describe(item="Um item que você já tem na mochila (a Vara de Bambu não pode ser enviada).")
+@app_commands.autocomplete(item=_presentear_autocomplete)
 async def presentear(interaction: discord.Interaction, amigo: discord.Member, item: str):
     ID_CRIADOR = 299323165937500160
     ID_DONO = 541680099477422110
 
     if amigo.id == interaction.user.id: return await interaction.response.send_message("🎁 Use /eco comprar.", ephemeral=True)
-    if item not in SHOP_ITEMS: return await interaction.response.send_message("❌ Item inválido.", ephemeral=True)
 
-    # --- CHECAGEM DE ITENS ESPECIAIS/SECRETOS (mesma regra de /eco comprar) ---
-    if item == "item_criador" and interaction.user.id != ID_CRIADOR:
-        return await interaction.response.send_message("⛔ Acesso Negado.", ephemeral=True)
-    if item == "item_dono" and interaction.user.id != ID_DONO:
-        return await interaction.response.send_message("🔥 Pesado demais para você.", ephemeral=True)
-
-    data = SHOP_ITEMS[item]
-    price = data['price']
     conn = get_bot_instance().db_conn
     sender_id = interaction.user.id
-
-    sender_wallet = get_wallet(conn, sender_id)
-    if sender_wallet < price: return await interaction.response.send_message(f"💸 Falta grana ({price}).", ephemeral=True)
-
     sender_inv = get_inventory(conn, sender_id)
 
-    # Item de preço 0 só pode ser presenteado se o remetente já o possuir de fato
-    # (evita criar itens exclusivos/míticos do nada via um "presente" gratuito).
-    owned_key = None
-    if sender_inv.get(item, 0) > 0:
-        owned_key = item
-    elif sender_inv.get(data['name'], 0) > 0:
-        owned_key = data['name']
-    if price == 0 and owned_key is None:
-        return await interaction.response.send_message("🚫 Você não possui esse item para presentear.", ephemeral=True)
+    chave = _resolve_gift_key(item, sender_inv)
+    if chave is None:
+        return await interaction.response.send_message("❌ Item inválido.", ephemeral=True)
 
-    # 'rod_tier' (gate de "já tem vara melhor") não tem equivalente na v4 —
-    # só existe na tabela legada. Garante que a linha legada do destinatário
-    # existe antes de ler esse campo específico.
+    if chave in GIFT_BLOCKED_KEYS:
+        return await interaction.response.send_message(
+            "🎣 A **Vara de Bambu** é o equipamento inicial e não pode ser presenteada — sem ela ninguém consegue começar a pescar.",
+            ephemeral=True,
+        )
+
+    # --- CHECAGEM DE ITENS ESPECIAIS/SECRETOS (mesma regra de /eco comprar) ---
+    if chave == "item_criador" and sender_id != ID_CRIADOR:
+        return await interaction.response.send_message("⛔ Acesso Negado.", ephemeral=True)
+    if chave == "item_dono" and sender_id != ID_DONO:
+        return await interaction.response.send_message("🔥 Pesado demais para você.", ephemeral=True)
+
+    data = SHOP_ITEMS.get(chave, {})
+    nome_item = _item_display_name(chave)
+
+    # Presentear é SEMPRE transferência de uma cópia que o remetente já tem —
+    # nunca uma compra disfarçada. Sem posse não há presente, e a carteira não
+    # é tocada em nenhum caminho (nem para cobrar, nem para recusar por saldo).
+    owned_key = _owned_inventory_key(sender_inv, chave)
+    if owned_key is None:
+        return await interaction.response.send_message("🚫 Você não possui esse item.", ephemeral=True)
+
     ensure_user(conn, amigo.id, amigo.name)
     sync_user_to_economy(conn, amigo.id)
-    receiver_row = conn.execute("SELECT rod_tier FROM economy WHERE user_id = ?", (amigo.id,)).fetchone()
-    receiver_rod_tier = receiver_row['rod_tier'] if receiver_row and receiver_row['rod_tier'] else 0
 
-    msg = ""
-    if data['type'] == 'rod':
-        if receiver_rod_tier >= data['tier']: return await interaction.response.send_message(f"⚠️ {amigo.name} já tem vara melhor.", ephemeral=True)
-        conn.execute("UPDATE economy SET rod_tier = ? WHERE user_id = ?", (data['tier'], amigo.id))
-        set_current_rod(conn, amigo.id, data['key'])
-        msg = f"🎣 **Presente:** {data['name']} entregue!"
-    elif data['type'] == 'flex':
-        add_inventory_item(conn, amigo.id, data['name'], 1)
-        msg = f"💎 **Luxo:** {data['name']} entregue!"
-    else: return await interaction.response.send_message("❌ Só pode dar Varas ou Flex.", ephemeral=True)
+    add_inventory_item(conn, sender_id, owned_key, -1)
 
-    # Item gratuito: consome a cópia do remetente (é uma transferência, não uma criação).
-    if price == 0 and owned_key is not None:
-        add_inventory_item(conn, sender_id, owned_key, -1)
+    # Entrega SEMPRE pela chave interna — inclusive itens flex, que antes eram
+    # gravados por data['name'] e acabavam criando uma segunda grafia do mesmo
+    # item no inventário do destinatário.
+    add_inventory_item(conn, amigo.id, chave, 1)
 
-    try_spend_wallet(conn, sender_id, price, interaction.user.name)
-    await interaction.response.send_message(f"🎁 **Enviado!**\n{msg}")
+    # Vara não tem tratamento especial: entra na mochila como qualquer outro
+    # item e o destinatário equipa quando quiser pelo menu do /eco saldo (o
+    # `owned_rods` é montado a partir do inventário). Nada de set_current_rod()
+    # aqui — trocar a vara equipada de outra pessoa sem ela pedir tirava dela
+    # a escolha, e podia até rebaixar o equipamento em uso.
+    if data.get('type') == 'flex':
+        msg = f"💎 **Luxo:** {nome_item} entregue!"
+    else:
+        msg = f"🎁 **Presente:** {nome_item} entregue!"
+
+    await interaction.response.send_message(
+        f"🎁 **Enviado para {amigo.name}!**\n{msg}\n🎒 Saiu da sua mochila."
+    )
 
 # --- CLASSES DE INTERFACE DO INVENTÁRIO (DROPDOWN) ---
 
@@ -1610,52 +1698,58 @@ class ConsumeSelect(discord.ui.Select):
 
         # Pegamos o ID de quem clicou (Mais seguro que usar o salvo no init)
         user_id = interaction.user.id
-        cursor = get_bot_instance().db_conn.cursor()
-        
-        # Recarrega inventário para garantir que não houve dupe
-        row = cursor.execute("SELECT inventory, wallet FROM economy WHERE user_id = ?", (user_id,)).fetchone()
-        if not row: return
-        
-        inv = json.loads(row['inventory'])
-        wallet = row['wallet']
-        
+        conn = get_bot_instance().db_conn
+
+        # Lê da camada v4 (user_inventory), não da tabela legada `economy`.
+        # Ler/gravar a legada aqui era o bug do "item usado que volta": a
+        # remoção ficava só no JSON legado, e a v4 — que nunca era
+        # decrementada — sobrescrevia esse JSON via sync_user_to_economy() no
+        # comando seguinte, ressuscitando o item. Como sync_user_from_economy()
+        # só SOMA (nunca apaga uma chave que sumiu do JSON), uma remoção
+        # gravada apenas na legada não tem como chegar na v4.
+        inv = get_inventory(conn, user_id)
+
         if inv.get(item_key, 0) <= 0:
             return await interaction.response.send_message("❌ Você não tem mais este item.", ephemeral=True)
 
-        msg = "" 
+        msg = ""
         item_data = SHOP_ITEMS.get(item_key, {})
-        
+
+        # Itens passivos (buffs e iscas) NÃO são gastos aqui — quem consome é
+        # /eco pescar. Só os ramos abaixo chamam add_inventory_item().
+
         # --- LÓGICA DE USO DOS ITENS ---
 
         # 1. ENERGÉTICO (Reseta Cooldown)
         if item_key == "energetico":
-            inv[item_key] -= 1
+            # Consome ANTES de aplicar o efeito: se o efeito falhar, o jogador
+            # perde o item sem o bônus — o inverso (efeito antes do consumo)
+            # devolveria o bônus com o item intacto, que é justamente o dupe.
+            add_inventory_item(conn, user_id, item_key, -1)
             # Corrigido: escrevia em 'last_fish_time', uma coluna órfã nunca
             # lida pela checagem real de cooldown (que usa 'last_fish') —
             # o item não fazia NADA. Mesmo padrão de reset já usado
             # corretamente no evento "Energético Perdido" do drone.
-            set_cooldown(get_bot_instance().db_conn, user_id, "last_fish", None)
+            set_cooldown(conn, user_id, "last_fish", None)
             msg = "⚡ **Energético bebido!** Você está pilhado! O tempo de espera da pesca foi zerado."
 
         # 2. CAIXA MISTERIOSA (Sorteio)
         elif item_key == "caixa_misteriosa":
-            inv[item_key] -= 1
+            add_inventory_item(conn, user_id, item_key, -1)
             premio = random.randint(100, 1000)
-            wallet += premio
-            cursor.execute("UPDATE economy SET wallet = ? WHERE user_id = ?", (wallet, user_id))
+            modify_wallet(conn, user_id, premio, interaction.user.name)
             msg = f"🎁 **Caixa Aberta!** Você encontrou 💰 **{premio} Sachês** dentro dela."
 
         # 3. REDE DE MÃO (Pesca 3 itens aleatórios instantâneos)
         elif item_key == "rede":
-            inv[item_key] -= 1
+            add_inventory_item(conn, user_id, item_key, -1)
             # Sorteia 3 recompensas simples (dinheiro) para simular pesca
             lucro_rede = 0
             for _ in range(3):
                 val = random.randint(10, 50)
                 lucro_rede += val
-            
-            wallet += lucro_rede
-            cursor.execute("UPDATE economy SET wallet = ? WHERE user_id = ?", (wallet, user_id))
+
+            modify_wallet(conn, user_id, lucro_rede, interaction.user.name)
             msg = f"🕸️ **Rede lançada!** Você puxou um monte de tralha e peixes pequenos, lucrando 💰 **{lucro_rede} Sachês**."
 
         # 4. BUFFS NOVOS (Ímã, Firewall, Chip)
@@ -1675,12 +1769,8 @@ class ConsumeSelect(discord.ui.Select):
         else:
             msg = f"❓ O item **{item_data.get('name', item_key)}** não pode ser usado através deste menu."
 
-        # Salva alterações (se gastou algo)
-        if inv.get(item_key, 0) <= 0 and item_key in inv:
-            del inv[item_key] 
-            
-        cursor.execute("UPDATE economy SET inventory = ? WHERE user_id = ?", (json.dumps(inv), user_id))
-        get_bot_instance().db_conn.commit()
+        # add_inventory_item()/modify_wallet() já commitam dentro da própria
+        # transação atômica — não há nada pendente para gravar aqui.
 
         # SEGURANÇA FINAL
         if not msg:
@@ -2563,19 +2653,22 @@ class GaldinoView(discord.ui.View):
     # --- BOTÃO 1: RECICLAGEM (Gera Sucata) ---
     @discord.ui.button(label="Reciclar Sucata", style=discord.ButtonStyle.success, emoji="♻️", row=0)
     async def recycle_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cursor = get_bot_instance().db_conn.cursor()
-        row = cursor.execute("SELECT inventory, scrap FROM economy WHERE user_id = ?", (self.user_id,)).fetchone()
-        inv = json.loads(row['inventory']) if row['inventory'] else {}
-        
+        conn = get_bot_instance().db_conn
+        # Camada v4, não a tabela legada: apagar o lixo só do JSON de
+        # `economy.inventory` era desfeito por sync_user_to_economy() no
+        # comando seguinte — o lixo voltava e a sucata paga ficava, o que
+        # tornava reciclar o mesmo lixo em loop uma fonte infinita de sucata.
+        inv = get_inventory(conn, self.user_id)
+
         gain = 0
         for t in TRASH_ITEMS:
-            if t in inv:
-                gain += inv[t] * 5
-                del inv[t]
-        
+            qtd = inv.get(t, 0)
+            if qtd > 0:
+                gain += qtd * 5
+                add_inventory_item(conn, self.user_id, t, -qtd)
+
         if gain > 0:
-            cursor.execute("UPDATE economy SET inventory = ?, scrap = scrap + ? WHERE user_id = ?", (json.dumps(inv), gain, self.user_id))
-            get_bot_instance().db_conn.commit()
+            modify_scrap(conn, self.user_id, gain)
             msg = f"🔧 **Galdino:** 'Isso sim é material!'\n⚙️ Ganhou: {gain} Sucata."
         else:
             msg = "🔧 **Galdino:** 'Sua mochila tá limpa demais. Suma daqui!'"

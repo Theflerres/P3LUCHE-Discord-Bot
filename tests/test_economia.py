@@ -417,9 +417,10 @@ class CompraQuantidadeModalTests(unittest.IsolatedAsyncioTestCase):
 
 
 class PresentearTests(unittest.IsolatedAsyncioTestCase):
-    """/eco presentear migrado pra v4 (saldo/inventário), preservando a
-    checagem de posse pra presentes grátis e o campo legado rod_tier (sem
-    equivalente na v4).
+    """/eco presentear é transferência pura: exige posse, move o item do
+    inventário do remetente para o do destinatário e nunca toca na carteira.
+    Não compra o item para quem não o tem, e não equipa nada no destinatário
+    (nem varas) — quem equipa é o próprio jogador, pelo menu do /eco saldo.
     """
 
     def _make_conn(self):
@@ -431,41 +432,50 @@ class PresentearTests(unittest.IsolatedAsyncioTestCase):
             response=SimpleNamespace(send_message=AsyncMock()),
         )
 
-    async def test_flex_gift_deducts_sender_and_grants_receiver(self):
+    async def test_flex_gift_transfers_owned_copy_without_touching_wallet(self):
         conn = self._make_conn()
         sender_id, receiver_id = 40, 41
         ensure_user(conn, sender_id, "Sender")
         modify_wallet(conn, sender_id, 6000, "Sender")
+        add_inventory_item(conn, sender_id, "certificado", 1)
 
         interaction = self._make_interaction(sender_id)
         amigo = SimpleNamespace(id=receiver_id, name="Amigo")
         with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
             await economia.presentear.callback(interaction, amigo, "certificado")
 
-        self.assertEqual(get_wallet(conn, sender_id), 6000 - 5000)
-        self.assertEqual(get_inventory(conn, receiver_id).get("Certificado de Dono"), 1)
+        # Transferência: a cópia sai do remetente e a carteira não é tocada
+        # (presentear não é mais uma compra disfarçada).
+        self.assertEqual(get_wallet(conn, sender_id), 6000)
+        self.assertEqual(get_inventory(conn, sender_id).get("certificado", 0), 0)
+        # Entrega pela CHAVE interna, não pelo nome de exibição: gravar por
+        # data['name'] criava uma segunda grafia do mesmo item no inventário.
+        self.assertEqual(get_inventory(conn, receiver_id).get("certificado"), 1)
+        self.assertEqual(get_inventory(conn, receiver_id).get("Certificado de Dono", 0), 0)
         self.assertIn("Enviado", interaction.response.send_message.call_args.args[0])
 
-    async def test_insufficient_balance_refuses_without_charging(self):
+    async def test_gift_refused_when_sender_lacks_item_even_with_balance(self):
         conn = self._make_conn()
         sender_id, receiver_id = 42, 43
-        ensure_user(conn, sender_id, "Pobre")
-        modify_wallet(conn, sender_id, 100, "Pobre")
+        ensure_user(conn, sender_id, "Rico")
+        # Saldo de sobra para o preço de loja do item (5000) — irrelevante:
+        # sem a cópia na mochila não há presente, e nada é comprado.
+        modify_wallet(conn, sender_id, 999999, "Rico")
 
         interaction = self._make_interaction(sender_id)
         amigo = SimpleNamespace(id=receiver_id, name="Amigo")
         with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
             await economia.presentear.callback(interaction, amigo, "certificado")
 
-        self.assertEqual(get_wallet(conn, sender_id), 100)
-        self.assertEqual(get_inventory(conn, receiver_id).get("Certificado de Dono", 0), 0)
-        self.assertIn("Falta grana", interaction.response.send_message.call_args.args[0])
+        self.assertEqual(get_wallet(conn, sender_id), 999999)
+        self.assertEqual(get_inventory(conn, receiver_id).get("certificado", 0), 0)
+        self.assertIn("não possui esse item", interaction.response.send_message.call_args.args[0])
 
-    async def test_rod_gift_blocked_when_receiver_already_has_better_rod(self):
+    async def test_rod_gift_not_blocked_by_receiver_rod_tier(self):
         conn = self._make_conn()
         sender_id, receiver_id = 44, 45
         ensure_user(conn, sender_id, "Sender")
-        modify_wallet(conn, sender_id, 6000, "Sender")
+        add_inventory_item(conn, sender_id, "vara_plastico", 1)
         ensure_user(conn, receiver_id, "Amigo")
         sync_user_to_economy(conn, receiver_id)
         conn.execute("UPDATE economy SET rod_tier = 5 WHERE user_id = ?", (receiver_id,))
@@ -476,25 +486,29 @@ class PresentearTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
             await economia.presentear.callback(interaction, amigo, "vara_plastico")
 
-        # Bloqueado ANTES de cobrar o remetente.
-        self.assertEqual(get_wallet(conn, sender_id), 6000)
-        self.assertIn("já tem vara melhor", interaction.response.send_message.call_args.args[0])
+        # Não há mais recusa por comparação de rod_tier: a vara é só um item
+        # de inventário e o destinatário decide se equipa.
+        self.assertNotIn("já tem vara melhor", interaction.response.send_message.call_args.args[0])
+        self.assertEqual(get_inventory(conn, receiver_id).get("vara_plastico"), 1)
+        self.assertEqual(get_inventory(conn, sender_id).get("vara_plastico", 0), 0)
 
-    async def test_rod_gift_success_equips_and_sets_legacy_rod_tier(self):
+    async def test_rod_gift_lands_in_inventory_without_auto_equipping(self):
         conn = self._make_conn()
         sender_id, receiver_id = 46, 47
         ensure_user(conn, sender_id, "Sender")
-        modify_wallet(conn, sender_id, 6000, "Sender")
+        add_inventory_item(conn, sender_id, "vara_plastico", 1)
+        ensure_user(conn, receiver_id, "Amigo")
 
         interaction = self._make_interaction(sender_id)
         amigo = SimpleNamespace(id=receiver_id, name="Amigo")
         with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
             await economia.presentear.callback(interaction, amigo, "vara_plastico")
 
-        self.assertEqual(get_wallet(conn, sender_id), 6000 - 600)
-        self.assertEqual(get_current_rod(conn, receiver_id), "vara_plastico")
-        legacy = conn.execute("SELECT rod_tier FROM economy WHERE user_id = ?", (receiver_id,)).fetchone()
-        self.assertEqual(legacy["rod_tier"], 1)
+        # A vara entra na mochila (é daí que o menu de equipar monta owned_rods)
+        # mas NÃO é equipada: trocar o equipamento em uso de outra pessoa sem
+        # ela pedir tira a escolha dela e pode até rebaixar a vara ativa.
+        self.assertEqual(get_inventory(conn, receiver_id).get("vara_plastico"), 1)
+        self.assertEqual(get_current_rod(conn, receiver_id), "vara_bambu")
 
     async def test_free_gift_consumes_sender_owned_copy(self):
         conn = self._make_conn()
@@ -511,7 +525,7 @@ class PresentearTests(unittest.IsolatedAsyncioTestCase):
             await economia.presentear.callback(interaction, amigo, "item_dono")
 
         self.assertEqual(get_inventory(conn, sender_id).get("item_dono", 0), 0)
-        self.assertEqual(get_inventory(conn, receiver_id).get("Coroa do Imperador"), 1)
+        self.assertEqual(get_inventory(conn, receiver_id).get("item_dono"), 1)
 
     async def test_free_gift_refused_when_sender_does_not_own_it(self):
         conn = self._make_conn()
@@ -525,7 +539,7 @@ class PresentearTests(unittest.IsolatedAsyncioTestCase):
             await economia.presentear.callback(interaction, amigo, "item_dono")
 
         self.assertIn("não possui esse item", interaction.response.send_message.call_args.args[0])
-        self.assertEqual(get_inventory(conn, receiver_id).get("Coroa do Imperador", 0), 0)
+        self.assertEqual(get_inventory(conn, receiver_id).get("item_dono", 0), 0)
 
 
 class ExplorarTests(unittest.IsolatedAsyncioTestCase):

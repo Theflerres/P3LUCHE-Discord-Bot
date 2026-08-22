@@ -19,6 +19,7 @@ from economy_db import (
     get_cooldowns,
     get_inventory,
     get_wallet,
+    modify_scrap,
     modify_wallet,
     set_cooldown,
     set_inventory_item,
@@ -144,10 +145,12 @@ async def craftar(interaction: discord.Interaction, tipo: str):
     for fish, qty in recipe["peixes"].items():
         consume_fish(conn, uid, fish, qty)
 
-    conn.execute(
-        "UPDATE users SET scrap = scrap - ? WHERE user_id = ?",
-        (recipe["scrap"], uid),
-    )
+    # modify_scrap() em vez de UPDATE cru: o SQL direto na v4 ficava pendente
+    # sem sincronizar para a legada, e o ensure_user() de add_inventory_item()
+    # logo abaixo disparava sync_user_from_economy(), que sobrescrevia
+    # users.scrap com o valor antigo vindo de `economy` — o craft saía de
+    # graça. Precisa vir ANTES do add_inventory_item() do resultado.
+    modify_scrap(conn, uid, -recipe["scrap"])
     add_inventory_item(conn, uid, recipe["result"], 1)
     conn.commit()
 
