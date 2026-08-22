@@ -1026,7 +1026,18 @@ class NewAccountPescarFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(conn.execute("SELECT 1 FROM economy WHERE user_id = ?", (user_id,)).fetchone())
         self.assertIsNone(conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone())
 
+        # A vara inicial tem 90% de chance de lixo, e nesse ramo o pool nem
+        # contem Sardinha - forcar so o random.choice deixava o resultado
+        # depender de sorte (o teste falhava de forma intermitente). A
+        # rolagem de lixo, randint(1, 100), tambem precisa ser fixada acima
+        # de trash_chance.
+        _real_randint = economia.random.randint
+
+        def _sem_lixo(a, b):
+            return 100 if (a, b) == (1, 100) else _real_randint(a, b)
+
         with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+             patch.object(economia.random, "randint", side_effect=_sem_lixo), \
              patch.object(economia.random, "choice", side_effect=choose_sardinha):
             await economia.pescar.callback(interaction)
 

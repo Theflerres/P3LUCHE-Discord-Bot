@@ -243,6 +243,37 @@ class PokerEscrowTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("já encerrada", second.response.send_message.call_args.args[0])
 
 
+class _RelogioFalso:
+    """Relógio virtual para o loop do crash, que agenda por tempo absoluto.
+
+    `avancar` simula tanto a espera entre ticks quanto a latência de uma
+    edição, o que permite testar a cadência sem dormir de verdade.
+    """
+
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def avancar(self, segundos: float) -> None:
+        self.t += max(0.0, segundos)
+
+
+def _patch_relogio(clock):
+    return patch.object(casino, "time", SimpleNamespace(monotonic=clock.monotonic))
+
+
+def _espera_falsa(clock):
+    async def _wait(view, seconds):
+        if seconds > 0 and not view.ended.is_set():
+            clock.avancar(seconds)
+        # O `asyncio.wait_for` real sempre cede o controle; sem ceder aqui, as
+        # tasks de edição criadas pelo loop nunca chegariam a rodar no teste.
+        await asyncio.sleep(0)
+    return _wait
+
+
 class CrashOvershootTests(unittest.IsolatedAsyncioTestCase):
     """Regressão: o multiplicador podia ultrapassar o crash_point antes de
     parar — o valor pós-crash ficava exposto e o Cash Out continuava ativo
@@ -258,11 +289,13 @@ class CrashOvershootTests(unittest.IsolatedAsyncioTestCase):
         interaction = _make_interaction(uid)
         msg = SimpleNamespace(edit=AsyncMock())
         interaction.followup.send = AsyncMock(return_value=msg)
+        clock = _RelogioFalso()
 
         with patch.object(casino, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
-             patch.object(casino, "_draw_crash_point", return_value=2.0), \
+             patch.object(casino, "_draw_crash_point", return_value=5.0), \
              patch.object(casino.random, "uniform", return_value=0.5), \
-             patch.object(casino, "_crash_wait", new=AsyncMock()):
+             _patch_relogio(clock), \
+             patch.object(casino, "_crash_wait", new=_espera_falsa(clock)):
             await casino.crash.callback(interaction, 100)
 
         shown_multipliers = []
@@ -274,12 +307,58 @@ class CrashOvershootTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(shown_multipliers, "esperava pelo menos uma atualização de multiplicador")
         for value in shown_multipliers:
-            self.assertLess(value, 2.0)
+            self.assertLess(value, 5.0)
 
         final_call = msg.edit.call_args_list[-1]
         self.assertIn("CRASH", final_call.kwargs.get("content", ""))
         final_view = final_call.kwargs.get("view")
         self.assertTrue(all(child.disabled for child in final_view.children))
+
+    async def test_intervalo_visivel_nao_soma_a_latencia_da_edicao(self):
+        """Regressao do relato "demorando 4 segundos": o loop era de atraso
+        fixo (edita, DEPOIS dorme o tick), entao o periodo virava
+        latencia + tick. Agora o agendamento e por tempo absoluto, e uma
+        edicao lenta e PULADA em vez de empurrar o proximo tick para frente.
+        """
+        conn = _make_conn()
+        uid = 123
+        ensure_user(conn, uid, "Tester")
+        modify_wallet(conn, uid, 1000, "Tester")
+
+        interaction = _make_interaction(uid)
+        msg = SimpleNamespace(edit=AsyncMock())
+        interaction.followup.send = AsyncMock(return_value=msg)
+        clock = _RelogioFalso()
+
+        publicados = []
+        em_voo = {"n": 0, "max": 0}
+
+        async def edicao_lenta(_msg_obj, multiplier, _medida):
+            publicados.append(multiplier)
+            em_voo["n"] += 1
+            em_voo["max"] = max(em_voo["max"], em_voo["n"])
+            # Edicao de ~3s: mais lenta que o tick de 2s.
+            await asyncio.sleep(0)
+            clock.avancar(3.0)
+            em_voo["n"] -= 1
+
+        taxa = 0.5
+        with patch.object(casino, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)),              patch.object(casino, "_draw_crash_point", return_value=11.0),              patch.object(casino.random, "uniform", return_value=taxa),              _patch_relogio(clock),              patch.object(casino, "_crash_wait", new=_espera_falsa(clock)),              patch.object(casino, "_edit_multiplier", new=edicao_lenta):
+            await casino.crash.callback(interaction, 100)
+
+        # Nunca mais de uma edicao em voo: sem backlog, o ritmo se auto-ajusta
+        # ao que o Discord consegue entregar.
+        self.assertEqual(em_voo["max"], 1)
+        self.assertTrue(publicados, "esperava pelo menos uma atualizacao")
+        # Todo valor publicado cai numa fronteira de tick. Num loop de atraso
+        # fixo os instantes seriam multiplo + latencia acumulada, e os valores
+        # sairiam fora dessa grade.
+        for m in publicados:
+            instante = (m - 1.0) / taxa
+            self.assertAlmostEqual(instante % casino.CRASH_TICK_SECONDS, 0.0, places=6)
+        # A edicao de 3s custa ticks: alguns sao pulados, nao enfileirados.
+        ticks_totais = int(((11.0 - 1.0) / taxa) / casino.CRASH_TICK_SECONDS)
+        self.assertLess(len(publicados), ticks_totais)
 
     async def test_cashout_still_possible_before_crash_and_pays_shown_multiplier(self):
         view = casino.CrashView(1, 100, crash_point=5.0)
@@ -293,6 +372,30 @@ class CrashOvershootTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(view.cashed_out)
         self.assertEqual(get_wallet(conn, 1), int(100 * 1.8))
+
+    async def test_botao_confirma_antes_de_escrever_no_banco(self):
+        """`modify_wallet` faz BEGIN IMMEDIATE síncrono e pode segurar o event
+        loop até o timeout do sqlite, estourando a janela de 3s da interação.
+        A confirmação tem que sair primeiro.
+        """
+        view = casino.CrashView(1, 100, crash_point=5.0)
+        view.multiplier = 2.0
+        conn = _make_conn()
+        ensure_user(conn, 1, "Tester")
+
+        ordem = []
+        interaction = _make_interaction(1)
+        interaction.response.edit_message = AsyncMock(side_effect=lambda **kw: ordem.append("resposta"))
+
+        def wallet_lento(*args, **kwargs):
+            ordem.append("banco")
+            return 0
+
+        with patch.object(casino, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+             patch.object(casino, "modify_wallet", side_effect=wallet_lento):
+            await view.cashout.callback(interaction)
+
+        self.assertEqual(ordem, ["resposta", "banco"])
 
     async def test_cashout_depois_do_crash_e_recusado(self):
         """Regressão: entre o crash e a edição final da mensagem (janela que
@@ -326,19 +429,33 @@ class CrashOvershootTests(unittest.IsolatedAsyncioTestCase):
         interaction = _make_interaction(uid)
         msg = SimpleNamespace(edit=AsyncMock())
         interaction.followup.send = AsyncMock(return_value=msg)
+        clock = _RelogioFalso()
 
-        async def saca_no_primeiro_tick(view, _seconds):
-            view.cashed_out = True
-            view.ended.set()
+        edicoes = []
+
+        async def registra(_msg_obj, multiplier, _medida):
+            edicoes.append(multiplier)
+
+        espera = _espera_falsa(clock)
+
+        async def saca_no_segundo_tick(view, seconds):
+            await espera(view, seconds)
+            if len(edicoes) >= 1:
+                view.cashed_out = True
+                view.ended.set()
 
         with patch.object(casino, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
              patch.object(casino, "_draw_crash_point", return_value=50.0), \
              patch.object(casino.random, "uniform", return_value=0.5), \
-             patch.object(casino, "_crash_wait", new=saca_no_primeiro_tick):
+             _patch_relogio(clock), \
+             patch.object(casino, "_edit_multiplier", new=registra), \
+             patch.object(casino, "_crash_wait", new=saca_no_segundo_tick):
             await casino.crash.callback(interaction, 100)
 
-        self.assertEqual(msg.edit.call_count, 1)
-        self.assertNotIn("CRASH", msg.edit.call_args.kwargs.get("content", ""))
+        self.assertEqual(len(edicoes), 1)
+        # Nenhuma edição de CRASH depois do saque.
+        for call in msg.edit.call_args_list:
+            self.assertNotIn("CRASH", call.kwargs.get("content", ""))
         self.assertNotIn(uid, casino._crash_rounds_ativos)
 
     async def test_rodada_simultanea_do_mesmo_jogador_e_recusada(self):
@@ -361,12 +478,16 @@ class CrashOvershootTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("em andamento", interaction.response.send_message.call_args.args[0])
         self.assertEqual(get_wallet(conn, uid), 1000)
 
-    def test_cadencia_de_edicao_respeita_o_rate_limit_do_discord(self):
-        """~5 edições / 5s por canal. O tick antigo (0.5s) era 4x acima."""
+    def test_cadencia_e_duracao_cabem_nos_limites(self):
+        """~5 edições / 5s por canal, e a rodada mais longa tem que caber no
+        timeout de 120s da view.
+        """
         self.assertGreaterEqual(casino.CRASH_TICK_SECONDS, 1.0)
-        # Velocidade de subida por segundo preservada (era 0.2-1.0/s).
-        self.assertAlmostEqual(casino.CRASH_STEP_MIN / casino.CRASH_TICK_SECONDS, 0.2)
-        self.assertAlmostEqual(casino.CRASH_STEP_MAX / casino.CRASH_TICK_SECONDS, 1.0)
+        duracao_maxima = (casino.CRASH_MAX_MULTIPLIER - 1.0) / casino.CRASH_RATE_MIN
+        self.assertLess(duracao_maxima, 120)
+        # Velocidade média preservada (era ~0.6x por segundo).
+        media = (casino.CRASH_RATE_MIN + casino.CRASH_RATE_MAX) / 2
+        self.assertAlmostEqual(media, 0.6)
 
 
 class CrashHouseEdgeFormulaTests(unittest.TestCase):

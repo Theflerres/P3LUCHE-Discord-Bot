@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 
 import discord
 from discord import app_commands
@@ -16,6 +17,7 @@ from discord.ext import commands
 
 from config import get_bot_instance
 from economy_db import get_wallet, modify_wallet
+from utils import log_to_gui
 
 casino_group = app_commands.Group(name="casino", description="Jogos de casino do P3LUCHE.")
 
@@ -381,21 +383,19 @@ CRASH_HOUSE_EDGE = 0.09
 # Recorta só a cauda extrema (~1.8% de probabilidade com he=9%).
 CRASH_MAX_MULTIPLIER = 30.0
 
-# Cadência de atualização da mensagem. O Discord limita edições de mensagem
-# a ~5 requisições / 5s POR CANAL (em DM o bucket é o canal da DM). O valor
-# antigo (0.5s) mandava 2 edições/s — 4x acima do limite — então o
-# rate limiter do discord.py passava a dormir para respeitar os 429: o
-# multiplicador congelava, edições atrasadas chegavam fora de ordem (o
-# número "sumia"/voltava) e, com várias rodadas simultâneas, a fila HTTP
-# global do bot atrasava até o clique do Cash Out demorar segundos para
-# registrar. 2.0s deixa ~2.5x de folga no bucket do canal.
+# Cadência ALVO entre atualizações da mensagem.
+#
+# O ciclo é de TAXA fixa, não de atraso fixo: cada tick é agendado a partir
+# do início da rodada (`inicio + n*TICK`), nunca a partir do fim da edição
+# anterior. Um loop de atraso fixo ("edita, depois dorme 2s") soma a latência
+# da edição ao intervalo — com edição de ~2s o jogador via 4s entre números.
 CRASH_TICK_SECONDS = 2.0
-# Incremento por tick. Calibrado para manter a MESMA velocidade de subida
-# por segundo de antes (uniform(0.1, 0.5) a cada 0.5s = 0.2-1.0 por segundo),
-# de modo que a duração da rodada e a sensação do jogo não mudam — só a
-# quantidade de requisições HTTP cai 4x.
-CRASH_STEP_MIN = 0.4
-CRASH_STEP_MAX = 2.0
+
+# Subida do multiplicador por segundo, sorteada por rodada. Média de 0.6/s
+# mantém a mesma velocidade de antes; o piso de 0.4/s garante que o teto de
+# 30x leve (30-1)/0.4 ≈ 72s, dentro do timeout de 120s da view.
+CRASH_RATE_MIN = 0.4
+CRASH_RATE_MAX = 0.8
 
 
 def _draw_crash_point(house_edge: float = CRASH_HOUSE_EDGE) -> float:
@@ -411,6 +411,8 @@ class CrashView(discord.ui.View):
         self.aposta = aposta
         self.crash_point = crash_point
         self.cashed_out = False
+        # Sempre o último valor EFETIVAMENTE publicado na mensagem: é ele que
+        # o jogador viu ao clicar, e é ele que o saque paga.
         self.multiplier = 1.0
         self.message: discord.Message | None = None
         # Fecha a rodada (saque OU crash). Serve para dois fins:
@@ -431,26 +433,64 @@ class CrashView(discord.ui.View):
             aviso = "❌ Já sacou." if self.cashed_out else "💥 Tarde demais — o avião já crashou."
             return await interaction.response.send_message(aviso, ephemeral=True)
         # Encerra a rodada de forma síncrona, antes do primeiro await: o loop
-        # não chega a disparar mais nenhuma edição que sobrescreveria a
-        # confirmação do saque.
+        # não chega a disparar mais nenhuma edição depois deste ponto.
         self.cashed_out = True
         self.ended.set()
         for child in self.children:
             child.disabled = True
         winnings = int(self.aposta * self.multiplier)
-        modify_wallet(get_bot_instance().db_conn, self.user_id, winnings)
+        # Responde ANTES de tocar no banco. `modify_wallet` faz BEGIN IMMEDIATE
+        # síncrono; sob disputa de lock ele segura o event loop por até o
+        # timeout do sqlite (5s por padrão) e estoura a janela de 3s que o
+        # Discord dá para confirmar a interação — era daí que vinha parte do
+        # "apertei e demorou para registrar".
         await interaction.response.edit_message(
             content=f"✅ Cash out em **{self.multiplier:.2f}x**! +{winnings} Sachês",
             view=self,
         )
+        modify_wallet(get_bot_instance().db_conn, self.user_id, winnings)
         self.stop()
 
 
 async def _crash_wait(view: CrashView, seconds: float) -> None:
-    """Espera o próximo tick, mas acorda imediatamente se o jogador sacar."""
+    """Espera até `seconds`, mas acorda imediatamente se a rodada encerrar."""
+    if seconds <= 0:
+        return
     try:
         await asyncio.wait_for(view.ended.wait(), timeout=seconds)
     except asyncio.TimeoutError:
+        pass
+
+
+async def _edit_multiplier(msg_obj, multiplier: float, medida: dict) -> None:
+    """Publica um valor do multiplicador.
+
+    Sem `view=`: os componentes não mudam entre ticks, então não há por que
+    reenviá-los em toda requisição.
+
+    Mede quanto a requisição demorou. Se ela custa mais que um tick, o teto do
+    ritmo é a latência do Discord (rate limit ou rede), não a cadência daqui —
+    e sem esse número o diagnóstico vira chute.
+    """
+    t0 = time.monotonic()
+    try:
+        await msg_obj.edit(content=f"🚀 Multiplicador: **{multiplier:.2f}x**")
+    except discord.HTTPException:
+        pass
+    finally:
+        medida["pior"] = max(medida["pior"], time.monotonic() - t0)
+        medida["n"] += 1
+
+
+async def _drenar(pendente) -> None:
+    """Espera a edição em voo terminar antes de escrever o estado final —
+    senão ela pode aterrissar DEPOIS e ressuscitar o avião na tela.
+    """
+    if pendente is None or pendente.done():
+        return
+    try:
+        await asyncio.wait_for(asyncio.shield(pendente), timeout=10)
+    except Exception:
         pass
 
 
@@ -476,44 +516,53 @@ async def crash(interaction: discord.Interaction, aposta: int):
     await interaction.response.defer()
     crash_point = _draw_crash_point()
     view = CrashView(interaction.user.id, aposta, crash_point)
-    multiplier = 1.0
+    taxa = random.uniform(CRASH_RATE_MIN, CRASH_RATE_MAX)
+    # O multiplicador é função do relógio, não de incrementos acumulados: uma
+    # edição lenta ou pulada não desloca mais a rodada nem o ponto de queda.
+    crash_em = (crash_point - 1.0) / taxa
+
     _crash_rounds_ativos.add(interaction.user.id)
+    pendente = None
+    medida = {"pior": 0.0, "n": 0}
     try:
         msg_obj = await interaction.followup.send(
-            f"🚀 Avião decolando! Multiplicador: **{multiplier:.2f}x**",
+            f"🚀 Avião decolando! Multiplicador: **{view.multiplier:.2f}x**",
             view=view,
             wait=True,
         )
         view.message = msg_obj
+        inicio = time.monotonic()
 
         while not view.ended.is_set():
-            proximo = multiplier + random.uniform(CRASH_STEP_MIN, CRASH_STEP_MAX)
-            # Nunca deixa o multiplicador exposto/clicável passar do
-            # crash_point: se o próximo incremento ultrapassaria, o crash já
-            # aconteceu — quebra ANTES de publicar esse valor ou dar mais uma
-            # janela de tick com o Cash Out ainda ativo além do ponto real de
-            # queda.
-            if proximo >= crash_point:
+            agora = time.monotonic() - inicio
+            if agora >= crash_em:
                 break
-            multiplier = proximo
-            view.multiplier = multiplier
-            # Recheca na borda do await: o saque pode ter entrado enquanto o
-            # tick dormia, e uma edição em voo sobrescreveria a confirmação.
-            if view.ended.is_set():
+            # Próxima fronteira de tick estritamente à frente, limitada ao
+            # instante do crash. Garante progresso (nunca gira em falso) e
+            # mantém o intervalo visível igual a CRASH_TICK_SECONDS.
+            proximo = min((int(agora / CRASH_TICK_SECONDS) + 1) * CRASH_TICK_SECONDS, crash_em)
+            await _crash_wait(view, proximo - agora)
+            if view.ended.is_set() or proximo >= crash_em:
                 break
-            try:
-                await msg_obj.edit(
-                    content=f"🚀 Multiplicador: **{multiplier:.2f}x**",
-                    view=view,
-                )
-            except discord.HTTPException:
-                break
-            await _crash_wait(view, CRASH_TICK_SECONDS)
+
+            # Drop-behind: se a edição anterior ainda está em voo, PULA esta.
+            # Nunca existe mais de uma requisição pendente, então a fila HTTP
+            # não acumula backlog e o ritmo se auto-ajusta ao que o Discord
+            # permite — em vez de o loop empurrar edições mais rápido do que
+            # elas saem, que era o que fazia o número congelar e voltar.
+            if pendente is not None and not pendente.done():
+                continue
+            # Só atualiza o valor pago depois de decidir publicá-lo: o saque
+            # nunca paga um número que o jogador não chegou a ver.
+            view.multiplier = 1.0 + taxa * proximo
+            pendente = asyncio.create_task(_edit_multiplier(msg_obj, view.multiplier, medida))
+
+        await _drenar(pendente)
 
         if not view.cashed_out:
-            # Marca o fim antes do await da edição final: durante essa
-            # janela (que sob rate limit podia durar segundos) o botão
-            # continuava vivo e pagava o multiplicador pré-crash.
+            # Marca o fim antes do await da edição final: durante essa janela
+            # (que sob rate limit durava segundos) o botão continuava vivo e
+            # pagava o multiplicador pré-crash.
             view.ended.set()
             for child in view.children:
                 child.disabled = True
@@ -527,6 +576,15 @@ async def crash(interaction: discord.Interaction, aposta: int):
             view.stop()
     finally:
         _crash_rounds_ativos.discard(interaction.user.id)
+        # Um aviso por rodada, e só quando a edição passa do tick: se aparecer,
+        # o gargalo está na saída HTTP (rate limit/rede), não no agendamento.
+        if medida["pior"] > CRASH_TICK_SECONDS:
+            log_to_gui(
+                f"Crash: edição mais lenta que o tick "
+                f"({medida['pior']:.1f}s > {CRASH_TICK_SECONDS:.1f}s) "
+                f"em {medida['n']} atualizações.",
+                "WARNING",
+            )
 
 
 # --- SLOTS ---
