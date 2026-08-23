@@ -50,7 +50,6 @@ from economy_db import (
     set_current_rod,
     set_guild_rank,
     set_trap,
-    sync_user_from_economy,
     sync_user_to_economy,
     try_spend_wallet,
     try_upgrade_rod,
@@ -1891,8 +1890,10 @@ async def diario(interaction: discord.Interaction):
     user_id = interaction.user.id
     conn = get_bot_instance().db_conn
     ensure_v4_tables(conn)
+    # NÃO chamar sync_user_from_economy aqui: reimportar a legada a cada
+    # /eco diario ressuscitava na v4 o que já tinha sido gasto/removido
+    # (mesma raiz que foi tirada do ensure_user). A legada é cópia derivada.
     ensure_user(conn, user_id, interaction.user.name)
-    sync_user_from_economy(conn, user_id)
 
     cursor = conn.cursor()
     row = cursor.execute(

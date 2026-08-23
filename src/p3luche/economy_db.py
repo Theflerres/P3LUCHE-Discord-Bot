@@ -314,26 +314,49 @@ def sync_user_to_economy(conn: sqlite3.Connection, user_id: int) -> None:
 
 
 def ensure_user(conn: sqlite3.Connection, user_id: int, user_name: str = "") -> None:
+    """Garante as linhas v4 do jogador. NÃO reimporta dados da legada.
+
+    Esta função é chamada no início de praticamente todo helper da v4, ou
+    seja, algumas vezes por comando. Enquanto ela chamava
+    sync_user_from_economy() incondicionalmente, era a raiz do sync
+    assimétrico: aquele sync faz upsert do que a legada TEM mas nunca apaga
+    o que sumiu de lá, então qualquer item/valor já removido na v4
+    ressuscitava a partir de um JSON legado obsoleto na chamada seguinte.
+    A legada é cópia derivada (sync_user_to_economy a reescreve inteira a
+    partir da v4), então importar dela de volta a cada chamada invertia a
+    fonte de verdade.
+
+    A importação legada->v4 agora acontece só quando o jogador ainda não
+    existe em `users` — primeiro contato de uma conta pré-v4. A migração em
+    massa continua sendo feita por migration_v4.py, que chama
+    sync_user_from_economy() explicitamente.
+    """
     cursor = conn.cursor()
     ensure_v4_tables(conn)
     row = cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
-    sync_user_from_economy(conn, user_id)
-    row = cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
+    if not row:
+        # Conta ainda não migrada: puxa o que existir na legada uma vez.
+        sync_user_from_economy(conn, user_id)
+        row = cursor.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
     if not row:
         cursor.execute(
             "INSERT OR IGNORE INTO users (user_id, user_name) VALUES (?, ?)",
             (user_id, user_name),
         )
-        cursor.execute(
-            "INSERT OR IGNORE INTO user_rods (user_id) VALUES (?)", (user_id,)
-        )
-        cursor.execute(
-            "INSERT OR IGNORE INTO rod_upgrades (user_id) VALUES (?)", (user_id,)
-        )
-        cursor.execute(
-            "INSERT OR IGNORE INTO user_cooldowns (user_id) VALUES (?)", (user_id,)
-        )
-        conn.commit()
+    # Linhas irmãs são criadas SEMPRE (idempotente, não traz dado da legada):
+    # set_current_rod/set_cooldown/try_upgrade_rod fazem UPDATE puro e viram
+    # no-op silencioso se a linha não existir. Antes esse era um efeito
+    # colateral do sync_user_from_economy que rodava a cada chamada.
+    cursor.execute(
+        "INSERT OR IGNORE INTO user_rods (user_id) VALUES (?)", (user_id,)
+    )
+    cursor.execute(
+        "INSERT OR IGNORE INTO rod_upgrades (user_id) VALUES (?)", (user_id,)
+    )
+    cursor.execute(
+        "INSERT OR IGNORE INTO user_cooldowns (user_id) VALUES (?)", (user_id,)
+    )
+    conn.commit()
 
 
 def _coerce_int(value: object, default: int = 0) -> int:

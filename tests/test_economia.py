@@ -25,9 +25,12 @@ from economy_db import (
     modify_scrap,
     modify_wallet,
     set_cooldown,
+    set_current_rod,
     set_guild_rank,
+    set_inventory_item,
     set_trap,
     sync_user_to_economy,
+    try_spend_wallet,
 )
 
 
@@ -1569,44 +1572,32 @@ class AddGuildXpHelperTests(unittest.TestCase):
     """add_guild_xp: relê o XP dentro da transação, em vez de somar sobre um
     `users` que pode estar defasado em relação à legada."""
 
-    def _desynced_user(self, conn, user_id):
-        """Deixa `users` para trás da legada de propósito — é o estado em que
-        um incremento cru propaga dado obsoleto para economy."""
+    def _seed(self, conn, user_id, xp):
         conn.execute(
             "INSERT INTO economy (user_id, user_name, guild_rank, guild_xp) VALUES (?, ?, ?, ?)",
-            (user_id, "Tester", "E", 100),
+            (user_id, "Tester", "E", xp),
         )
         conn.commit()
         ensure_user(conn, user_id, "Tester")
-        conn.execute(
-            "UPDATE economy SET guild_xp = ? WHERE user_id = ?", (500, user_id)
-        )
-        conn.commit()
 
-    def test_raw_increment_plus_sync_propagates_stale_xp(self):
-        """Contraste: é exatamente este par de statements que estava nos
-        sites de recompensa de grupo. Sem um ensure_user antes ele soma sobre
-        o `users` defasado e escreve o resultado obsoleto na legada."""
-        conn = _make_pescar_conn()
-        user_id = 7500
-        self._desynced_user(conn, user_id)
+    def test_add_guild_xp_accumulates_on_the_current_v4_value(self):
+        """O incremento sai do valor que está em `users` na hora da transação,
+        não de um valor capturado antes — um escritor v4 no meio do caminho
+        não pode ser sobrescrito.
 
-        conn.execute(
-            "UPDATE users SET guild_xp = guild_xp + ? WHERE user_id = ?", (50, user_id)
-        )
-        sync_user_to_economy(conn, user_id)
-
-        legacy = conn.execute(
-            "SELECT guild_xp FROM economy WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        self.assertEqual(legacy["guild_xp"], 150)  # perdeu 400 de XP
-
-    def test_add_guild_xp_reads_fresh_state_instead_of_stale_users(self):
-        """Mesmo ponto de partida do teste acima, agora pelo helper: o
-        ensure_user interno reconcilia antes de somar."""
+        Nota (etapa 2): até a etapa 1c este teste partia de um `users`
+        defasado em relação à legada, apostando no ensure_user interno para
+        reconciliar. Depois que a etapa 2 tirou a reimportação do
+        ensure_user, esse estado deixou de ser recuperável — e deixou de ser
+        alcançável, já que nenhum fluxo escreve só na legada. O que o helper
+        garante hoje é a releitura dentro da transação, que é o que se testa.
+        """
         conn = _make_pescar_conn()
         user_id = 7501
-        self._desynced_user(conn, user_id)
+        self._seed(conn, user_id, 100)
+
+        # Outro escritor v4 avança o XP depois do seed.
+        set_guild_rank(conn, user_id, "E", 500)
 
         novo = add_guild_xp(conn, user_id, 50)
 
@@ -1617,18 +1608,286 @@ class AddGuildXpHelperTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(legacy["guild_xp"], 550)
 
+    def test_add_guild_xp_is_cumulative_across_calls(self):
+        conn = _make_pescar_conn()
+        user_id = 7503
+        self._seed(conn, user_id, 100)
+
+        self.assertEqual(add_guild_xp(conn, user_id, 40), 140)
+        self.assertEqual(add_guild_xp(conn, user_id, 40), 180)
+        self.assertEqual(get_guild_rank(conn, user_id)["xp"], 180)
+
     def test_add_guild_xp_clamps_at_zero(self):
         conn = _make_pescar_conn()
         user_id = 7502
+        self._seed(conn, user_id, 30)
+
+        self.assertEqual(add_guild_xp(conn, user_id, -100), 0)
+        self.assertEqual(get_guild_rank(conn, user_id)["xp"], 0)
+
+
+
+class LegacyResurrectionTests(unittest.IsolatedAsyncioTestCase):
+    """Etapa 2 — a raiz do sync assimétrico.
+
+    sync_user_from_economy() faz upsert do que a legada TEM mas nunca apaga o
+    que sumiu de lá; sync_user_to_economy() reescreve a legada inteira a
+    partir da v4. Enquanto ensure_user() chamava o primeiro em toda chamada —
+    e quase todo helper v4 começa por ensure_user — qualquer coisa já gasta
+    ou removida na v4 voltava a partir de um JSON legado obsoleto.
+
+    Cada teste aqui adultera a legada à mão (nenhum fluxo do projeto escreve
+    só nela hoje — ver auditoria da etapa 2) e confirma que o valor obsoleto
+    NÃO volta para a v4 em nenhum dos fluxos migrados nas etapas 1/1b/1c.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _account(self, conn, user_id, **cols):
+        campos = ", ".join(cols)
+        marks = ", ".join("?" for _ in cols)
         conn.execute(
-            "INSERT INTO economy (user_id, user_name, guild_rank, guild_xp) VALUES (?, ?, ?, ?)",
-            (user_id, "Tester", "E", 30),
+            f"INSERT INTO economy (user_id, user_name, {campos}) VALUES (?, ?, {marks})",
+            (user_id, "Tester", *cols.values()),
         )
         conn.commit()
         ensure_user(conn, user_id, "Tester")
 
-        self.assertEqual(add_guild_xp(conn, user_id, -100), 0)
-        self.assertEqual(get_guild_rank(conn, user_id)["xp"], 0)
+    # ------------------------------------------------------------ inventário
+    def test_consumed_item_does_not_come_back_from_legacy_json(self):
+        conn = self._make_conn()
+        user_id = 8001
+        self._account(conn, user_id, inventory=json.dumps({"energetico": 2}))
+        self.assertEqual(get_inventory(conn, user_id).get("energetico"), 2)
+
+        # Consome tudo pela v4 (fluxo do ConsumeSelect / Galdino).
+        set_inventory_item(conn, user_id, "energetico", 0)
+        self.assertNotIn("energetico", get_inventory(conn, user_id))
+
+        # Legada ficou para trás com o item ainda lá.
+        conn.execute(
+            "UPDATE economy SET inventory = ? WHERE user_id = ?",
+            (json.dumps({"energetico": 2}), user_id),
+        )
+        conn.commit()
+
+        self.assertNotIn(
+            "energetico",
+            get_inventory(conn, user_id),
+            "item consumido ressuscitou a partir do JSON legado",
+        )
+
+    def test_partially_spent_stack_is_not_topped_back_up(self):
+        conn = self._make_conn()
+        user_id = 8002
+        self._account(conn, user_id, inventory=json.dumps({"isca": 10}))
+        add_inventory_item(conn, user_id, "isca", -7)
+        self.assertEqual(get_inventory(conn, user_id)["isca"], 3)
+
+        conn.execute(
+            "UPDATE economy SET inventory = ? WHERE user_id = ?",
+            (json.dumps({"isca": 10}), user_id),
+        )
+        conn.commit()
+
+        self.assertEqual(get_inventory(conn, user_id)["isca"], 3)
+
+    # -------------------------------------------------------------- carteira
+    def test_spent_wallet_is_not_restored_from_legacy(self):
+        conn = self._make_conn()
+        user_id = 8003
+        self._account(conn, user_id, wallet=1000)
+        self.assertTrue(try_spend_wallet(conn, user_id, 800))
+        self.assertEqual(get_wallet(conn, user_id), 200)
+
+        conn.execute("UPDATE economy SET wallet = ? WHERE user_id = ?", (1000, user_id))
+        conn.commit()
+
+        self.assertEqual(get_wallet(conn, user_id), 200)
+
+    # ---------------------------------------------------------------- sucata
+    def test_spent_scrap_is_not_restored_from_legacy(self):
+        """Bug real citado em minigames.py: o craft saía de graça porque o
+        ensure_user do add_inventory_item seguinte trazia o scrap antigo."""
+        conn = self._make_conn()
+        user_id = 8004
+        self._account(conn, user_id, scrap=50)
+        modify_scrap(conn, user_id, -30)
+        self.assertEqual(get_scrap(conn, user_id), 20)
+
+        conn.execute("UPDATE economy SET scrap = ? WHERE user_id = ?", (50, user_id))
+        conn.commit()
+
+        add_inventory_item(conn, user_id, "resultado_craft", 1)
+
+        self.assertEqual(
+            get_scrap(conn, user_id), 20, "sucata gasta voltou — craft de graça"
+        )
+
+    # ------------------------------------------------------------- armadilha
+    def test_collected_trap_does_not_return_to_ready(self):
+        conn = self._make_conn()
+        user_id = 8005
+        self._account(conn, user_id, wallet=0)
+        set_trap(conn, user_id, {"type": "covo_basico", "status": "ready", "timer_end": 0})
+        set_trap(conn, user_id, {"type": "covo_basico", "status": "cooldown", "timer_end": 99})
+        self.assertEqual(get_trap(conn, user_id)["status"], "cooldown")
+
+        conn.execute(
+            "UPDATE economy SET afk_trap = ? WHERE user_id = ?",
+            (json.dumps({"type": "covo_basico", "status": "ready", "timer_end": 0}), user_id),
+        )
+        conn.commit()
+
+        self.assertEqual(
+            get_trap(conn, user_id)["status"],
+            "cooldown",
+            "armadilha voltou para 'ready' — coleta duplicada",
+        )
+
+    def test_removed_trap_stays_removed(self):
+        conn = self._make_conn()
+        user_id = 8006
+        self._account(conn, user_id, wallet=0)
+        set_trap(conn, user_id, {"type": "covo_basico", "status": "idle", "timer_end": 0})
+        set_trap(conn, user_id, None)
+        self.assertEqual(get_trap(conn, user_id), {})
+
+        conn.execute(
+            "UPDATE economy SET afk_trap = ? WHERE user_id = ?",
+            (json.dumps({"type": "covo_basico", "status": "idle", "timer_end": 0}), user_id),
+        )
+        conn.commit()
+
+        self.assertEqual(get_trap(conn, user_id), {})
+
+    # --------------------------------------------------------- rank / XP
+    def test_promoted_rank_is_not_reverted_by_legacy(self):
+        conn = self._make_conn()
+        user_id = 8007
+        self._account(conn, user_id, guild_rank="E", guild_xp=600)
+        set_guild_rank(conn, user_id, "D", 100)
+
+        conn.execute(
+            "UPDATE economy SET guild_rank = ?, guild_xp = ? WHERE user_id = ?",
+            ("E", 600, user_id),
+        )
+        conn.commit()
+
+        self.assertEqual(get_guild_rank(conn, user_id), {"rank": "D", "xp": 100})
+
+    # ------------------------------------------------------------ vara
+    def test_equipped_rod_is_not_reverted_by_legacy(self):
+        conn = self._make_conn()
+        user_id = 8008
+        self._account(conn, user_id, current_rod="vara_bambu")
+        set_current_rod(conn, user_id, "vara_ouro")
+        self.assertEqual(get_current_rod(conn, user_id), "vara_ouro")
+
+        conn.execute(
+            "UPDATE economy SET current_rod = ? WHERE user_id = ?", ("vara_bambu", user_id)
+        )
+        conn.commit()
+
+        self.assertEqual(get_current_rod(conn, user_id), "vara_ouro")
+
+    # ------------------------------------------- XP de pesca fim-a-fim
+    async def test_fishing_xp_and_fish_count_survive_a_stale_legacy_row(self):
+        """Fluxo completo de /eco pescar com a legada adulterada logo antes:
+        o comando não pode partir do estado velho."""
+        conn = self._make_conn()
+        user_id = 8009
+        self._account(conn, user_id, guild_rank="E", guild_xp=100, fish_count=5)
+        conn.execute(
+            "INSERT INTO quest_progress (user_id, current_chapter) VALUES (?, 'acesso_liberado')",
+            (user_id,),
+        )
+        conn.commit()
+        set_guild_rank(conn, user_id, "E", 300)
+
+        # Legada adulterada para valores diferentes dos da v4 nos dois campos.
+        conn.execute(
+            "UPDATE economy SET guild_xp = ?, fish_count = ? WHERE user_id = ?",
+            (100, 99, user_id),
+        )
+        conn.commit()
+
+        interaction = SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name="Tester", display_name="Tester"),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+        real_choice = economia.random.choice
+
+        def low_tier(seq):
+            cands = [i for i in seq if isinstance(i, tuple) and len(i) == 6 and 0 < i[4] <= 1]
+            return cands[0] if cands else real_choice(seq)
+
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia.random, "choice", side_effect=low_tier):
+            await economia.pescar.callback(interaction)
+
+        row = conn.execute(
+            "SELECT guild_xp, fish_count FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        # Parte de 300 (v4), não de 100 (legada adulterada); +2 de XP do tier baixo.
+        self.assertEqual(row["guild_xp"], 302)
+        # 5 vieram da importação de criação; a pescaria soma 1. O 99 plantado
+        # na legada não pode entrar na conta.
+        self.assertEqual(row["fish_count"], 6)
+
+    # ------------------------------- criação de conta ainda importa a legada
+    def test_pre_v4_account_is_still_imported_on_first_touch(self):
+        """Contraprova: o caminho de criação continua trazendo a legada — é o
+        que faz uma conta antiga (pré-v4) não nascer zerada."""
+        conn = self._make_conn()
+        user_id = 8010
+        conn.execute(
+            """
+            INSERT INTO economy (user_id, user_name, wallet, scrap, guild_rank, guild_xp,
+                                 inventory, current_rod, afk_trap)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id, "Antigo", 777, 42, "C", 1234,
+                json.dumps({"energetico": 3}), "vara_ouro",
+                json.dumps({"type": "covo_basico", "status": "ready", "timer_end": 0}),
+            ),
+        )
+        conn.commit()
+        self.assertIsNone(
+            conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        )
+
+        ensure_user(conn, user_id, "Antigo")
+
+        self.assertEqual(get_wallet(conn, user_id), 777)
+        self.assertEqual(get_scrap(conn, user_id), 42)
+        self.assertEqual(get_guild_rank(conn, user_id), {"rank": "C", "xp": 1234})
+        self.assertEqual(get_inventory(conn, user_id).get("energetico"), 3)
+        self.assertEqual(get_current_rod(conn, user_id), "vara_ouro")
+        self.assertEqual(get_trap(conn, user_id).get("status"), "ready")
+
+    def test_sibling_rows_are_recreated_even_for_an_existing_user(self):
+        """set_current_rod/set_cooldown/try_upgrade_rod fazem UPDATE puro e
+        viram no-op se a linha irmã sumir. Antes o sync_user_from_economy de
+        toda chamada recriava por efeito colateral; agora o INSERT OR IGNORE
+        é explícito e incondicional."""
+        conn = self._make_conn()
+        user_id = 8011
+        self._account(conn, user_id, wallet=0)
+
+        conn.execute("DELETE FROM user_rods WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM rod_upgrades WHERE user_id = ?", (user_id,))
+        conn.execute("DELETE FROM user_cooldowns WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+        set_current_rod(conn, user_id, "vara_ouro")
+
+        self.assertEqual(get_current_rod(conn, user_id), "vara_ouro")
+        self.assertEqual(get_rod_upgrades(conn, user_id), {"luck": 0, "cd": 0})
+        self.assertIsNone(get_cooldowns(conn, user_id)["last_fish"])
 
 
 

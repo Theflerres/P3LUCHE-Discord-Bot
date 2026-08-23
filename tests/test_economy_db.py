@@ -45,16 +45,41 @@ class EconomyDbTests(unittest.TestCase):
         ensure_v4_tables(conn)
         return conn
 
-    def test_ensure_user_syncs_existing_users_row_from_economy(self):
+    def test_ensure_user_imports_from_economy_on_account_creation(self):
+        """Conta pré-v4 (existe em economy, não existe em users): o primeiro
+        contato importa os dados da legada."""
         conn = self._make_conn()
         conn.execute(
             "INSERT INTO economy (user_id, user_name, wallet) VALUES (?, ?, ?)",
             (42, "Teste", 250),
         )
+        conn.commit()
+
+        ensure_user(conn, 42, "Teste")
+
+        self.assertEqual(get_wallet(conn, 42), 250)
+
+    def test_ensure_user_does_not_reimport_over_an_existing_users_row(self):
+        """Etapa 2 — mudança deliberada de contrato.
+
+        Antes, ensure_user() chamava sync_user_from_economy() em TODA chamada,
+        então um `users` já existente era sobrescrito pela legada. Como
+        ensure_user roda no início de quase todo helper v4, era por aí que
+        dado já removido na v4 ressuscitava. Agora a importação legada->v4 só
+        acontece na criação da linha.
+        """
+        conn = self._make_conn()
         conn.execute(
-            "INSERT INTO users (user_id, user_name, wallet) VALUES (?, ?, ?)",
-            (42, "Teste", 0),
+            "INSERT INTO economy (user_id, user_name, wallet) VALUES (?, ?, ?)",
+            (42, "Teste", 250),
         )
+        conn.commit()
+        ensure_user(conn, 42, "Teste")
+        self.assertEqual(get_wallet(conn, 42), 250)
+
+        # Escrita fora da v4 na legada (só possível por adulteração direta —
+        # nenhum fluxo do projeto faz isso hoje). Não pode voltar para a v4.
+        conn.execute("UPDATE economy SET wallet = ? WHERE user_id = ?", (9999, 42))
         conn.commit()
 
         ensure_user(conn, 42, "Teste")
@@ -66,10 +91,6 @@ class EconomyDbTests(unittest.TestCase):
         conn.execute(
             "INSERT INTO economy (user_id, user_name, wallet) VALUES (?, ?, ?)",
             (43, "Texto", "300"),
-        )
-        conn.execute(
-            "INSERT INTO users (user_id, user_name, wallet) VALUES (?, ?, ?)",
-            (43, "Texto", "0"),
         )
         conn.commit()
 

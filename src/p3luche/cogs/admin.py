@@ -17,7 +17,6 @@ UI do Discord (escondido de quem não é admin do servidor); não substitui
 a checagem de backend.
 """
 import asyncio
-import json
 import time
 from datetime import datetime
 
@@ -38,6 +37,7 @@ from economy_db import (
     modify_wallet,
     reset_all_players,
     reset_player_progress,
+    set_inventory_item,
 )
 from permissions import is_bot_owner
 from utils import log_to_gui
@@ -664,20 +664,18 @@ class AdminCog(commands.Cog):
         conn = get_bot_instance().db_conn
         cursor = conn.cursor()
 
-        row = cursor.execute("SELECT inventory FROM economy WHERE user_id = ?", (user_id,)).fetchone()
+        row = cursor.execute("SELECT 1 FROM economy WHERE user_id = ?", (user_id,)).fetchone()
         if not row:
             return await interaction.response.send_message("Crie uma conta pescando primeiro.", ephemeral=True)
 
-        try:
-            inv = json.loads(row["inventory"]) if row["inventory"] else {}
-        except (json.JSONDecodeError, TypeError):
-            inv = {}
-
-        inv["garrafa_incrustada"] = 1
-
         cursor.execute("UPDATE quest_progress SET current_chapter = 'inicio' WHERE user_id = ?", (user_id,))
-        cursor.execute("UPDATE economy SET inventory = ? WHERE user_id = ?", (json.dumps(inv), user_id))
         conn.commit()
+
+        # Grava pela v4. Escrever o JSON de `economy.inventory` direto era o
+        # último escritor só-na-legada do projeto: a garrafa nunca chegava em
+        # user_inventory e o sync_user_to_economy do comando seguinte
+        # sobrescrevia a coluna a partir da v4, apagando o item.
+        set_inventory_item(conn, user_id, "garrafa_incrustada", 1)
 
         await interaction.response.send_message(
             "🛠️ **DEBUG:** Garrafa adicionada e Quest resetada.\nTeste agora usando `/ler_garrafa`.",
