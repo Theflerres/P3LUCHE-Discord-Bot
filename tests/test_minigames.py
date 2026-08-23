@@ -141,9 +141,10 @@ class BattleViewAntiReplayTests(unittest.IsolatedAsyncioTestCase):
 
 
 class MemoriaCooldownTests(unittest.IsolatedAsyncioTestCase):
-    """Regressão: /eco memoria pagava 150 Sachês garantidos sem custo real
-    (20-48k Sachês/hora de graça, auditoria Fase 4) — agora tem cooldown
-    real de 300s (mesma base da vara inicial).
+    """Regressão: /eco memoria pagava sem custo real nem cooldown (20-48k
+    Sachês/hora de graça, auditoria Fase 4) — agora tem cooldown real de 300s
+    (mesma base da vara inicial). O valor do prêmio vive em MEMORIA_PREMIO e
+    é balanceamento, não regra deste teste.
     """
 
     def _make_interaction(self, user_id, name="Tester"):
@@ -225,7 +226,10 @@ class MemoriaViewAntiReplayTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(view.finished)
         wallet_after_win = get_wallet(conn, uid)
-        self.assertEqual(wallet_after_win, 150)
+        # Lê a constante em vez de um literal: este teste é sobre pagamento
+        # duplo, não sobre o valor do prêmio — travar o número aqui faz um
+        # ajuste de balanceamento quebrar um teste de anti-replay.
+        self.assertEqual(wallet_after_win, minigames.MEMORIA_PREMIO)
 
         # Qualquer clique adicional (mesmo em carta nunca virada) é
         # bloqueado pela guarda `finished`, não paga de novo.
@@ -235,6 +239,48 @@ class MemoriaViewAntiReplayTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(get_wallet(conn, uid), wallet_after_win)
         self.assertIn("já encerrado", another_interaction.response.send_message.call_args.args[0])
+
+
+class MemoriaPremioTests(unittest.TestCase):
+    """Ajuste de balanceamento: o Aquário rendia mais que a pescaria da faixa
+    de entrada, sem custo e sem depender de equipamento."""
+
+    def _pesca_inicial_por_hora(self):
+        """Sachês/hora da Vara de Bambu, o piso da progressão de verdade."""
+        from cogs.economia import ROD_STATS, FISH_DB, TRASH_ITEMS, TRASH_ROLL_RATIO
+
+        r = ROD_STATS["vara_bambu"]
+        climas = {"normal": (1.0, 1.0, 0, 0.7), "bad": (0.5, 2.0, 0, 0.2), "good": (1.5, 0.5, 1, 0.1)}
+        iniciais = [p for p in FISH_DB if p[4] == 0 and p[0] not in TRASH_ITEMS]
+        media = lambda p: (p[1] + p[2]) / 2
+        ev = 0.0
+        for _, (lm, tm, tb, peso) in climas.items():
+            pt = max(0.0, min(100.0, r["trash"] * tm)) / 100.0
+            mult = r["luck"] * lm
+            parcial = pt * (1 - TRASH_ROLL_RATIO) * (sum(map(media, iniciais)) / len(iniciais)) * mult
+            pool = [p for p in FISH_DB if 0 < p[4] <= r["tier"] + tb] or iniciais
+            parcial += (1 - pt) * (
+                sum(media(p) for p in pool if p[0] not in TRASH_ITEMS) / len(pool)
+            ) * mult
+            ev += peso * parcial
+        return ev * 3600 / int(300 * r["cd"])
+
+    def test_premio_lowered(self):
+        self.assertEqual(minigames.MEMORIA_PREMIO, 100)
+
+    def test_hourly_rate(self):
+        por_hora = minigames.MEMORIA_PREMIO * 3600 / minigames.MEMORIA_COOLDOWN_SECONDS
+        self.assertEqual(por_hora, 1200)
+
+    def test_memoria_pays_less_per_hour_than_the_starter_rod_band(self):
+        """O invariante de desenho: um minijogo sem risco nem equipamento não
+        pode ser a melhor renda de quem está começando."""
+        memoria_h = minigames.MEMORIA_PREMIO * 3600 / minigames.MEMORIA_COOLDOWN_SECONDS
+        pesca_h = self._pesca_inicial_por_hora()
+        # Ainda é bem acima da pescaria em números absolutos — o Aquário roda
+        # em cooldown próprio e soma. O que a asserção fixa é que a distância
+        # parou de crescer: no valor antigo eram 7,4x a pescaria inicial.
+        self.assertLess(memoria_h / pesca_h, 5.0)
 
 
 if __name__ == "__main__":

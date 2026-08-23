@@ -14,7 +14,12 @@ from economy_db import (
     modify_wallet,
     start_island_construction,
 )
-from cogs.ilha import ISLAND_STRUCTURES, _structure_cost
+from cogs.ilha import (
+    ISLAND_STRUCTURES,
+    _structure_cost,
+    get_island_bonuses,
+    island_bonuses,
+)
 
 
 def _make_conn():
@@ -276,6 +281,87 @@ class FullProgressionFlowTests(unittest.TestCase):
         done = finalize_island_construction(conn, user_id, "nucleo", 1, is_core=True)
         self.assertTrue(done["success"])
         self.assertEqual(get_island(conn, user_id)["tier"], 1)
+
+
+class IslandBonusTests(unittest.TestCase):
+    """Item 4: as construções deixaram de ser só custo e passaram a fazer algo.
+
+    A regra de desenho que os testes fixam é que cada estrutura mexe num eixo
+    diferente — quatro construções dando "+X% de renda" seriam a mesma
+    construção quatro vezes, e a decisão de qual erguer primeiro sumiria.
+    """
+
+    def _estruturas(self, **niveis):
+        return {
+            chave: {"level": nivel, "status": "idle", "timer_end": None, "state_json": "{}"}
+            for chave, nivel in niveis.items()
+        }
+
+    def test_no_structures_means_no_bonus(self):
+        b = island_bonuses({})
+        self.assertEqual(b["cd_reducao"], 0.0)
+        self.assertEqual(b["sorte_bonus"], 0.0)
+        self.assertEqual(b["sucata_mult"], 1.0)
+        self.assertEqual(b["craft_mult"], 1.0)
+        self.assertFalse(b["isca_diaria"])
+
+    def test_camp_reduces_cooldown_by_two_percent_per_level(self):
+        for nivel, esperado in [(1, 0.02), (2, 0.04), (3, 0.06), (4, 0.08)]:
+            with self.subTest(nivel=nivel):
+                b = island_bonuses(self._estruturas(nucleo=nivel))
+                self.assertAlmostEqual(b["cd_reducao"], esperado)
+
+    def test_camp_bonus_is_capped_at_max_level(self):
+        """Nível acima do teto do catálogo não pode render bônus extra."""
+        acima = ISLAND_STRUCTURES["nucleo"]["max_level"] + 3
+        b = island_bonuses(self._estruturas(nucleo=acima))
+        self.assertAlmostEqual(b["cd_reducao"], 0.08)
+
+    def test_each_structure_touches_a_different_axis(self):
+        """A matriz tem que sair diagonal: uma estrutura, um eixo."""
+        eixos = ["cd_reducao", "sorte_bonus", "sucata_mult", "craft_mult"]
+        neutro = {"cd_reducao": 0.0, "sorte_bonus": 0.0, "sucata_mult": 1.0, "craft_mult": 1.0}
+        por_estrutura = {
+            "nucleo": "cd_reducao",
+            "farol": "sorte_bonus",
+            "deposito": "sucata_mult",
+            "oficina": "craft_mult",
+        }
+        for chave, eixo_esperado in por_estrutura.items():
+            b = island_bonuses(self._estruturas(**{chave: 1}))
+            for eixo in eixos:
+                with self.subTest(estrutura=chave, eixo=eixo):
+                    if eixo == eixo_esperado:
+                        self.assertNotEqual(b[eixo], neutro[eixo])
+                    else:
+                        self.assertEqual(b[eixo], neutro[eixo])
+
+    def test_full_island_stacks_every_axis(self):
+        b = island_bonuses(self._estruturas(nucleo=4, deposito=1, oficina=1, farol=1))
+        self.assertAlmostEqual(b["cd_reducao"], 0.08)
+        self.assertAlmostEqual(b["sorte_bonus"], 0.10)
+        self.assertEqual(b["sucata_mult"], 1.25)
+        self.assertEqual(b["craft_mult"], 0.5)
+        self.assertTrue(b["isca_diaria"])
+
+    def test_structure_under_construction_grants_nothing(self):
+        """O nível só sobe em finalize_island_construction; obra em andamento
+        não pode pagar bônus adiantado."""
+        em_obra = {"nucleo": {"level": 0, "status": "building", "timer_end": 1, "state_json": "{}"}}
+        self.assertEqual(island_bonuses(em_obra)["cd_reducao"], 0.0)
+
+    def test_reads_from_the_database(self):
+        conn = _make_conn()
+        user_id = 5501
+        self.assertEqual(get_island_bonuses(conn, user_id)["sorte_bonus"], 0.0)
+
+        conn.execute(
+            "INSERT INTO user_island_structures (user_id, structure_key, level, status) "
+            "VALUES (?, 'farol', 1, 'idle')",
+            (user_id,),
+        )
+        conn.commit()
+        self.assertAlmostEqual(get_island_bonuses(conn, user_id)["sorte_bonus"], 0.10)
 
 
 if __name__ == "__main__":

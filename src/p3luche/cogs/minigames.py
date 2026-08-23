@@ -25,6 +25,7 @@ from economy_db import (
     set_inventory_item,
 )
 from cogs.economia import SHOP_ITEMS, eco_group
+from cogs.ilha import get_island_bonuses
 
 CRAFT_RECIPES = {
     "brilhante": {
@@ -136,9 +137,14 @@ async def craftar(interaction: discord.Interaction, tipo: str):
                 f"❌ Precisa de {qty}x **{fish}** (tem {inv.get(fish, 0)}).",
                 ephemeral=True,
             )
-    if scrap < recipe["scrap"]:
+    # Bancada do Náufrago (ilha) corta o custo de sucata pela metade. O custo
+    # cobrado é o mesmo que a checagem acima usa — calcular duas vezes com
+    # regras diferentes deixaria o jogador ser recusado por um valor e
+    # debitado por outro.
+    custo_scrap = int(recipe["scrap"] * get_island_bonuses(conn, uid)["craft_mult"])
+    if scrap < custo_scrap:
         return await interaction.response.send_message(
-            f"❌ Precisa de {recipe['scrap']} sucata (tem {scrap}).",
+            f"❌ Precisa de {custo_scrap} sucata (tem {scrap}).",
             ephemeral=True,
         )
 
@@ -150,7 +156,7 @@ async def craftar(interaction: discord.Interaction, tipo: str):
     # logo abaixo disparava sync_user_from_economy(), que sobrescrevia
     # users.scrap com o valor antigo vindo de `economy` — o craft saía de
     # graça. Precisa vir ANTES do add_inventory_item() do resultado.
-    modify_scrap(conn, uid, -recipe["scrap"])
+    modify_scrap(conn, uid, -custo_scrap)
     add_inventory_item(conn, uid, recipe["result"], 1)
     conn.commit()
 
@@ -261,12 +267,13 @@ class MemoriaView(discord.ui.View):
                         if view.pairs_found >= 6:
                             view.finished = True
                             modify_wallet(
-                                get_bot_instance().db_conn, view.user_id, 150
+                                get_bot_instance().db_conn, view.user_id, MEMORIA_PREMIO
                             )
                             for child in view.children:
                                 child.disabled = True
                             await interaction.response.edit_message(
-                                content=view._board_text() + "\n\n🎉 **Vitória! +150 Sachês**",
+                                content=view._board_text()
+                                + f"\n\n🎉 **Vitória! +{MEMORIA_PREMIO} Sachês**",
                                 view=view,
                             )
                             view.stop()
@@ -299,9 +306,17 @@ class MemoriaView(discord.ui.View):
 
 # 300 Sachês garantidos por vitória mereciam custo real de entrada — sem
 # isso, o jogo pagava 20-48k Sachês/hora de graça (auditoria da Fase 4).
-# Mesmo cooldown base da vara inicial (vara_bambu, 5min/300s): 150 Sachês
-# garantidos ao completar o tabuleiro é equivalente a uma boa pescaria.
+# Mesmo cooldown base da vara inicial (vara_bambu, 5min/300s).
 MEMORIA_COOLDOWN_SECONDS = 300
+
+# 150 -> 100. A 150 por rodada o Aquário rendia 1.800 Sachês/hora garantidos,
+# sem custo de entrada e sem depender de equipamento — mais do que a pescaria
+# da faixa de entrada, mesmo depois do ajuste da vara inicial (244,5/h com a
+# Vara de Bambu). Um minijogo sem risco não pode ser a melhor fonte de renda
+# de quem está começando, senão a vara deixa de ser a progressão principal.
+# A 100 ele fica em 1.200/h: continua sendo um bom complemento, mas o valor
+# não é mais o argumento para ignorar a vara.
+MEMORIA_PREMIO = 100
 
 
 @eco_group.command(name="memoria", description="Jogo da memória do aquário.")

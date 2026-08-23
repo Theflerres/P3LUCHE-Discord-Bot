@@ -107,7 +107,18 @@ CREATE TABLE IF NOT EXISTS user_island_unlocks (
     unlocked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, unlock_key)
 );
+CREATE TABLE IF NOT EXISTS mission_completions (
+    leader_id INTEGER,
+    mission_id TEXT,
+    completed_on DATE,
+    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (leader_id, mission_id, completed_on)
+);
 """
+
+# Teto de conclusões de missão por grupo, por dia civil. É o mesmo número de
+# missões que o quadro oferece, então o teto é o que a interface já promete.
+MISSION_DAILY_CAP = 3
 
 
 def ensure_v4_tables(conn: sqlite3.Connection) -> None:
@@ -797,6 +808,73 @@ def add_guild_xp(conn: sqlite3.Connection, user_id: int, delta: int) -> int:
         sync_user_to_economy(conn, user_id)
         conn.commit()
         return new_xp
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# --- TETO DE MISSÕES (por grupo, por dia civil) ---
+# A missão era infinitamente repetível: o bloco de conclusão zerava
+# active_mission_id/mission_progress e não registrava nada, então bastava
+# reaceitar a mesma missão. No rank A isso são 8.000 Sachês por ciclo, sem
+# limite. A trava é por leader_id porque a missão vive na tabela `parties`,
+# indexada pelo líder — limitação conhecida e documentada: quem troca de grupo
+# ao longo do dia contorna o teto.
+
+
+def _hoje() -> str:
+    """Dia civil no mesmo critério do /eco diario (data local, não UTC)."""
+    return datetime.now().date().isoformat()
+
+
+def missions_completed_today(conn: sqlite3.Connection, leader_id: int) -> set:
+    ensure_v4_tables(conn)
+    rows = conn.execute(
+        "SELECT mission_id FROM mission_completions WHERE leader_id = ? AND completed_on = ?",
+        (leader_id, _hoje()),
+    ).fetchall()
+    return {r["mission_id"] for r in rows}
+
+
+def mission_slots_left(conn: sqlite3.Connection, leader_id: int) -> int:
+    return max(0, MISSION_DAILY_CAP - len(missions_completed_today(conn, leader_id)))
+
+
+def try_register_mission_completion(conn: sqlite3.Connection, leader_id: int, mission_id: str) -> dict:
+    """Reserva a conclusão de hoje. Só quem receber success=True pode pagar.
+
+    O INSERT com chave composta é a própria trava: duas conclusões simultâneas
+    da mesma missão disputam a mesma linha e só uma insere. Checar antes com um
+    SELECT deixaria a janela entre a leitura e a escrita aberta — mesmo
+    raciocínio do BEGIN IMMEDIATE no resto da camada.
+    """
+    ensure_v4_tables(conn)
+    hoje = _hoje()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        feitas = {
+            r["mission_id"]
+            for r in conn.execute(
+                "SELECT mission_id FROM mission_completions WHERE leader_id = ? AND completed_on = ?",
+                (leader_id, hoje),
+            ).fetchall()
+        }
+        if mission_id in feitas:
+            conn.commit()
+            return {"success": False, "reason": "already_today", "restantes": max(0, MISSION_DAILY_CAP - len(feitas))}
+        if len(feitas) >= MISSION_DAILY_CAP:
+            conn.commit()
+            return {"success": False, "reason": "daily_cap", "restantes": 0}
+
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO mission_completions (leader_id, mission_id, completed_on) VALUES (?, ?, ?)",
+            (leader_id, mission_id, hoje),
+        )
+        if cur.rowcount == 0:
+            conn.commit()
+            return {"success": False, "reason": "already_today", "restantes": max(0, MISSION_DAILY_CAP - len(feitas))}
+        conn.commit()
+        return {"success": True, "reason": None, "restantes": MISSION_DAILY_CAP - len(feitas) - 1}
     except Exception:
         conn.rollback()
         raise

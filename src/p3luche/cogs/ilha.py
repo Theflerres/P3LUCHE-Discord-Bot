@@ -92,6 +92,48 @@ ISLAND_STRUCTURES = {
 }
 
 
+# --- BÔNUS MECÂNICOS DAS CONSTRUÇÕES ---
+# Cada estrutura mexe num eixo diferente de propósito. Quatro construções
+# dando "+X% de renda" seriam a mesma construção quatro vezes, e a decisão de
+# qual erguer primeiro deixaria de existir.
+#
+# O núcleo escala com o nível (é a única com mais de um); as demais têm nível
+# único, então o bônus liga quando ela existe.
+ISLAND_BONUS = {
+    "nucleo_cd_por_nivel": 0.02,   # -2% de cooldown de pesca por nível (máx -8%)
+    "deposito_sucata_mult": 1.25,  # +25% em toda fonte de sucata
+    "oficina_craft_mult": 0.5,     # craft custa metade da sucata
+    "farol_sorte": 0.10,           # +10% de sorte, multiplicativo com a vara
+}
+
+
+def island_bonuses(structures: dict) -> dict:
+    """Bônus ativos a partir do estado das construções.
+
+    Função pura sobre o dicionário de `get_island_structures` para poder ser
+    exercitada sem banco. Construção em obra (`status == 'building'`) ainda
+    não conta: o nível só sobe em `finalize_island_construction`.
+    """
+    def nivel(chave):
+        estado = structures.get(chave)
+        return estado["level"] if estado else 0
+
+    nucleo = min(nivel("nucleo"), ISLAND_STRUCTURES["nucleo"]["max_level"])
+    return {
+        "cd_reducao": nucleo * ISLAND_BONUS["nucleo_cd_por_nivel"],
+        "sucata_mult": ISLAND_BONUS["deposito_sucata_mult"] if nivel("deposito") else 1.0,
+        "craft_mult": ISLAND_BONUS["oficina_craft_mult"] if nivel("oficina") else 1.0,
+        "sorte_bonus": ISLAND_BONUS["farol_sorte"] if nivel("farol") else 0.0,
+        "isca_diaria": bool(nivel("oficina")),
+    }
+
+
+def get_island_bonuses(conn, user_id: int) -> dict:
+    """Versão que lê do banco. Ponto único de consulta para os outros cogs —
+    nenhum deles deve reimplementar a leitura das estruturas."""
+    return island_bonuses(get_island_structures(conn, user_id))
+
+
 def _structure_cost(structure_key: str, current_level: int) -> dict:
     """Custo/tempo para levar `structure_key` de current_level para o
     próximo nível. Para estruturas-núcleo o custo escala com o nível alvo

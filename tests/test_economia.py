@@ -1,7 +1,9 @@
 import asyncio
 import json
+import random
 import sqlite3
 import unittest
+from collections import Counter
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -10,6 +12,7 @@ import discord
 
 from cogs import economia
 from economy_db import (
+    MISSION_DAILY_CAP,
     add_guild_xp,
     add_inventory_item,
     ensure_user,
@@ -32,7 +35,10 @@ from economy_db import (
     set_inventory_item,
     set_trap,
     sync_user_to_economy,
+    try_register_mission_completion,
     try_spend_wallet,
+    mission_slots_left,
+    missions_completed_today,
 )
 
 
@@ -2341,6 +2347,135 @@ class PortaoXpGarrafaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_guild_rank(conn, user_id)["xp"], antes + 2)
 
 
+class VaraInicialTests(unittest.IsolatedAsyncioTestCase):
+    """Item 1 do balanceamento: a faixa de entrada estava fora da escada.
+
+    Uma vara de tier 0 zera o filtro `0 < tier <= 0` do ramo "não deu lixo",
+    e o fallback devolvia as 20 entradas de tier 0 — metade delas lixo. Efeito
+    colateral: a Vara de Treino, única vara COMPRÁVEL de tier 0, dividia o pool
+    com a vara grátis e, por ser 20% mais lenta, rendia MENOS que ela — a
+    primeira compra do jogo era um downgrade.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Novato"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name, display_name=name),
+            response=SimpleNamespace(
+                send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock()
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    # ------------------------------------------------ fallback do tier 0
+    def test_tier0_fallback_has_no_trash(self):
+        fallback = [p for p in economia.FISH_DB if p[4] == 0 and p[0] not in economia.TRASH_ITEMS]
+        self.assertEqual(len(fallback), 10)
+        self.assertTrue(all(p[0] not in economia.TRASH_ITEMS for p in fallback))
+
+    async def test_fishing_with_a_tier0_rod_never_returns_trash_from_the_fish_branch(self):
+        """Força o ramo "não deu lixo" (trash_chance 0 via Firewall) e confere
+        que 200 lances com a vara inicial não trazem uma peça de lixo."""
+        conn = self._make_conn()
+        user_id = 9801
+        ensure_user(conn, user_id, "Novato")
+        add_inventory_item(conn, user_id, "firewall", 300)
+
+        capturas = []
+        real_choice = economia.random.choice
+
+        def espiao(seq):
+            escolha = real_choice(seq)
+            if isinstance(escolha, tuple) and len(escolha) == 6:
+                capturas.append(escolha[0])
+            return escolha
+
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia, "get_local_file", return_value=(None, None)), \
+                patch.object(economia.random, "choice", side_effect=espiao):
+            for _ in range(200):
+                conn.execute("UPDATE user_cooldowns SET last_fish = NULL WHERE user_id = ?", (user_id,))
+                conn.commit()
+                await economia.pescar.callback(self._make_interaction(user_id))
+
+        self.assertEqual(len(capturas), 200)
+        lixo = [c for c in capturas if c in economia.TRASH_ITEMS]
+        self.assertEqual(lixo, [], f"fallback do tier 0 ainda devolve lixo: {set(lixo)}")
+
+    # ------------------------------------------------ stats das varas
+    def test_bambu_trash_lowered(self):
+        self.assertEqual(economia.ROD_STATS["vara_bambu"]["trash"], 35)
+        self.assertEqual(economia.ROD_STATS["vara_bambu"]["tier"], 0)
+        self.assertEqual(economia.ROD_STATS["vara_bambu"]["price"], 0)
+
+    def test_treino_is_now_tier_1(self):
+        t = economia.ROD_STATS["vara_treino"]
+        self.assertEqual(t["tier"], 1)
+        self.assertEqual(t["cd"], 1.3)
+        self.assertEqual(t["trash"], 55)
+        self.assertEqual(t["price"], 250)
+
+    def test_shop_entry_agrees_with_rod_stats(self):
+        """A loja mostra o tier para o jogador; divergir de ROD_STATS mente
+        sobre o que a compra faz."""
+        for key, item in economia.SHOP_ITEMS.items():
+            if item.get("type") != "rod":
+                continue
+            with self.subTest(vara=key):
+                self.assertEqual(item["tier"], economia.ROD_STATS[key]["tier"])
+                self.assertEqual(item["price"], economia.ROD_STATS[key]["price"])
+
+    def test_no_purchasable_rod_is_tier_zero(self):
+        """Vara comprável de tier 0 divide o pool com a vara grátis e vira
+        armadilha — foi exatamente o caso da Treino."""
+        for key, r in economia.ROD_STATS.items():
+            if r["price"] > 0:
+                with self.subTest(vara=key):
+                    self.assertGreater(r["tier"], 0)
+
+    def test_entry_ladder_is_monotonic(self):
+        """Cada compra da faixa de entrada tem que render mais por hora que a
+        anterior. Antes a escada começava DESCENDO (185,2 -> 159,8)."""
+        escada = ["vara_bambu", "vara_treino", "vara_plastico", "vara_fibra", "vara_pesada"]
+        taxas = []
+        for k in escada:
+            r = economia.ROD_STATS[k]
+            taxas.append(_ev_por_hora(k))
+        for anterior, atual, ka, kb in zip(taxas, taxas[1:], escada, escada[1:]):
+            with self.subTest(de=ka, para=kb):
+                self.assertGreater(
+                    atual, anterior,
+                    f"{economia.ROD_STATS[kb]['name']} rende menos que {economia.ROD_STATS[ka]['name']}",
+                )
+
+    def test_isca_price_lowered(self):
+        self.assertEqual(economia.SHOP_ITEMS["isca"]["price"], 25)
+
+
+def _ev_por_hora(rod_key):
+    """EV analítico de Sachês/hora de uma vara, sem upgrades e sem isca.
+
+    Espelha a matemática de `pescar` (clima ponderado 70/20/10, pool uniforme,
+    média do intervalo randint) — serve para as asserções de ORDEM da escada,
+    não como número exibido ao jogador.
+    """
+    r = economia.ROD_STATS[rod_key]
+    climas = {"normal": (1.0, 1.0, 0, 0.7), "bad": (0.5, 2.0, 0, 0.2), "good": (1.5, 0.5, 1, 0.1)}
+    iniciais = [p for p in economia.FISH_DB if p[4] == 0 and p[0] not in economia.TRASH_ITEMS]
+    media = lambda p: (p[1] + p[2]) / 2
+    ev = 0.0
+    for _, (lm, tm, tb, peso) in climas.items():
+        pt = max(0.0, min(100.0, r["trash"] * tm)) / 100.0
+        mult = r["luck"] * lm
+        parcial = pt * (1 - economia.TRASH_ROLL_RATIO) * (sum(map(media, iniciais)) / len(iniciais)) * mult
+        pool = [p for p in economia.FISH_DB if 0 < p[4] <= r["tier"] + tb] or iniciais
+        parcial += (1 - pt) * (sum(media(p) for p in pool if p[0] not in economia.TRASH_ITEMS) / len(pool)) * mult
+        ev += peso * parcial
+    return ev * 3600 / int(300 * r["cd"])
+
+
 class CovoWaitTimeTests(unittest.IsolatedAsyncioTestCase):
     """Regressão do Covo que entregava na hora.
 
@@ -2924,6 +3059,784 @@ class GuildaEntryV4Tests(unittest.IsolatedAsyncioTestCase):
             conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
         )
 
+
+
+class VenderTests(unittest.IsolatedAsyncioTestCase):
+    """Item 2: /eco vender, o escoadouro do peixe da armadilha.
+
+    Peixe pescado vira Sachê no ato e nunca entra na mochila — quem enche a
+    mochila de peixe é a armadilha AFK, e até aqui esse peixe não tinha
+    destino nenhum.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name, display_name=name),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def _conta(self, conn, user_id):
+        conn.execute("INSERT INTO economy (user_id, user_name) VALUES (?, ?)", (user_id, "Tester"))
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+
+    async def _vender(self, conn, user_id, o_que="tudo"):
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await economia.vender.callback(interaction, o_que)
+        return interaction
+
+    # ------------------------------------------------ tabela de preços
+    def test_price_matches_median_times_tier_rate(self):
+        for nome, (tier, v_min, v_max) in economia.FISH_BY_NAME.items():
+            with self.subTest(peixe=nome):
+                esperado = int((v_min + v_max) / 2 * economia.SELL_RATES[tier])
+                self.assertEqual(economia.fish_sell_price(nome), esperado)
+
+    def test_published_price_examples(self):
+        """Os números que foram para a proposta aprovada."""
+        for nome, preco in [
+            ("Sardinha", 5), ("Lambari", 4), ("Tilápia", 7),
+            ("Truta", 15), ("Tambaqui", 21), ("Lula", 24),
+            ("Peixe-Palhaço", 33), ("Arraia", 50),
+            ("Tubarão Branco", 225), ("Kraken", 1500),
+        ]:
+            with self.subTest(peixe=nome):
+                self.assertEqual(economia.fish_sell_price(nome), preco)
+
+    def test_rates_decrease_with_tier(self):
+        """Peixe raro tem que valer a pena pescar, não farmar em armadilha."""
+        taxas = [economia.SELL_RATES[t] for t in sorted(economia.SELL_RATES)]
+        for anterior, atual in zip(taxas, taxas[1:]):
+            self.assertLess(atual, anterior)
+
+    def test_trash_is_not_sellable(self):
+        for t in economia.TRASH_ITEMS:
+            with self.subTest(item=t):
+                self.assertEqual(economia.fish_sell_price(t), 0)
+                self.assertNotIn(t, economia.FISH_BY_NAME)
+
+    def test_unknown_item_is_worth_nothing(self):
+        self.assertEqual(economia.fish_sell_price("vara_ouro"), 0)
+        self.assertEqual(economia.fish_sell_price("nao_existe"), 0)
+
+    # ------------------------------------------------ venda em lote
+    async def test_sell_everything_pays_and_empties(self):
+        conn = self._make_conn()
+        user_id = 9901
+        self._conta(conn, user_id)
+        add_inventory_item(conn, user_id, "Sardinha", 10)   # 5 cada  = 50
+        add_inventory_item(conn, user_id, "Truta", 4)       # 15 cada = 60
+        add_inventory_item(conn, user_id, "Arraia", 2)      # 50 cada = 100
+
+        await self._vender(conn, user_id, "tudo")
+
+        self.assertEqual(get_wallet(conn, user_id), 210)
+        inv = get_inventory(conn, user_id)
+        for nome in ("Sardinha", "Truta", "Arraia"):
+            self.assertEqual(inv.get(nome, 0), 0, f"{nome} continuou na mochila")
+
+    async def test_sell_by_tier_leaves_other_tiers_alone(self):
+        conn = self._make_conn()
+        user_id = 9902
+        self._conta(conn, user_id)
+        add_inventory_item(conn, user_id, "Sardinha", 10)   # tier 0
+        add_inventory_item(conn, user_id, "Truta", 4)       # tier 1
+
+        await self._vender(conn, user_id, "tier1")
+
+        self.assertEqual(get_wallet(conn, user_id), 60)
+        inv = get_inventory(conn, user_id)
+        self.assertEqual(inv.get("Sardinha", 0), 10, "tier 0 foi vendido junto")
+        self.assertEqual(inv.get("Truta", 0), 0)
+
+    async def test_sell_a_single_species(self):
+        conn = self._make_conn()
+        user_id = 9903
+        self._conta(conn, user_id)
+        add_inventory_item(conn, user_id, "Sardinha", 3)
+        add_inventory_item(conn, user_id, "Lambari", 3)
+
+        await self._vender(conn, user_id, "Sardinha")
+
+        self.assertEqual(get_wallet(conn, user_id), 15)
+        self.assertEqual(get_inventory(conn, user_id).get("Lambari", 0), 3)
+
+    async def test_selling_never_touches_trash_or_gear(self):
+        conn = self._make_conn()
+        user_id = 9904
+        self._conta(conn, user_id)
+        add_inventory_item(conn, user_id, "Sardinha", 2)
+        add_inventory_item(conn, user_id, "Bota Velha", 5)
+        add_inventory_item(conn, user_id, "vara_ouro", 1)
+        add_inventory_item(conn, user_id, "isca", 7)
+
+        await self._vender(conn, user_id, "tudo")
+
+        inv = get_inventory(conn, user_id)
+        self.assertEqual(inv.get("Bota Velha", 0), 5, "lixo foi vendido")
+        self.assertEqual(inv.get("vara_ouro", 0), 1, "vara foi vendida")
+        self.assertEqual(inv.get("isca", 0), 7, "consumível foi vendido")
+        self.assertEqual(get_wallet(conn, user_id), 10)
+
+    async def test_trash_keyword_points_to_galdino_without_selling(self):
+        conn = self._make_conn()
+        user_id = 9905
+        self._conta(conn, user_id)
+        add_inventory_item(conn, user_id, "Bota Velha", 5)
+
+        interaction = await self._vender(conn, user_id, "lixo")
+
+        args, _ = interaction.response.send_message.call_args
+        self.assertIn("Galdino", args[0])
+        self.assertEqual(get_inventory(conn, user_id).get("Bota Velha", 0), 5)
+        self.assertEqual(get_wallet(conn, user_id), 0)
+
+    async def test_empty_selection_is_refused_without_charging(self):
+        conn = self._make_conn()
+        user_id = 9906
+        self._conta(conn, user_id)
+        add_inventory_item(conn, user_id, "Sardinha", 3)
+
+        interaction = await self._vender(conn, user_id, "tier3")
+
+        args, _ = interaction.response.send_message.call_args
+        self.assertIn("não tem peixe", args[0])
+        self.assertEqual(get_inventory(conn, user_id).get("Sardinha", 0), 3)
+
+    async def test_unknown_term_is_refused(self):
+        conn = self._make_conn()
+        user_id = 9907
+        self._conta(conn, user_id)
+        add_inventory_item(conn, user_id, "Sardinha", 3)
+
+        interaction = await self._vender(conn, user_id, "banana")
+
+        args, _ = interaction.response.send_message.call_args
+        self.assertIn("Não reconheço", args[0])
+        self.assertEqual(get_inventory(conn, user_id).get("Sardinha", 0), 3)
+
+    async def test_account_is_required(self):
+        conn = self._make_conn()
+        interaction = await self._vender(conn, 9908, "tudo")
+        args, _ = interaction.response.send_message.call_args
+        self.assertIn("/eco pescar", args[0])
+        self.assertIsNone(
+            conn.execute("SELECT 1 FROM users WHERE user_id = ?", (9908,)).fetchone()
+        )
+
+    async def test_selling_twice_does_not_pay_twice(self):
+        conn = self._make_conn()
+        user_id = 9909
+        self._conta(conn, user_id)
+        add_inventory_item(conn, user_id, "Arraia", 2)
+
+        await self._vender(conn, user_id, "tudo")
+        await self._vender(conn, user_id, "tudo")
+
+        self.assertEqual(get_wallet(conn, user_id), 100)
+
+
+class RedeDeArrastoTests(unittest.TestCase):
+    """Dependência do Item 2: a Rede rendia menos que o Covo, que é grátis."""
+
+    def _liquido_por_hora(self, key):
+        st = economia.TRAP_TYPES[key]
+        pool = [p for p in economia.FISH_DB if p[4] <= st["loot_tier_max"]]
+        coletas_h = 3600 / (st["wait_time"] + st["reset_time"])
+        bruto = coletas_h * st["capacity"] * (
+            sum(economia.fish_sell_price(p[0]) for p in pool) / len(pool)
+        )
+        reparo = coletas_h * (st["break_chance"] / 100) * st["repair_cost"]
+        return bruto - reparo
+
+    def test_rede_stats_adjusted(self):
+        rede = economia.TRAP_TYPES["rede_industrial"]
+        self.assertEqual(rede["break_chance"], 35)
+        self.assertEqual(rede["repair_cost"], 250)
+
+    def test_rede_beats_the_free_covo(self):
+        """O invariante que a mudança existe para garantir: um item pago não
+        pode render menos que o gratuito."""
+        covo = self._liquido_por_hora("covo_basico")
+        rede = self._liquido_por_hora("rede_industrial")
+        self.assertGreater(rede, covo)
+        self.assertGreater(rede, covo * 2, "a Rede custa 1500; precisa compensar de verdade")
+
+    def test_rede_pays_back_in_reasonable_time(self):
+        ganho = self._liquido_por_hora("rede_industrial") - self._liquido_por_hora("covo_basico")
+        self.assertLess(economia.TRAP_TYPES["rede_industrial"]["cost"] / ganho, 4.0)
+
+    def test_no_trap_is_net_negative(self):
+        for key in economia.TRAP_TYPES:
+            with self.subTest(armadilha=key):
+                self.assertGreater(self._liquido_por_hora(key), 0)
+
+
+class TetoDeMissoesTests(unittest.IsolatedAsyncioTestCase):
+    """Item 7: a missão era infinitamente repetível.
+
+    O bloco de conclusão zerava active_mission_id/mission_progress e não
+    registrava nada, então bastava reaceitar a mesma missão no quadro. No rank
+    A isso são 8.000 Sachês por ciclo, sem limite.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name, display_name=name),
+            response=SimpleNamespace(
+                send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock()
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def _seed(self, conn, user_id):
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, guild_rank, guild_xp) VALUES (?, ?, 'F', 0)",
+            (user_id, "Tester"),
+        )
+        conn.execute(
+            "INSERT INTO quest_progress (user_id, current_chapter) VALUES (?, 'acesso_liberado')",
+            (user_id,),
+        )
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+
+    def _armar(self, conn, user_id, mission_id="f1", progress=4, target=5):
+        """Party de um membro com a missão a uma pescaria de fechar."""
+        conn.execute(
+            "INSERT OR REPLACE INTO parties (leader_id, leader_name, members_json, "
+            "active_mission_id, mission_progress, mission_target) VALUES (?, ?, '[]', ?, ?, ?)",
+            (user_id, "Tester", mission_id, progress, target),
+        )
+        conn.commit()
+
+    async def _pescar(self, conn, user_id):
+        conn.execute("UPDATE user_cooldowns SET last_fish = NULL WHERE user_id = ?", (user_id,))
+        conn.commit()
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia, "get_local_file", return_value=(None, None)):
+            await economia.pescar.callback(interaction)
+        return interaction
+
+    # ------------------------------------------------ camada de dados
+    def test_first_registration_succeeds_and_second_fails(self):
+        conn = self._make_conn()
+        primeira = try_register_mission_completion(conn, 100, "a1")
+        self.assertTrue(primeira["success"])
+        self.assertEqual(primeira["restantes"], MISSION_DAILY_CAP - 1)
+
+        segunda = try_register_mission_completion(conn, 100, "a1")
+        self.assertFalse(segunda["success"])
+        self.assertEqual(segunda["reason"], "already_today")
+
+    def test_daily_cap_blocks_the_fourth_distinct_mission(self):
+        conn = self._make_conn()
+        for i in range(MISSION_DAILY_CAP):
+            self.assertTrue(try_register_mission_completion(conn, 101, f"m{i}")["success"])
+
+        excedente = try_register_mission_completion(conn, 101, "m_extra")
+        self.assertFalse(excedente["success"])
+        self.assertEqual(excedente["reason"], "daily_cap")
+        self.assertEqual(mission_slots_left(conn, 101), 0)
+
+    def test_cap_is_per_party_not_global(self):
+        conn = self._make_conn()
+        for i in range(MISSION_DAILY_CAP):
+            try_register_mission_completion(conn, 102, f"m{i}")
+        self.assertEqual(mission_slots_left(conn, 102), 0)
+        self.assertEqual(mission_slots_left(conn, 103), MISSION_DAILY_CAP)
+        self.assertTrue(try_register_mission_completion(conn, 103, "m0")["success"])
+
+    def test_yesterdays_completions_do_not_count(self):
+        """O reset é na virada do dia civil, mesmo critério do /eco diario."""
+        conn = self._make_conn()
+        ontem = (datetime.now().date() - timedelta(days=1)).isoformat()
+        for i in range(MISSION_DAILY_CAP):
+            conn.execute(
+                "INSERT INTO mission_completions (leader_id, mission_id, completed_on) VALUES (?, ?, ?)",
+                (104, f"m{i}", ontem),
+            )
+        conn.commit()
+
+        self.assertEqual(missions_completed_today(conn, 104), set())
+        self.assertEqual(mission_slots_left(conn, 104), MISSION_DAILY_CAP)
+        self.assertTrue(try_register_mission_completion(conn, 104, "m0")["success"])
+
+    def test_completed_set_reflects_only_today(self):
+        conn = self._make_conn()
+        try_register_mission_completion(conn, 105, "b1")
+        try_register_mission_completion(conn, 105, "b2")
+        self.assertEqual(missions_completed_today(conn, 105), {"b1", "b2"})
+        self.assertEqual(mission_slots_left(conn, 105), MISSION_DAILY_CAP - 2)
+
+    # ------------------------------------------------ caminho de /eco pescar
+    async def test_mission_does_not_pay_twice_in_the_same_day(self):
+        conn = self._make_conn()
+        user_id = 9991
+        self._seed(conn, user_id)
+
+        self._armar(conn, user_id)
+        await self._pescar(conn, user_id)
+        saldo_apos_primeira = get_wallet(conn, user_id)
+        self.assertGreater(saldo_apos_primeira, 0)
+
+        # Reaceita a MESMA missão e fecha de novo — era o loop infinito.
+        self._armar(conn, user_id)
+        await self._pescar(conn, user_id)
+
+        recompensa = 50  # prêmio da f1
+        self.assertLess(
+            get_wallet(conn, user_id) - saldo_apos_primeira,
+            recompensa,
+            "a missão pagou duas vezes no mesmo dia",
+        )
+
+    async def test_reward_is_paid_on_the_first_completion(self):
+        conn = self._make_conn()
+        user_id = 9992
+        self._seed(conn, user_id)
+        self._armar(conn, user_id)
+
+        interaction = await self._pescar(conn, user_id)
+
+        self.assertEqual(missions_completed_today(conn, user_id), {"f1"})
+        embed = interaction.followup.send.call_args.kwargs["embed"]
+        self.assertIn("MISSÃO CUMPRIDA", embed.description)
+
+    async def test_blocked_completion_explains_itself(self):
+        conn = self._make_conn()
+        user_id = 9993
+        self._seed(conn, user_id)
+        try_register_mission_completion(conn, user_id, "f1")
+
+        self._armar(conn, user_id)
+        interaction = await self._pescar(conn, user_id)
+
+        embed = interaction.followup.send.call_args.kwargs["embed"]
+        self.assertIn("já tinha sido concluída hoje", embed.description)
+
+    async def test_daily_cap_message_when_exhausted(self):
+        conn = self._make_conn()
+        user_id = 9994
+        self._seed(conn, user_id)
+        for i in range(MISSION_DAILY_CAP):
+            try_register_mission_completion(conn, user_id, f"outra{i}")
+
+        self._armar(conn, user_id)
+        interaction = await self._pescar(conn, user_id)
+
+        embed = interaction.followup.send.call_args.kwargs["embed"]
+        self.assertIn("teto de", embed.description)
+
+    # ------------------------------------------------ MissionSelect
+    def test_select_hides_missions_already_done_today(self):
+        select = economia.MissionSelect(9995, "F", feitas_hoje=set(), vagas=3)
+        ids = {o.value for o in select.options}
+        self.assertTrue(ids)
+
+        alvo = next(iter(ids))
+        filtrado = economia.MissionSelect(9995, "F", feitas_hoje={alvo}, vagas=3)
+        self.assertNotIn(alvo, {o.value for o in filtrado.options})
+
+    def test_select_is_disabled_when_the_cap_is_reached(self):
+        select = economia.MissionSelect(9996, "F", feitas_hoje=set(), vagas=0)
+        self.assertTrue(select.disabled)
+        self.assertEqual([o.value for o in select.options], ["__indisponivel__"])
+
+    def test_select_never_ships_an_empty_option_list(self):
+        """O Discord recusa um Select sem opções — o estado 'nada disponível'
+        precisa de um placeholder, senão o quadro inteiro quebra."""
+        todas = {m["id"] for m in economia.MISSION_DB["F"]}
+        select = economia.MissionSelect(9997, "F", feitas_hoje=todas, vagas=3)
+        self.assertEqual(len(select.options), 1)
+        self.assertEqual(select.options[0].value, "__indisponivel__")
+
+    async def test_select_refuses_the_placeholder(self):
+        conn = self._make_conn()
+        select = economia.MissionSelect(9998, "F", feitas_hoje=set(), vagas=0)
+        select._values = ["__indisponivel__"]
+        interaction = self._make_interaction(9998)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await select.callback(interaction)
+        self.assertIn("Nenhuma missão disponível", interaction.response.send_message.call_args.args[0])
+
+    async def test_select_rechecks_the_cap_at_click_time(self):
+        """A view fica aberta; outro membro pode fechar uma missão no meio."""
+        conn = self._make_conn()
+        user_id = 9999
+        self._seed(conn, user_id)
+        select = economia.MissionSelect(user_id, "F", feitas_hoje=set(), vagas=3)
+        select._values = [economia.MISSION_DB["F"][0]["id"]]
+
+        for i in range(MISSION_DAILY_CAP):
+            try_register_mission_completion(conn, user_id, f"depois{i}")
+
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await select.callback(interaction)
+
+        self.assertIn("já concluiu", interaction.response.send_message.call_args.args[0])
+        party = conn.execute(
+            "SELECT active_mission_id FROM parties WHERE leader_id = ?", (user_id,)
+        ).fetchone()
+        self.assertIsNone(party["active_mission_id"] if party else None)
+
+
+class CaixaMisteriosaTests(unittest.IsolatedAsyncioTestCase):
+    """Item 6: a caixa tinha EV POSITIVO para o jogador.
+
+    500 de custo pagando randint(100, 1000) dá EV 550 — comprar em lote era
+    renda, não gasto, e o modal de compra aceita 4 dígitos de quantidade.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name="Tester", display_name="Tester"),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def _valor_de_referencia(self, resultado):
+        if resultado["tipo"] == "item":
+            return economia.SHOP_ITEMS[resultado["item"]]["price"]
+        return resultado["valor"]
+
+    # ------------------------------------------------ distribuição
+    def test_weights_sum_to_one(self):
+        self.assertAlmostEqual(sum(f[0] for f in economia.CAIXA_FAIXAS), 1.0)
+
+    def test_expected_value_is_below_the_price(self):
+        """A propriedade que estava errada: um sink não pode pagar mais do que
+        custa. Amostragem grande com semente fixa — determinística."""
+        rng = random.Random(20260823)
+        n = 300_000
+        total = sum(self._valor_de_referencia(economia.abrir_caixa_misteriosa(rng)) for _ in range(n))
+        ev = total / n
+        preco = economia.SHOP_ITEMS["caixa_misteriosa"]["price"]
+
+        self.assertLess(ev, preco, "a Caixa Misteriosa voltou a ser lucrativa")
+        self.assertAlmostEqual(ev / preco - 1, -0.098, delta=0.015)
+
+    def test_distribution_matches_the_declared_weights(self):
+        rng = random.Random(4242)
+        n = 200_000
+        contagem = Counter(economia.abrir_caixa_misteriosa(rng)["tipo"] for _ in range(n))
+        self.assertAlmostEqual(contagem["item"] / n, 0.080, delta=0.005)
+        self.assertAlmostEqual(contagem["jackpot"] / n, 0.025, delta=0.005)
+        self.assertAlmostEqual(contagem["dinheiro"] / n, 0.895, delta=0.008)
+
+    def test_every_outcome_stays_in_its_declared_range(self):
+        rng = random.Random(7)
+        for _ in range(20_000):
+            r = economia.abrir_caixa_misteriosa(rng)
+            if r["tipo"] == "item":
+                self.assertIn(r["item"], economia.CAIXA_PREMIO_ITENS)
+                self.assertEqual(r["valor"], 0)
+            elif r["tipo"] == "jackpot":
+                self.assertGreaterEqual(r["valor"], 3000)
+                self.assertLessEqual(r["valor"], 6000)
+            else:
+                self.assertGreaterEqual(r["valor"], 50)
+                self.assertLessEqual(r["valor"], 900)
+
+    def test_prize_pool_items_all_exist_in_the_shop(self):
+        for chave in economia.CAIXA_PREMIO_ITENS:
+            with self.subTest(item=chave):
+                self.assertIn(chave, economia.SHOP_ITEMS)
+                self.assertGreater(economia.SHOP_ITEMS[chave]["price"], 0)
+
+    def test_price_unchanged(self):
+        self.assertEqual(economia.SHOP_ITEMS["caixa_misteriosa"]["price"], 500)
+
+    # ------------------------------------------------ uso real
+    async def test_opening_consumes_the_box_and_pays_money(self):
+        conn = self._make_conn()
+        user_id = 9981
+        ensure_user(conn, user_id, "Tester")
+        add_inventory_item(conn, user_id, "caixa_misteriosa", 2)
+
+        select = economia.ConsumeSelect(user_id, {"caixa_misteriosa": 2})
+        select._values = ["caixa_misteriosa"]
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia, "abrir_caixa_misteriosa",
+                             return_value={"tipo": "dinheiro", "valor": 321, "item": None}):
+            await select.callback(self._make_interaction(user_id))
+
+        self.assertEqual(get_inventory(conn, user_id).get("caixa_misteriosa", 0), 1)
+        self.assertEqual(get_wallet(conn, user_id), 321)
+
+    async def test_opening_can_deliver_an_item_instead_of_money(self):
+        conn = self._make_conn()
+        user_id = 9982
+        ensure_user(conn, user_id, "Tester")
+        add_inventory_item(conn, user_id, "caixa_misteriosa", 1)
+
+        select = economia.ConsumeSelect(user_id, {"caixa_misteriosa": 1})
+        select._values = ["caixa_misteriosa"]
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia, "abrir_caixa_misteriosa",
+                             return_value={"tipo": "item", "valor": 0, "item": "firewall"}):
+            interaction = self._make_interaction(user_id)
+            await select.callback(interaction)
+
+        self.assertEqual(get_inventory(conn, user_id).get("firewall", 0), 1)
+        self.assertEqual(get_wallet(conn, user_id), 0)
+        self.assertIn("Firewall", interaction.response.send_message.call_args.args[0])
+
+
+class SucataTests(unittest.IsolatedAsyncioTestCase):
+    """Item 5: a sucata só vinha de lixo, e as varas boas evitam lixo.
+
+    Sniper .50 e Devoradora têm 0% de lixo e não produziam nenhuma sucata,
+    para sempre — enquanto os upgrades pagos em sucata são o melhor retorno
+    por unidade de recurso do jogo.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name, display_name=name),
+            response=SimpleNamespace(
+                send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock()
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def _conta(self, conn, user_id):
+        conn.execute("INSERT INTO economy (user_id, user_name) VALUES (?, ?)", (user_id, "Tester"))
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+
+    def _com_bau(self, conn, user_id):
+        conn.execute(
+            "INSERT INTO user_island_structures (user_id, structure_key, level, status) "
+            "VALUES (?, 'deposito', 1, 'idle')",
+            (user_id,),
+        )
+        conn.commit()
+
+    # ------------------------------------------------ tabela de rendimento
+    def test_scrap_per_fish_table(self):
+        for nome, (tier, _, _) in economia.FISH_BY_NAME.items():
+            with self.subTest(peixe=nome):
+                self.assertEqual(economia.fish_scrap_yield(nome), economia.SCRAP_PER_FISH[tier])
+
+    def test_trash_yields_no_scrap_through_the_sell_path(self):
+        """Lixo tem o caminho dele (Galdino); não pode contar duas vezes."""
+        for t in economia.TRASH_ITEMS:
+            with self.subTest(item=t):
+                self.assertEqual(economia.fish_scrap_yield(t), 0)
+
+    def test_desmanche_yield_formula(self):
+        for tier, esperado in [(0, 2), (1, 6), (2, 10), (3, 14), (4, 18)]:
+            with self.subTest(tier=tier):
+                self.assertEqual(economia.desmanche_yield(tier), esperado)
+
+    # ------------------------------------------------ grant_scrap
+    def test_grant_scrap_applies_the_island_multiplier(self):
+        conn = self._make_conn()
+        user_id = 9951
+        self._conta(conn, user_id)
+
+        self.assertEqual(economia.grant_scrap(conn, user_id, 100), 100)
+        self._com_bau(conn, user_id)
+        self.assertEqual(economia.grant_scrap(conn, user_id, 100), 125)
+        self.assertEqual(get_scrap(conn, user_id), 225)
+
+    def test_grant_scrap_ignores_non_positive(self):
+        conn = self._make_conn()
+        user_id = 9952
+        self._conta(conn, user_id)
+        self.assertEqual(economia.grant_scrap(conn, user_id, 0), 0)
+        self.assertEqual(economia.grant_scrap(conn, user_id, -50), 0)
+        self.assertEqual(get_scrap(conn, user_id), 0)
+
+    # ------------------------------------------------ /vender dá sucata
+    async def test_selling_grants_scrap_as_a_byproduct(self):
+        conn = self._make_conn()
+        user_id = 9953
+        self._conta(conn, user_id)
+        add_inventory_item(conn, user_id, "Sardinha", 4)   # tier 0 -> 1 cada
+        add_inventory_item(conn, user_id, "Arraia", 2)     # tier 2 -> 3 cada
+
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await economia.vender.callback(self._make_interaction(user_id), "tudo")
+
+        self.assertEqual(get_scrap(conn, user_id), 4 * 1 + 2 * 3)
+
+    async def test_selling_scrap_respects_the_bau(self):
+        conn = self._make_conn()
+        user_id = 9954
+        self._conta(conn, user_id)
+        self._com_bau(conn, user_id)
+        add_inventory_item(conn, user_id, "Arraia", 4)     # 4 x 3 = 12 -> x1.25 = 15
+
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await economia.vender.callback(self._make_interaction(user_id), "tudo")
+
+        self.assertEqual(get_scrap(conn, user_id), 15)
+
+    # ------------------------------------------------ recicladora do Galdino
+    async def test_galdino_recycle_respects_the_bau(self):
+        conn = self._make_conn()
+        user_id = 9955
+        self._conta(conn, user_id)
+        add_inventory_item(conn, user_id, "Bota Velha", 4)  # 4 x 5 = 20
+
+        view = economia.GaldinoView(user_id, "Tester")
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await view.recycle_btn.callback(self._make_interaction(user_id))
+        self.assertEqual(get_scrap(conn, user_id), 20)
+
+        user_id2 = 9956
+        self._conta(conn, user_id2)
+        self._com_bau(conn, user_id2)
+        add_inventory_item(conn, user_id2, "Bota Velha", 4)
+        view2 = economia.GaldinoView(user_id2, "Tester")
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await view2.recycle_btn.callback(self._make_interaction(user_id2))
+        self.assertEqual(get_scrap(conn, user_id2), 25)
+
+    # ------------------------------------------------ desmanche
+    async def test_desmanchar_swaps_sache_for_scrap(self):
+        conn = self._make_conn()
+        user_id = 9957
+        self._conta(conn, user_id)
+        modify_wallet(conn, user_id, 500, "Tester")
+
+        view = economia.DesmancharView(user_id, "Truta", 1, 120)
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await view.desmanchar.callback(interaction)
+
+        self.assertEqual(get_wallet(conn, user_id), 380, "o Sachê da captura não foi estornado")
+        self.assertEqual(get_scrap(conn, user_id), economia.desmanche_yield(1))
+
+    async def test_desmanchar_cannot_be_used_twice(self):
+        conn = self._make_conn()
+        user_id = 9958
+        self._conta(conn, user_id)
+        modify_wallet(conn, user_id, 500, "Tester")
+
+        view = economia.DesmancharView(user_id, "Truta", 1, 100)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await view.desmanchar.callback(self._make_interaction(user_id))
+            saldo = get_wallet(conn, user_id)
+            sucata = get_scrap(conn, user_id)
+            segunda = self._make_interaction(user_id)
+            await view.desmanchar.callback(segunda)
+
+        self.assertEqual(get_wallet(conn, user_id), saldo)
+        self.assertEqual(get_scrap(conn, user_id), sucata)
+        self.assertIn("já foi desmanchada", segunda.response.send_message.call_args.args[0])
+
+    async def test_desmanchar_is_refused_for_other_players(self):
+        conn = self._make_conn()
+        dono, intruso = 9959, 9960
+        self._conta(conn, dono)
+        self._conta(conn, intruso)
+        modify_wallet(conn, dono, 500, "Tester")
+
+        view = economia.DesmancharView(dono, "Truta", 1, 100)
+        interaction = self._make_interaction(intruso)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await view.desmanchar.callback(interaction)
+
+        self.assertEqual(get_wallet(conn, dono), 500)
+        self.assertEqual(get_scrap(conn, dono), 0)
+        self.assertIn("não é sua", interaction.response.send_message.call_args.args[0])
+
+    async def test_zero_trash_rods_can_finally_produce_scrap(self):
+        """O ponto do item: a Devoradora tem 0% de lixo e não tinha NENHUMA
+        fonte de sucata na pescaria."""
+        conn = self._make_conn()
+        user_id = 9961
+        self._conta(conn, user_id)
+        self.assertEqual(economia.ROD_STATS["vara_void"]["trash"], 0)
+
+        modify_wallet(conn, user_id, 50000, "Tester")
+        view = economia.DesmancharView(user_id, "CTHULHU", 4, 50000)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await view.desmanchar.callback(self._make_interaction(user_id))
+
+        self.assertEqual(get_scrap(conn, user_id), economia.desmanche_yield(4))
+        self.assertGreater(get_scrap(conn, user_id), 0)
+
+
+class IscaDiariaTests(unittest.IsolatedAsyncioTestCase):
+    """Item 4: a Bancada do Náufrago entrega 1 Isca Minhoca por dia.
+
+    Entregue dentro de /eco diario porque ele já É o portão diário do jogo —
+    um segundo cooldown para a mesma cadência seria estado duplicado.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name="Tester", display_name="Tester"),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    async def _diario(self, conn, user_id):
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await economia.diario.callback(interaction)
+        return interaction
+
+    def _com_bancada(self, conn, user_id):
+        conn.execute(
+            "INSERT INTO user_island_structures (user_id, structure_key, level, status) "
+            "VALUES (?, 'oficina', 1, 'idle')",
+            (user_id,),
+        )
+        conn.commit()
+
+    async def test_without_the_workshop_no_free_bait(self):
+        conn = self._make_conn()
+        user_id = 9971
+        ensure_user(conn, user_id, "Tester")
+        await self._diario(conn, user_id)
+        self.assertEqual(get_inventory(conn, user_id).get("isca", 0), 0)
+
+    async def test_with_the_workshop_one_bait_per_day(self):
+        conn = self._make_conn()
+        user_id = 9972
+        ensure_user(conn, user_id, "Tester")
+        self._com_bancada(conn, user_id)
+
+        interaction = await self._diario(conn, user_id)
+
+        self.assertEqual(get_inventory(conn, user_id).get("isca", 0), 1)
+        self.assertIn("Bancada", interaction.response.send_message.call_args.args[0])
+
+    async def test_bait_is_not_granted_twice_on_the_same_day(self):
+        """A trava é a do próprio /eco diario — a isca herda o mesmo portão."""
+        conn = self._make_conn()
+        user_id = 9973
+        ensure_user(conn, user_id, "Tester")
+        self._com_bancada(conn, user_id)
+
+        await self._diario(conn, user_id)
+        await self._diario(conn, user_id)
+
+        self.assertEqual(get_inventory(conn, user_id).get("isca", 0), 1)
 
 
 if __name__ == "__main__":

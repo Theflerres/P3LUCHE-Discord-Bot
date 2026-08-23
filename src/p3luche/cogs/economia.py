@@ -30,7 +30,12 @@ from cogs.pesca_visuals import (
     resolve_fishing_asset,
     resolve_weather_asset,
 )
+# cogs.ilha não importa cogs.economia (só config/utils/economy_db), então esta
+# direção não fecha ciclo. O catálogo de construções mora lá, e é de lá que
+# vem o único ponto de leitura dos bônus.
+from cogs.ilha import get_island_bonuses
 from economy_db import (
+    MISSION_DAILY_CAP,
     add_guild_xp,
     add_inventory_item,
     ensure_user,
@@ -56,8 +61,11 @@ from economy_db import (
     set_guild_rank,
     set_trap,
     sync_user_to_economy,
+    try_register_mission_completion,
     try_spend_wallet,
     try_upgrade_rod,
+    mission_slots_left,
+    missions_completed_today,
 )
 
 
@@ -93,18 +101,28 @@ ROD_STATS = {
         "desc": "Rápida, mas pega mais bota que peixe."
     },
     "vara_bambu": {
-        "name": "Vara de Bambu", 
-        "price": 0, 
-        "tier": 0, 
-        "cd": 1.0, "trash": 60, "luck": 1.0,
+        "name": "Vara de Bambu",
+        "price": 0,
+        "tier": 0,
+        # trash 60 -> 35: com o fallback do tier 0 devolvendo lixo, a Bambu
+        # entregava 40% de lixo efetivo e 15,4 Sachês por lance. Corrigido o
+        # fallback, 35 põe a taxa efetiva em ~16% e o lance em ~20,4.
+        "cd": 1.0, "trash": 35, "luck": 1.0,
         "desc": "A clássica. Conffiável e humilde."
     },
     "vara_treino": {
-        "name": "Vara de Treino", 
-        "price": 250, 
-        "tier": 0, 
-        "cd": 1.2, "trash": 40, "luck": 1.0,
-        "desc": "Um pouco lenta, mas ensina a não pegar lixo."
+        "name": "Vara de Treino",
+        "price": 250,
+        # tier 0 -> 1. Era a única vara COMPRÁVEL de tier 0, o que a deixava
+        # fora da escada: mesmo pool da Bambu (que é grátis), com cooldown
+        # 20% mais lento. Resultado: a primeira compra do jogo rendia 159,8/h
+        # contra 185,2/h da vara inicial — o jogador pagava 250 Sachês para
+        # ganhar menos. Como tier 1 ela abre o pool de peixe de verdade;
+        # cd 1,3 e trash 55 a mantêm abaixo da Reciclada (600), preservando a
+        # ordem da escada: 245 -> 403 -> 618 -> 691 -> 704 Sachês/h.
+        "tier": 1,
+        "cd": 1.3, "trash": 55, "luck": 1.0,
+        "desc": "Lenta e suja, mas finalmente pega peixe de verdade."
     },
 
     # --- TIER 1: AMADOR (Começando a lucrar) ---
@@ -212,7 +230,7 @@ ROD_STATS = {
 # 2. CONFIGURAÇÃO DA LOJA E ITENS
 SHOP_ITEMS = {
     # --- CONSUMÍVEIS (Buffs para Pesca) ---
-    "isca": {"name": "Isca Minhoca", "price": 50, "type": "consumable", "rarity": "common", "desc": "Reduz lixo pela metade (+Valor)."},
+    "isca": {"name": "Isca Minhoca", "price": 25, "type": "consumable", "rarity": "common", "desc": "Reduz lixo pela metade (+Valor)."},
     "energetico": {"name": "Energético", "price": 900, "type": "buff", "rarity": "common", "desc": "Reseta cooldown imediatamente."},
     "rede": {"name": "Rede de Mão", "price": 400, "type": "consumable", "rarity": "uncommon", "desc": "Pega 3 itens de uma vez (Consumível)."},
     "caixa_misteriosa": {"name": "Caixa Misteriosa", "price": 500, "type": "box", "rarity": "rare", "desc": "Pode ter dinheiro, itens ou nada."},
@@ -227,7 +245,7 @@ SHOP_ITEMS = {
 
     # --- VARAS (Sincronizado com ROD_STATS) ---
     # TIER 0 & 1
-    "vara_treino":   {"name": "Vara de Treino", "price": 250, "type": "rod", "key": "vara_treino", "tier": 0, "rarity": "common", "desc": "Para iniciantes aprenderem."},
+    "vara_treino":   {"name": "Vara de Treino", "price": 250, "type": "rod", "key": "vara_treino", "tier": 1, "rarity": "common", "desc": "Para iniciantes aprenderem."},
     "vara_plastico": {"name": "Vara Reciclada", "price": 600, "type": "rod", "key": "vara_plastico", "tier": 1, "rarity": "uncommon", "desc": "Feita de garrafas. Barata."},
     "vara_fibra":    {"name": "Vara de Fibra",  "price": 900, "type": "rod", "key": "vara_fibra", "tier": 1, "rarity": "uncommon", "desc": "Equilibrada e resistente."},
     "vara_pesada":   {"name": "Vara de Chumbo", "price": 1200, "type": "rod", "key": "vara_pesada", "tier": 1, "rarity": "uncommon", "desc": "Afunda rápido."},
@@ -264,6 +282,68 @@ SHOP_ITEMS = {
     "garrafa_incrustada": {"name": "Garrafa Incrustada", "price": 0, "type": "quest", "rarity": "quest", "desc": "Tem algo dentro... Use /ler_garrafa"},
     "selo_capitao": {"name": "Selo do Capitão", "price": 0, "type": "quest", "rarity": "epic", "desc": "Permite entrar em Porto Solare."}
 }
+
+# 3. VENDA DE PEIXE DA MOCHILA (/eco vender)
+#
+# Peixe pescado por /eco pescar vira Sachê na hora e nunca entra na mochila —
+# só o lixo entra. O que enche a mochila de peixe é a armadilha AFK, e até
+# aqui esse peixe não tinha destino nenhum: metade a 60% de cada coleta era
+# item morto. Este é o escoadouro.
+#
+# A taxa cai conforme o tier sobe de propósito: peixe raro tem que valer a
+# pena PESCAR, não farmar em armadilha. Sem essa inclinação, a Rede de
+# Arrasto (que alcança tier 2) viraria a melhor fonte de renda do meio de
+# jogo. Calibrado para o Covo render ~40% da pesca ativa da faixa em que ele
+# é destravado.
+SELL_RATES = {0: 0.35, 1: 0.30, 2: 0.22, 3: 0.18, 4: 0.15}
+
+# Espécie -> (tier, v_min, v_max). Lixo fica fora: ele não se vende aqui, vai
+# para o Galdino virar sucata, que é o único destino que ele sempre teve.
+FISH_BY_NAME = {
+    p[0]: (p[4], p[1], p[2]) for p in FISH_DB if p[0] not in TRASH_ITEMS
+}
+
+
+# Sucata por peixe vendido (Item 5). A sucata só vinha de lixo, e as varas
+# boas existem justamente para evitar lixo — Sniper .50 e Devoradora têm 0% e
+# não produziam nenhuma, para sempre, enquanto os upgrades pagos em sucata são
+# o melhor retorno por unidade de recurso do jogo. Isto dá à sucata uma
+# segunda fonte que não anda contra a progressão.
+SCRAP_PER_FISH = {0: 1, 1: 1, 2: 3, 3: 8, 4: 20}
+
+
+def fish_scrap_yield(fish_name: str) -> int:
+    dados = FISH_BY_NAME.get(fish_name)
+    return SCRAP_PER_FISH.get(dados[0], 0) if dados else 0
+
+
+def grant_scrap(conn, user_id: int, bruto: int) -> int:
+    """Credita sucata aplicando o multiplicador da ilha. Retorna o creditado.
+
+    Ponto único: toda fonte de sucata passa por aqui, senão o Baú da Maré
+    valeria só onde alguém lembrou de multiplicar.
+    """
+    if bruto <= 0:
+        return 0
+    mult = get_island_bonuses(conn, user_id)["sucata_mult"]
+    total = int(bruto * mult)
+    modify_scrap(conn, user_id, total)
+    return total
+
+
+def fish_sell_price(fish_name: str) -> int:
+    """Preço de venda de uma unidade, ou 0 se não for peixe vendável.
+
+    Reusa o valor-base do FISH_DB (a mediana do intervalo que /eco pescar
+    sorteia) em vez de uma tabela de preços paralela — duas tabelas para o
+    mesmo conceito divergem no primeiro peixe novo que alguém adicionar.
+    """
+    dados = FISH_BY_NAME.get(fish_name)
+    if not dados:
+        return 0
+    tier, v_min, v_max = dados
+    return int((v_min + v_max) / 2 * SELL_RATES.get(tier, 0.0))
+
 
 #4 --- SISTEMA DE CLIMA ---
 WEATHER_EFFECTS = {
@@ -500,6 +580,23 @@ WORLD_LORE = {
     }
 }
 
+def _mission_blocked_msg(reserva: dict, titulo: str) -> str:
+    """Texto para quando a missão fechou mas o teto diário não deixa pagar.
+
+    O progresso é zerado de qualquer forma (a missão foi cumprida), então o
+    jogador precisa saber que ele não perdeu nada por bug — bateu num limite.
+    """
+    if reserva["reason"] == "daily_cap":
+        return (
+            f"\n🏁 **{titulo}** concluída, mas o grupo já bateu o teto de "
+            f"{MISSION_DAILY_CAP} missões hoje. Recompensa não paga — volte amanhã."
+        )
+    return (
+        f"\n🔁 **{titulo}** já tinha sido concluída hoje por este grupo. "
+        "Recompensa não paga; escolha outra missão no quadro."
+    )
+
+
 def get_dialogue(npc, key):
     res = NPC_DIALOGUES.get(npc, {}).get(key, "...")
     return random.choice(res) if isinstance(res, list) else res
@@ -734,6 +831,102 @@ async def comprar(interaction: discord.Interaction, item: str):
     await interaction.response.send_message(f"✅ **Compra realizada!**\n{emoji_tipo} **{data['name']}** foi guardado na sua mochila.\nUse `/eco saldo` para ver ou usar.", ephemeral=True)
 
 
+# --- CAIXA MISTERIOSA ---
+# Custava 500 e pagava randint(100, 1000): EV 550, ou seja, +10% de margem
+# PARA O JOGADOR. Um "sink" com valor esperado positivo é uma impressora de
+# dinheiro — comprar em lote era renda, não gasto, e o modal de compra aceita
+# até 4 dígitos de quantidade.
+#
+# A distribuição abaixo devolve a margem para a casa (EV ~451, -9,8%) e de
+# quebra conserta um problema de sensação: a faixa antiga era estreita demais
+# para a caixa ser emocionante. Agora existe um prêmio grande de verdade em
+# 2,5% das aberturas, e a maioria das aberturas é pequena.
+CAIXA_PREMIO_ITENS = ("isca", "firewall", "isca_fedorenta", "isca_brilhante", "ima_saches")
+
+CAIXA_FAIXAS = (
+    (0.600, "dinheiro", 50, 400),
+    (0.295, "dinheiro", 400, 900),
+    (0.080, "item", None, None),
+    (0.025, "jackpot", 3000, 6000),
+)
+
+
+def abrir_caixa_misteriosa(rng=random) -> dict:
+    """Sorteia o resultado de uma Caixa Misteriosa.
+
+    Devolve {"tipo", "valor", "item"} em vez de já creditar: separar o sorteio
+    do efeito é o que permite medir o EV da tabela num teste sem falsear
+    saldo, e o EV é justamente a propriedade que estava errada.
+    """
+    ponto = rng.random()
+    acumulado = 0.0
+    for peso, tipo, lo, hi in CAIXA_FAIXAS:
+        acumulado += peso
+        if ponto < acumulado:
+            if tipo == "item":
+                return {"tipo": tipo, "valor": 0, "item": rng.choice(CAIXA_PREMIO_ITENS)}
+            return {"tipo": tipo, "valor": rng.randint(lo, hi), "item": None}
+    # Só alcançável por erro de arredondamento no topo da faixa.
+    return {"tipo": "dinheiro", "valor": rng.randint(50, 400), "item": None}
+
+
+def desmanche_yield(tier: int) -> int:
+    """Sucata que uma captura de `tier` rende se for desmanchada."""
+    return tier * 4 + 2
+
+
+class DesmancharView(discord.ui.View):
+    """Troca a captura recém-paga por sucata, à escolha do jogador.
+
+    Existe porque a sucata só vinha de lixo e as varas boas evitam lixo: a
+    Sniper .50 e a Devoradora têm 0% e não produziam nenhuma, para sempre.
+    A troca é MANUAL e por lance — automatizá-la escolheria pelo jogador em
+    todo lance de tier alto, que é justamente onde o Sachê vale mais.
+    """
+
+    def __init__(self, user_id: int, nome: str, tier: int, valor: int):
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.nome = nome
+        self.tier = tier
+        self.valor = valor
+        self.usado = False
+        self.message = None
+        self.desmanchar.label = f"Desmanchar (+{desmanche_yield(tier)} ⚙️)"
+
+    async def on_timeout(self):
+        if self.message:
+            try:
+                await self.message.edit(view=None)
+            except discord.HTTPException:
+                pass
+
+    @discord.ui.button(label="Desmanchar", style=discord.ButtonStyle.secondary, emoji="⚙️")
+    async def desmanchar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("❌ Essa captura não é sua.", ephemeral=True)
+        # Guarda anti-replay, mesmo padrão de BlackjackView/MemoriaView: sem
+        # ela, dois cliques rápidos estornariam o Sachê duas vezes e pagariam
+        # sucata duas vezes pela mesma captura.
+        if self.usado:
+            return await interaction.response.send_message("❌ Esta captura já foi desmanchada.", ephemeral=True)
+        self.usado = True
+
+        conn = get_bot_instance().db_conn
+        # Estorna o Sachê ANTES de creditar a sucata: se a segunda metade
+        # falhar, o jogador fica sem os dois em vez de com os dois.
+        modify_wallet(conn, self.user_id, -self.valor, interaction.user.name)
+        sucata = grant_scrap(conn, self.user_id, desmanche_yield(self.tier))
+
+        button.disabled = True
+        await interaction.response.edit_message(view=self)
+        await interaction.followup.send(
+            f"⚙️ **{self.nome}** desmanchado: −{self.valor} Sachês, +{sucata} sucata.",
+            ephemeral=True,
+        )
+        self.stop()
+
+
 async def _finalize_pescar(interaction: discord.Interaction, ctx: dict):
     """Persiste captura e envia embed final."""
     conn = get_bot_instance().db_conn
@@ -824,10 +1017,18 @@ async def _finalize_pescar(interaction: discord.Interaction, ctx: dict):
     if img_file:
         embed.set_thumbnail(url=img_url)
 
+    # Desmanche: só faz sentido quando houve peixe pago. Lixo já vai para a
+    # mochila e vira sucata no Galdino pelo caminho de sempre.
+    view = None
+    if valor > 0 and not ctx.get("is_trash"):
+        view = DesmancharView(user_id, nome, tier_p, valor)
+
     if img_file:
-        await interaction.followup.send(embed=embed, file=img_file)
+        mensagem = await interaction.followup.send(embed=embed, file=img_file, view=view, wait=True)
     else:
-        await interaction.followup.send(embed=embed)
+        mensagem = await interaction.followup.send(embed=embed, view=view, wait=True)
+    if view is not None:
+        view.message = mensagem
 
 
 @eco_group.command(name="pescar", description="Pesca usando itens da sua mochila.")
@@ -880,11 +1081,16 @@ async def pescar(interaction: discord.Interaction):
     if current_rod_key not in ROD_STATS: current_rod_key = 'vara_bambu'
     rod_data = ROD_STATS[current_rod_key]
 
-    # 3. CARREGA UPGRADES
+    # 3. CARREGA UPGRADES (do Galdino) E BÔNUS DA ILHA
     upgrades = {"luck": row['luck_level'] or 0, "cd": row['cd_level'] or 0}
+    # Ilha pessoal: Acampamento reduz cooldown (−2%/nível) e Farol soma sorte
+    # (+10%). Somam com os upgrades do Galdino em vez de multiplicar — dois
+    # sistemas multiplicativos empilhados escalam rápido demais no fim de jogo,
+    # e a diferença é imperceptível na faixa em que a ilha é alcançável.
+    ilha_bonus = get_island_bonuses(conn, user_id)
 
-    luck_bonus = 1 + (upgrades.get("luck", 0) * 0.10) # +10% por nível
-    cd_reduction = 1 - (upgrades.get("cd", 0) * 0.05) # -5% por nível
+    luck_bonus = 1 + (upgrades.get("luck", 0) * 0.10) + ilha_bonus["sorte_bonus"]
+    cd_reduction = 1 - (upgrades.get("cd", 0) * 0.05) - ilha_bonus["cd_reducao"]
 
     # 4. LÓGICA DE COOLDOWN
     base_cd = 300 # 5 minutos padrão
@@ -991,7 +1197,16 @@ async def pescar(interaction: discord.Interaction):
             tier2_pool = [p for p in pool if p[4] == 2]
             if tier2_pool:
                 pool = tier2_pool
-        if not pool: pool = [p for p in FISH_DB if p[4] == 0]
+        # Fallback do tier 0: só peixe inicial, nunca lixo. Uma vara de tier 0
+        # deixa o filtro acima vazio (`0 < tier <= 0`), e o fallback antigo
+        # devolvia TODAS as 20 entradas de tier 0 — metade delas lixo. O
+        # resultado é que este ramo, que é justamente o "não deu lixo", pagava
+        # lixo em ~50% das vezes: a Vara de Bambu entregava 40% de lixo no
+        # total, contra os 60% do stat dela, e ninguém conseguia ler de onde
+        # vinha a diferença. O roll de lixo de verdade continua sendo o ramo
+        # de cima, governado por TRASH_ROLL_RATIO.
+        if not pool:
+            pool = [p for p in FISH_DB if p[4] == 0 and p[0] not in TRASH_ITEMS]
 
     catch_data = random.choice(pool)
     nome, v_min, v_max, emoji, tier_p, frase = catch_data
@@ -1061,30 +1276,46 @@ async def pescar(interaction: discord.Interaction):
                 
                 if new_prog >= target:
                     mission_completed = True
-                    reward_money = m_data['reward']
-                    reward_xp = m_data['xp']
-                    
-                    members_ids = json.loads(my_party['members_json'])
-                    members_ids.append(my_party['leader_id'])
-                    unique_members = set(members_ids)
                     leader_id = my_party['leader_id']
-                    # Divide a recompensa igualmente; resto (se reward_money
-                    # não for divisível) vai para o líder, não é descartado.
-                    base_share = reward_money // len(unique_members)
-                    remainder = reward_money % len(unique_members)
+                    # Reserva a conclusão de hoje ANTES de pagar. Sem isso a
+                    # missão era infinitamente repetível: o bloco abaixo zera
+                    # active_mission_id e nada registrava que ela já tinha sido
+                    # feita, então bastava reaceitá-la no quadro.
+                    reserva = try_register_mission_completion(conn, leader_id, m_id)
+                    cursor.execute(
+                        "UPDATE parties SET active_mission_id = NULL, mission_progress = 0 WHERE leader_id = ?",
+                        (leader_id,),
+                    )
 
-                    for member_id in unique_members:
-                        share = base_share + remainder if member_id == leader_id else base_share
-                        modify_wallet(conn, member_id, share)
-                        # add_guild_xp relê o XP dentro da própria transação.
-                        # O UPDATE cru + sync_user_to_economy que havia aqui só
-                        # não propagava dado obsoleto porque o modify_wallet
-                        # acima chama ensure_user por acaso — dependência frágil
-                        # da linha anterior.
-                        add_guild_xp(conn, member_id, reward_xp)
+                    if not reserva["success"]:
+                        mission_msg = _mission_blocked_msg(reserva, m_data['title'])
+                    else:
+                        reward_money = m_data['reward']
+                        reward_xp = m_data['xp']
 
-                    cursor.execute("UPDATE parties SET active_mission_id = NULL, mission_progress = 0 WHERE leader_id = ?", (my_party['leader_id'],))
-                    mission_msg = f"\n🎉 **MISSÃO CUMPRIDA!**\nGrupo completou: **{m_data['title']}**\nPrêmio: 💰 {reward_money} | ⭐ {reward_xp} XP!"
+                        members_ids = json.loads(my_party['members_json'])
+                        members_ids.append(leader_id)
+                        unique_members = set(members_ids)
+                        # Divide a recompensa igualmente; resto (se reward_money
+                        # não for divisível) vai para o líder, não é descartado.
+                        base_share = reward_money // len(unique_members)
+                        remainder = reward_money % len(unique_members)
+
+                        for member_id in unique_members:
+                            share = base_share + remainder if member_id == leader_id else base_share
+                            modify_wallet(conn, member_id, share)
+                            # add_guild_xp relê o XP dentro da própria transação.
+                            # O UPDATE cru + sync_user_to_economy que havia aqui só
+                            # não propagava dado obsoleto porque o modify_wallet
+                            # acima chama ensure_user por acaso — dependência frágil
+                            # da linha anterior.
+                            add_guild_xp(conn, member_id, reward_xp)
+
+                        mission_msg = (
+                            f"\n🎉 **MISSÃO CUMPRIDA!**\nGrupo completou: **{m_data['title']}**\n"
+                            f"Prêmio: 💰 {reward_money} | ⭐ {reward_xp} XP!"
+                            f"\n📋 *Restam {reserva['restantes']} de {MISSION_DAILY_CAP} missões hoje.*"
+                        )
 
     # 8. XP DE GUILDA E RANK UP
     xp_ganho = 0
@@ -1379,23 +1610,37 @@ async def explorar(interaction: discord.Interaction):
             cursor.execute("UPDATE parties SET mission_progress = ? WHERE leader_id = ?", (new_prog, my_party['leader_id']))
             mission_msg = f"\n🚁 **Missão:** {new_prog}/{my_party['mission_target']}"
             if new_prog >= my_party['mission_target']:
-                rw, rx = m_data['reward'], m_data['xp']
-                mems = json.loads(my_party['members_json']) + [my_party['leader_id']]
-                unique_mems = set(mems)
                 leader_id = my_party['leader_id']
-                # Divide a recompensa igualmente; resto (se rw não for
-                # divisível) vai para o líder, não é descartado.
-                base_share = rw // len(unique_mems)
-                remainder = rw % len(unique_mems)
-                for mid in unique_mems:
-                    share = base_share + remainder if mid == leader_id else base_share
-                    modify_wallet(conn, mid, share)
-                    # Mesmo motivo do caminho de pescar: releitura dentro da
-                    # transação em vez de depender do ensure_user do
-                    # modify_wallet acima.
-                    add_guild_xp(conn, mid, rx)
-                cursor.execute("UPDATE parties SET active_mission_id=NULL, mission_progress=0 WHERE leader_id=?", (my_party['leader_id'],))
-                mission_msg = f"\n🎉 **Missão Completa!** Ganharam {rw} Sachês!"
+                # Mesma trava do caminho de pescar. As duas rotas de conclusão
+                # são independentes e tinham o mesmo furo; a reserva é única
+                # por (grupo, missão, dia), então elas não se atropelam.
+                reserva = try_register_mission_completion(conn, leader_id, m_id)
+                cursor.execute(
+                    "UPDATE parties SET active_mission_id=NULL, mission_progress=0 WHERE leader_id=?",
+                    (leader_id,),
+                )
+
+                if not reserva["success"]:
+                    mission_msg = _mission_blocked_msg(reserva, m_data['title'])
+                else:
+                    rw, rx = m_data['reward'], m_data['xp']
+                    mems = json.loads(my_party['members_json']) + [leader_id]
+                    unique_mems = set(mems)
+                    # Divide a recompensa igualmente; resto (se rw não for
+                    # divisível) vai para o líder, não é descartado.
+                    base_share = rw // len(unique_mems)
+                    remainder = rw % len(unique_mems)
+                    for mid in unique_mems:
+                        share = base_share + remainder if mid == leader_id else base_share
+                        modify_wallet(conn, mid, share)
+                        # Mesmo motivo do caminho de pescar: releitura dentro da
+                        # transação em vez de depender do ensure_user do
+                        # modify_wallet acima.
+                        add_guild_xp(conn, mid, rx)
+                    mission_msg = (
+                        f"\n🎉 **Missão Completa!** Ganharam {rw} Sachês!"
+                        f"\n📋 *Restam {reserva['restantes']} de {MISSION_DAILY_CAP} missões hoje.*"
+                    )
 
     # =========================================================================
     # ROTA 1: CIDADE (PORTO SOLARE) - AQUI ENTRA A IMAGEM DO PORTO
@@ -1645,6 +1890,154 @@ async def presentear(interaction: discord.Interaction, amigo: discord.Member, it
         f"🎁 **Enviado para {amigo.name}!**\n{msg}\n🎒 Saiu da sua mochila."
     )
 
+VENDER_LOTES = {
+    "tudo": "Tudo (todo o peixe da mochila)",
+    "tier0": "Tier 0 — peixes iniciais",
+    "tier1": "Tier 1",
+    "tier2": "Tier 2",
+    "tier3": "Tier 3",
+    "tier4": "Tier 4 — míticos",
+}
+
+
+def _vender_selecao(inv: dict, o_que: str) -> tuple[list, str | None]:
+    """Resolve o argumento em [(espécie, quantidade)] + rótulo do lote.
+
+    Devolve ([], None) quando o argumento não corresponde a nada vendável, e
+    quem chama decide a mensagem — aqui não se sabe se o caso é "mochila
+    vazia" ou "termo inválido".
+    """
+    alvo = (o_que or "tudo").strip().casefold()
+
+    def possui(nome):
+        return inv.get(nome, 0) > 0
+
+    if alvo == "tudo":
+        itens = [(n, inv[n]) for n in FISH_BY_NAME if possui(n)]
+        return itens, "toda a mochila"
+
+    if alvo.startswith("tier") and alvo[4:].isdigit():
+        tier = int(alvo[4:])
+        itens = [(n, inv[n]) for n, (t, _, _) in FISH_BY_NAME.items() if t == tier and possui(n)]
+        return itens, f"tier {tier}"
+
+    for nome in FISH_BY_NAME:
+        if nome.casefold() == alvo:
+            return ([(nome, inv[nome])] if possui(nome) else []), nome
+
+    return [], None
+
+
+async def _vender_autocomplete(interaction: discord.Interaction, current: str):
+    """Sugere os lotes que rendem algo AGORA, com o total já calculado.
+
+    Mostrar um tier que o jogador não tem leva a uma recusa depois de ele já
+    ter escolhido; mostrar o valor evita a ida e volta de "quanto vale?".
+    """
+    try:
+        inv = get_inventory(get_bot_instance().db_conn, interaction.user.id)
+    except Exception:
+        inv = {}
+
+    termo = (current or "").strip().casefold()
+    escolhas = []
+
+    for chave, descricao in VENDER_LOTES.items():
+        itens, _ = _vender_selecao(inv, chave)
+        total = sum(fish_sell_price(n) * q for n, q in itens)
+        if not itens:
+            continue
+        rotulo = f"{descricao} — {total} Sachês"
+        if not termo or termo in chave or termo in descricao.casefold():
+            escolhas.append(app_commands.Choice(name=rotulo[:100], value=chave))
+
+    for nome, qtd in sorted(inv.items()):
+        if qtd <= 0 or nome not in FISH_BY_NAME:
+            continue
+        rotulo = f"{nome} (x{qtd}) — {fish_sell_price(nome) * qtd} Sachês"
+        if not termo or termo in nome.casefold():
+            escolhas.append(app_commands.Choice(name=rotulo[:100], value=nome))
+
+    # O lixo aparece na lista mesmo não sendo vendável: é a única pista de
+    # que ele tem OUTRO destino. Sem isso o jogador tenta vender, leva
+    # "termo inválido" e conclui que o lixo não serve para nada.
+    lixo = sum(inv.get(t, 0) for t in TRASH_ITEMS)
+    if lixo and (not termo or termo in "lixo"):
+        escolhas.append(app_commands.Choice(name=f"Lixo (x{lixo}) — recicle no Galdino", value="lixo"))
+
+    return escolhas[:25]
+
+
+@eco_group.command(name="vender", description="Vende o peixe da mochila em lote.")
+@app_commands.describe(o_que="tudo, tier0..tier4, ou o nome de uma espécie")
+@app_commands.autocomplete(o_que=_vender_autocomplete)
+async def vender(interaction: discord.Interaction, o_que: str = "tudo"):
+    user_id = interaction.user.id
+    conn = get_bot_instance().db_conn
+
+    if not has_account(conn, user_id):
+        return await interaction.response.send_message("❌ Use /eco pescar primeiro.", ephemeral=True)
+    ensure_user(conn, user_id, interaction.user.name)
+
+    if (o_que or "").strip().casefold() == "lixo":
+        return await interaction.response.send_message(
+            "♻️ Lixo não se vende aqui — leve para o **Galdino** (`/eco explorar` → Cidade → Oficina) "
+            "e troque por sucata.",
+            ephemeral=True,
+        )
+
+    inv = get_inventory(conn, user_id)
+    itens, rotulo = _vender_selecao(inv, o_que)
+
+    if rotulo is None:
+        return await interaction.response.send_message(
+            f"❌ Não reconheço `{o_que}`. Use `tudo`, `tier0`–`tier4` ou o nome de um peixe.",
+            ephemeral=True,
+        )
+    if not itens:
+        return await interaction.response.send_message(
+            f"🎒 Você não tem peixe de **{rotulo}** para vender.", ephemeral=True
+        )
+
+    # Debita a mochila ANTES de creditar a carteira: se a entrega falhar no
+    # meio, o jogador perde o peixe sem o dinheiro — o inverso deixaria o
+    # peixe na mochila com o Sachê já pago, que é o dupe.
+    total = 0
+    sucata_bruta = 0
+    vendidos = []
+    for nome, qtd in itens:
+        preco = fish_sell_price(nome)
+        if preco <= 0 or qtd <= 0:
+            continue
+        add_inventory_item(conn, user_id, nome, -qtd)
+        total += preco * qtd
+        sucata_bruta += fish_scrap_yield(nome) * qtd
+        vendidos.append((nome, qtd, preco * qtd))
+
+    if not vendidos:
+        return await interaction.response.send_message("🎒 Nada vendável nessa seleção.", ephemeral=True)
+
+    novo_saldo = modify_wallet(conn, user_id, total, interaction.user.name)
+    sucata = grant_scrap(conn, user_id, sucata_bruta)
+
+    vendidos.sort(key=lambda v: -v[2])
+    linhas = [f"• **{n}** x{q} — {v} Sachês" for n, q, v in vendidos[:12]]
+    if len(vendidos) > 12:
+        linhas.append(f"• *…e mais {len(vendidos) - 12} espécies*")
+
+    embed = discord.Embed(
+        title="🐟 Peixaria",
+        description=f"Vendido: **{rotulo}**\n\n" + "\n".join(linhas),
+        color=discord.Color.teal(),
+    )
+    embed.add_field(name="Total", value=f"```diff\n+ {total} Sachês\n```", inline=True)
+    embed.add_field(name="Peças", value=str(sum(q for _, q, _ in vendidos)), inline=True)
+    if sucata:
+        embed.add_field(name="Sucata", value=f"⚙️ +{sucata}", inline=True)
+    embed.set_footer(text=f"Saldo: {novo_saldo}")
+    await interaction.response.send_message(embed=embed)
+
+
 # --- CLASSES DE INTERFACE DO INVENTÁRIO (DROPDOWN) ---
 
 class RodSelect(discord.ui.Select):
@@ -1808,9 +2201,20 @@ class ConsumeSelect(discord.ui.Select):
         # 2. CAIXA MISTERIOSA (Sorteio)
         elif item_key == "caixa_misteriosa":
             add_inventory_item(conn, user_id, item_key, -1)
-            premio = random.randint(100, 1000)
-            modify_wallet(conn, user_id, premio, interaction.user.name)
-            msg = f"🎁 **Caixa Aberta!** Você encontrou 💰 **{premio} Sachês** dentro dela."
+            resultado = abrir_caixa_misteriosa()
+            if resultado["tipo"] == "item":
+                add_inventory_item(conn, user_id, resultado["item"], 1)
+                nome_item = SHOP_ITEMS.get(resultado["item"], {}).get("name", resultado["item"])
+                msg = f"🎁 **Caixa Aberta!** Dentro havia: 🧪 **{nome_item}**."
+            else:
+                modify_wallet(conn, user_id, resultado["valor"], interaction.user.name)
+                if resultado["tipo"] == "jackpot":
+                    msg = (
+                        f"🎰 **JACKPOT!** A caixa estava forrada de Sachês: "
+                        f"💰 **{resultado['valor']}**!"
+                    )
+                else:
+                    msg = f"🎁 **Caixa Aberta!** Você encontrou 💰 **{resultado['valor']} Sachês** dentro dela."
 
         # 3. REDE DE MÃO (Pesca 3 itens aleatórios instantâneos)
         elif item_key == "rede":
@@ -1996,8 +2400,18 @@ async def diario(interaction: discord.Interaction):
     )
     sync_user_to_economy(conn, user_id)
     conn.commit()
+
+    # Bancada do Náufrago (ilha): 1 Isca Minhoca por dia. Entregue aqui em vez
+    # de num resgate próprio porque /eco diario já É o portão diário do jogo —
+    # um segundo cooldown para a mesma cadência seria estado duplicado, e o
+    # jogador teria que lembrar de dois comandos para a mesma rotina.
+    extra_isca = ""
+    if get_island_bonuses(conn, user_id)["isca_diaria"]:
+        add_inventory_item(conn, user_id, "isca", 1)
+        extra_isca = "\n🪱 *Bancada do Náufrago: +1 Isca Minhoca.*"
+
     await interaction.response.send_message(
-        f"📅 **Diário dia {streak}!** Recebeu **{total}** Sachês (bônus de streak: +{bonus})."
+        f"📅 **Diário dia {streak}!** Recebeu **{total}** Sachês (bônus de streak: +{bonus}).{extra_isca}"
     )
 
 @eco_group.command(name="rank", description="Hall da Fama.")
@@ -2021,51 +2435,96 @@ async def rank(interaction: discord.Interaction):
  
 # --- VIEW DE SELEÇÃO DE MISSÃO (ROTATIVO) ---
 class MissionSelect(discord.ui.Select):
-    def __init__(self, user_id, user_rank):
+    def __init__(self, user_id, user_rank, feitas_hoje=None, vagas=None):
         self.user_id = user_id
-        
+        # Missões que este grupo já concluiu hoje e quantas ainda cabem no
+        # teto diário. Vêm de fora porque quem monta a view já leu o banco —
+        # reler aqui dentro seria uma segunda consulta pelo mesmo dado.
+        self.feitas_hoje = feitas_hoje or set()
+        self.vagas = MISSION_DAILY_CAP if vagas is None else vagas
+
         # 1. PEGA A DATA DE HOJE COMO SEMENTE
         today_seed = datetime.now().strftime("%Y%m%d") # Ex: "20251230"
         random.seed(today_seed) # Trava o aleatório na data de hoje
-        
+
         # 2. SELECIONA 3 MISSÕES DO RANK DO JOGADOR
         # Se não tiver missões para o rank, pega do Rank F como fallback
         available_missions = MISSION_DB.get(user_rank, MISSION_DB["F"])
-        
+
         # Garante que não quebra se tiver poucas missões na lista
         count = min(3, len(available_missions))
         daily_missions = random.sample(available_missions, count)
-        
+
         random.seed() # Destrava o aleatório para o resto do bot
 
         # 3. CRIA AS OPÇÕES DO MENU
         options = []
         for m in daily_missions:
+            # Já concluída hoje some do menu: aceitá-la de novo levaria o
+            # jogador a cumprir o objetivo inteiro para receber uma recusa
+            # no fim.
+            if m['id'] in self.feitas_hoje:
+                continue
+
             emoji_type = "🎣"
             if m['type'] == 'earn_money': emoji_type = "💰"
             if m['type'] == 'explore_count': emoji_type = "🚁"
-            
+
             label = f"{m['title']} (+{m['xp']} XP)"
             desc = f"{m['desc']} | Prêmio: {m['reward']} Sachês"
-            
+
             # Limita tamanho da descrição para não dar erro no Discord (max 100 chars)
             if len(desc) > 100: desc = desc[:97] + "..."
 
             options.append(discord.SelectOption(
-                label=label, 
-                value=m['id'], 
-                description=desc, 
+                label=label,
+                value=m['id'],
+                description=desc,
                 emoji=emoji_type
             ))
 
+        # O Discord recusa um Select sem opções, então o estado "nada
+        # disponível" precisa de uma opção-placeholder desabilitada.
+        esgotado = self.vagas <= 0
+        if esgotado or not options:
+            texto = (
+                "Teto diário atingido — volte amanhã"
+                if esgotado
+                else "Todas as missões de hoje já foram concluídas"
+            )
+            options = [discord.SelectOption(label=texto[:100], value="__indisponivel__", default=True)]
+
         super().__init__(
-            placeholder="📜 Escolha a Missão Ativa de hoje...",
+            placeholder=(
+                "📜 Escolha a Missão Ativa de hoje..."
+                if not esgotado
+                else "🚫 Sem missões disponíveis hoje"
+            ),
             min_values=1,
             max_values=1,
-            options=options
+            options=options,
+            disabled=esgotado or options[0].value == "__indisponivel__",
         )
 
     async def callback(self, interaction: discord.Interaction):
+        if self.values and self.values[0] == "__indisponivel__":
+            return await interaction.response.send_message(
+                "📋 Nenhuma missão disponível para este grupo hoje.", ephemeral=True
+            )
+
+        conn = get_bot_instance().db_conn
+        # Relê o teto na hora do clique: a view fica aberta e outro membro do
+        # grupo pode ter fechado uma missão nesse meio-tempo.
+        if mission_slots_left(conn, self.user_id) <= 0:
+            return await interaction.response.send_message(
+                f"🚫 Seu grupo já concluiu {MISSION_DAILY_CAP} missões hoje. Volte amanhã.",
+                ephemeral=True,
+            )
+        if self.values and self.values[0] in missions_completed_today(conn, self.user_id):
+            return await interaction.response.send_message(
+                "🔁 Esta missão já foi concluída hoje pelo seu grupo.", ephemeral=True
+            )
+
         # Verifica se é o líder
         cursor = get_bot_instance().db_conn.cursor()
         party = cursor.execute("SELECT leader_id, members_json FROM parties WHERE leader_id = ?", (self.user_id,)).fetchone()
@@ -2515,8 +2974,17 @@ class GuildView(discord.ui.View):
         else:
             embed.description = f"📅 **Missões de Hoje ({datetime.now().strftime('%d/%m')}):**\nSelecione uma abaixo para iniciar."
 
+        conn = get_bot_instance().db_conn
+        feitas = missions_completed_today(conn, self.user_id)
+        vagas = mission_slots_left(conn, self.user_id)
+        embed.add_field(
+            name="📋 Conclusões de hoje",
+            value=f"{len(feitas)}/{MISSION_DAILY_CAP} — restam **{vagas}**",
+            inline=False,
+        )
+
         view_mission = discord.ui.View()
-        view_mission.add_item(MissionSelect(self.user_id, user_rank))
+        view_mission.add_item(MissionSelect(self.user_id, user_rank, feitas_hoje=feitas, vagas=vagas))
         
         # Botão Voltar (Recarrega a imagem da Guilda)
         back_btn = discord.ui.Button(label="Voltar", style=discord.ButtonStyle.danger, row=1)
@@ -2671,11 +3139,18 @@ TRAP_TYPES = {
         "loot_tier_max": 1      # Só pega peixe comum/incomum
     },
     "rede_industrial": {
-        "name": "Rede de Arrasto", 
-        "cost": 1500, 
-        "repair_cost": 400,     # Caro, mas vale a pena pelos 15 peixes
+        "name": "Rede de Arrasto",
+        "cost": 1500,
+        # break_chance 80 -> 35 e repair_cost 400 -> 250. Com os valores
+        # antigos a Rede custava 1.280 Sachês/hora só em conserto (4 coletas/h
+        # x 80% x 400) e, mesmo com o /eco vender pagando o loot, sobravam
+        # 122/h — METADE do Covo, que é grátis. Uma compra de 1.500 que rende
+        # menos que o item gratuito é armadilha, e nenhuma tabela de preço de
+        # venda conserta: baixar a taxa afunda a Rede, subir quebra o Covo.
+        # Nos valores novos ela rende ~1.052/h e se paga em ~1,8h de uso.
+        "repair_cost": 250,
         "capacity": 15,         # Pega MUITO peixe
-        "break_chance": 80,     # 80% de chance de quebrar (Alto Risco)
+        "break_chance": 35,     # Risco real, mas não confisco
         "wait_time": 600,       # 10 minutos (é uma rede grande)
         "reset_time": 300,      # 5 minutos para arrumar a bagunça
         "loot_tier_max": 2      # Pode pegar raros
@@ -2761,8 +3236,13 @@ class GaldinoView(discord.ui.View):
                 add_inventory_item(conn, self.user_id, t, -qtd)
 
         if gain > 0:
-            modify_scrap(conn, self.user_id, gain)
+            # Baú da Maré (+25%) passa por aqui como por toda fonte de sucata.
+            bruto = gain
+            gain = grant_scrap(conn, self.user_id, gain)
+            extra = gain - bruto
             msg = f"🔧 **Galdino:** 'Isso sim é material!'\n⚙️ Ganhou: {gain} Sucata."
+            if extra:
+                msg += f"\n🧰 *Baú da Maré rendeu +{extra}.*"
         else:
             msg = "🔧 **Galdino:** 'Sua mochila tá limpa demais. Suma daqui!'"
             
