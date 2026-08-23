@@ -325,13 +325,38 @@ GUILD_RANKS = {
     
     # --- CONTEÚDO FUTURO (BLOQUEADO) ---
     "S": {
-        "name": "Herói de Solare", 
+        "name": "Herói de Solare",
         "req_xp": 999999, # Valor simbólico impossível
-        "next": None, 
+        "next": None,
         "badge": "👑",
         "desc": "??? (Requer Feito Heroico - Em Breve)"
     }
 }
+
+
+def next_rank_requirement(rank_key):
+    """(chave do próximo rank, XP para alcançá-lo) a partir de `rank_key`.
+
+    `req_xp` de uma entrada é o custo para CHEGAR naquele rank, não para sair
+    dele — é assim que a credencial da guilda (`card_btn`) sempre leu a
+    tabela, com `GUILD_RANKS[next]['req_xp']` como meta da barra de
+    progresso. Os dois pontos que resolviam promoção, porém, comparavam o XP
+    com o `req_xp` do rank ATUAL, o que deslocava a escada inteira um degrau
+    para baixo: rank F tem `req_xp` 0, então a promoção F→E saía no primeiro
+    lance, e chegar ao rank A custava 16.000 XP acumulados em vez dos 41.000
+    que a tabela define (500+1500+4000+10000+25000).
+
+    Existe para que a regra viva num lugar só: antes ela estava escrita duas
+    vezes, em `/eco pescar` e no diálogo da Capitã, e as duas cópias tinham
+    o mesmo erro.
+
+    Retorna (None, None) para quem já está no topo da escada.
+    """
+    data = GUILD_RANKS.get(rank_key, GUILD_RANKS["F"])
+    next_key = data["next"]
+    if not next_key:
+        return None, None
+    return next_key, GUILD_RANKS[next_key]["req_xp"]
 
 # --- BANCO DE DADOS DE MISSÕES (COMPLETO & BALANCEADO) ---
 # Tipos: 'fish_count', 'fish_specific', 'earn_money', 'explore_count'
@@ -1076,14 +1101,14 @@ async def pescar(interaction: discord.Interaction):
     new_xp_total = _guild_atual['xp'] + xp_ganho
     
     current_rank = _guild_atual['rank']
-    rank_info = GUILD_RANKS.get(current_rank, GUILD_RANKS['F'])
-    
-    if rank_info['next'] and new_xp_total >= rank_info['req_xp']:
-        if rank_info['next'] == 'S':
+    proximo_rank, custo_promocao = next_rank_requirement(current_rank)
+
+    if proximo_rank and new_xp_total >= custo_promocao:
+        if proximo_rank == 'S':
              pass
         else:
-            current_rank = rank_info['next']
-            new_xp_total -= rank_info['req_xp']
+            current_rank = proximo_rank
+            new_xp_total -= custo_promocao
             mission_msg += f"\n🌟 **RANK UP!** Agora você é Rank {current_rank}!"
 
     # 9. QUEST DA GARRAFA
@@ -1114,11 +1139,39 @@ async def pescar(interaction: discord.Interaction):
 
         if quest_trigger:
             inv['garrafa_incrustada'] = 1
-            if not row['current_chapter'] or row['current_chapter'] == 'inicio':
-                cursor.execute("UPDATE quest_progress SET current_chapter = 'garrafa_encontrada' WHERE user_id = ?", (user_id,))
-            else:
-                cursor.execute("INSERT OR IGNORE INTO quest_progress (user_id, current_chapter) VALUES (?, 'garrafa_encontrada')", (user_id,))
-                
+            # INSERT ... ON CONFLICT (mesmo padrão de /ler_garrafa em
+            # cogs/sistema.py) em vez dos dois ramos UPDATE/INSERT OR IGNORE
+            # que havia aqui. ensure_user() materializa as linhas v4 do
+            # jogador (users/user_rods/rod_upgrades/user_cooldowns) mas NÃO a
+            # de quest_progress, então numa conta nova o UPDATE não achava
+            # linha nenhuma e voltava afetando 0 linhas em silêncio: o
+            # capítulo continuava NULL e o portão de XP de guilda (o `if
+            # row['current_chapter'] in [...]` do passo 8) ficava fechado
+            # para sempre, por mais que o jogador pescasse. O ramo do else
+            # tinha o problema espelhado — INSERT OR IGNORE é no-op quando a
+            # linha já existe, que é exatamente o caso em que ele rodava.
+            #
+            # O WHERE do DO UPDATE preserva a única regra que os dois ramos
+            # antigos codificavam junto: gravar 'garrafa_encontrada' só por
+            # cima de capítulo ausente ou 'inicio', nunca regredindo quem já
+            # está em city_spotted/acesso_liberado.
+            cursor.execute(
+                """
+                INSERT INTO quest_progress (user_id, current_chapter)
+                VALUES (?, 'garrafa_encontrada')
+                ON CONFLICT(user_id) DO UPDATE SET current_chapter = 'garrafa_encontrada'
+                WHERE quest_progress.current_chapter IS NULL
+                   OR quest_progress.current_chapter = 'inicio'
+                """,
+                (user_id,),
+            )
+            # Commit explícito, igual ao bloco de persistent_catches logo
+            # acima: sem ele a gravação fica pendente e só é fechada pelo
+            # commit() interno do primeiro ensure_user() de _finalize_pescar
+            # — dependência silenciosa da ordem de chamadas de outro módulo.
+            conn.commit()
+
+
     # 10. SALVA E ENTREGA O RESULTADO
     catch_ctx = {
         "user_id": user_id,
@@ -2237,11 +2290,17 @@ class GuildView(discord.ui.View):
                     curr_rank = self.rank
                     xp_val = self.xp
                     rdata = GUILD_RANKS.get(curr_rank, GUILD_RANKS['F'])
-                    next_key = rdata['next']
+                    # Mesma fonte de verdade da promoção logo abaixo e da barra
+                    # de progresso do cartão: a meta exibida é o req_xp do rank
+                    # SEGUINTE. Antes mostrava o do rank atual, ou seja, uma
+                    # meta que o jogador já tinha batido só por estar nele.
+                    next_key, req = next_rank_requirement(curr_rank)
                     if next_key:
-                        req = rdata['req_xp']
                         embed = discord.Embed(title="📜 Informação de Rank", color=discord.Color.blue())
-                        embed.add_field(name="Rank Atual", value=f"**{curr_rank}** - {rdata['title']}", inline=False)
+                        # 'name', não 'title': GUILD_RANKS não tem chave 'title'
+                        # e este acesso levantava KeyError, derrubando o tópico
+                        # inteiro no except genérico do menu.
+                        embed.add_field(name="Rank Atual", value=f"**{curr_rank}** - {rdata['name']}", inline=False)
                         embed.add_field(name="XP", value=f"{xp_val}/{req}", inline=False)
                         await interaction.response.edit_message(embed=embed, view=self.view)
                     else:
@@ -2256,19 +2315,18 @@ class GuildView(discord.ui.View):
                     gr = get_guild_rank(get_bot_instance().db_conn, self.user_id)
                     curr_rank = gr['rank']
                     xp_val = gr['xp']
-                    rdata = GUILD_RANKS.get(curr_rank, GUILD_RANKS['F'])
-                    next_key = rdata['next']
+                    next_key, custo = next_rank_requirement(curr_rank)
                     if not next_key:
                         await interaction.response.edit_message(embed=discord.Embed(description="⚠️ Você já está no Rank máximo."), view=self.view)
                         return
 
-                    if xp_val >= rdata['req_xp']:
+                    if xp_val >= custo:
                         if next_key == 'S':
                             text = get_dialogue('jenna', 'rank_s_lock')
                             await interaction.response.edit_message(embed=discord.Embed(title="🛡️ Capitã Jenna", description=text, color=discord.Color.red()), view=self.view)
                             return
                         new_rank = next_key
-                        new_xp = xp_val - rdata['req_xp']
+                        new_xp = xp_val - custo
                         # Grava na v4: UPDATE só em economy era revertido pelo
                         # sync_user_to_economy do comando seguinte.
                         set_guild_rank(get_bot_instance().db_conn, self.user_id, new_rank, new_xp)
@@ -2603,7 +2661,12 @@ TRAP_TYPES = {
         "repair_cost": 35,      # Custo para ARRUMAR
         "capacity": 5,          # Peixes por coleta
         "break_chance": 10,     # 10% de chance de quebrar ao coletar
-        "wait_time": 00,       # 5 minutos esperando o peixe cair
+        # Estava `00` (zero) com um comentário dizendo "5 minutos": a armadilha
+        # nascia em 'working' com timer_end = agora, a re-renderização já
+        # encontrava remaining <= 0 e promovia para 'ready' na mesma interação,
+        # então o Covo entregava as 5 capturas instantaneamente e o único freio
+        # era o reset_time. Valor correto definido em 10 minutos.
+        "wait_time": 600,       # 10 minutos esperando o peixe cair
         "reset_time": 120,      # 2 minutos para limpar/desembolar
         "loot_tier_max": 1      # Só pega peixe comum/incomum
     },

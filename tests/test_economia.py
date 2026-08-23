@@ -1362,12 +1362,13 @@ class JennaPromotionPersistenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_promotion_survives_the_next_v4_command(self):
         conn = self._make_conn()
         user_id = 7201
-        # Rank E (req_xp 500) com 600 XP: promoção elegível para D, sobrando
-        # 100 XP. Rank F não serve aqui porque seu req_xp é 0 — promoveria
-        # com qualquer XP e não exercitaria a checagem.
+        # Rank E com 1600 XP: sair de E custa o req_xp de D (1500), então a
+        # promoção é elegível e sobram 100 XP. Rank F não serve aqui porque
+        # subir dele custa só 500 e a margem ficaria estreita demais para
+        # separar "promoveu" de "promoveu com o limiar errado".
         conn.execute(
             "INSERT INTO economy (user_id, user_name, wallet, guild_rank, guild_xp) VALUES (?, ?, ?, ?, ?)",
-            (user_id, "Tester", 100, "E", 600),
+            (user_id, "Tester", 100, "E", 1600),
         )
         conn.commit()
         ensure_user(conn, user_id, "Tester")
@@ -1560,12 +1561,18 @@ class GuildXpStalePropagationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(legacy["guild_xp"], 142)
 
     async def test_promotion_then_group_reward_keeps_promoted_rank(self):
-        """Cenário exato pedido no ticket: promoção E/600 -> D/100, seguida de
+        """Cenário exato pedido no ticket: promoção E/1600 -> D/100, seguida de
         recompensa de missão de grupo. Rank tem que continuar D e o XP tem que
-        somar, nunca voltar para o estado pré-promoção."""
+        somar, nunca voltar para o estado pré-promoção.
+
+        O XP semeado era 600 quando a promoção comparava com o `req_xp` do rank
+        ATUAL (E, 500). Com o limiar correto — o `req_xp` do PRÓXIMO rank (D,
+        1500) — o mesmo cenário precisa de 1600 para sobrar os mesmos 100. O que
+        o teste verifica (a promoção sobreviver ao sync seguinte) não mudou.
+        """
         conn = self._make_conn()
         user_id = 7402
-        self._seed(conn, user_id, "E", 600)
+        self._seed(conn, user_id, "E", 1600)
 
         # Promoção pelo fluxo real da Jenna (mesmo caminho da etapa 1b).
         view = economia.GuildView(user_id, "Tester")
@@ -1584,7 +1591,7 @@ class GuildXpStalePropagationTests(unittest.IsolatedAsyncioTestCase):
         self._arm_group_mission(conn, user_id)
         await self._pescar(conn, user_id)
 
-        # D exige 1500 XP para subir, então 142 não promove de novo.
+        # Sair de D custa o req_xp de C (4000), então 142 não promove de novo.
         self.assertEqual(
             get_guild_rank(conn, user_id),
             {"rank": "D", "xp": 142},
@@ -2190,6 +2197,351 @@ class LerGarrafaV4Tests(unittest.IsolatedAsyncioTestCase):
 
         interaction.response.defer.assert_awaited()
 
+
+class PortaoXpGarrafaTests(unittest.IsolatedAsyncioTestCase):
+    """Regressão do portão de XP de guilda travado em conta nova.
+
+    `ensure_user()` cria as linhas v4 do jogador mas não a de
+    `quest_progress`. O trecho da garrafa em `/eco pescar` gravava o capítulo
+    com um `UPDATE ... WHERE user_id = ?`, que numa conta nova não encontrava
+    linha nenhuma e voltava afetando 0 linhas em silêncio — o capítulo ficava
+    NULL e o `if row['current_chapter'] in [...]` que libera XP de guilda
+    nunca abria, por mais que o jogador pescasse.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Novato"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name, display_name=name),
+            response=SimpleNamespace(
+                send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock()
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def _cog_sistema(self, conn):
+        from cogs.sistema import SistemaCog
+
+        return SistemaCog(SimpleNamespace(db_conn=conn))
+
+    async def _pescar(self, conn, user_id, com_garrafa):
+        """Uma pescaria determinística de tier 1 (2 XP de guilda quando o
+        portão está aberto). `com_garrafa` força/bloqueia o gatilho da quest
+        pelo único ramo que ele consulta o RNG (`randint(1, 4) == 1`)."""
+        real_choice = economia.random.choice
+        real_randint = economia.random.randint
+
+        def tier1(seq):
+            cands = [i for i in seq if isinstance(i, tuple) and len(i) == 6 and i[4] == 1]
+            return cands[0] if cands else real_choice(seq)
+
+        def randint(a, b):
+            if (a, b) == (1, 4):
+                return 1 if com_garrafa else 2
+            return real_randint(a, b)
+
+        # Libera o cooldown de pesca para as chamadas encadeadas do mesmo teste.
+        conn.execute("UPDATE user_cooldowns SET last_fish = NULL WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia, "get_local_file", return_value=(None, None)), \
+                patch.object(economia.random, "choice", side_effect=tier1), \
+                patch.object(economia.random, "randint", side_effect=randint):
+            await economia.pescar.callback(interaction)
+        return interaction
+
+    def _chapter(self, conn, user_id):
+        row = conn.execute(
+            "SELECT current_chapter FROM quest_progress WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return row["current_chapter"] if row else None
+
+    async def test_bottle_creates_quest_progress_row_on_new_account(self):
+        """O caso que quebrava: conta nova, sem linha em quest_progress."""
+        conn = self._make_conn()
+        user_id = 9501
+
+        self.assertIsNone(self._chapter(conn, user_id))
+        await self._pescar(conn, user_id, com_garrafa=True)
+
+        self.assertEqual(get_inventory(conn, user_id).get("garrafa_incrustada"), 1)
+        self.assertEqual(self._chapter(conn, user_id), "garrafa_encontrada")
+
+    async def test_xp_flows_on_the_cast_after_the_bottle(self):
+        """O portão abre de verdade: a pescaria seguinte já credita XP.
+
+        A pescaria que traz a garrafa ainda não pontua — o capítulo é lido no
+        início do comando, antes do gatilho — e isso é intencional; o que não
+        podia acontecer é a seguinte também sair zerada.
+        """
+        conn = self._make_conn()
+        user_id = 9502
+
+        await self._pescar(conn, user_id, com_garrafa=True)
+        xp_na_garrafa = get_guild_rank(conn, user_id)["xp"]
+
+        await self._pescar(conn, user_id, com_garrafa=False)
+        xp_depois = get_guild_rank(conn, user_id)["xp"]
+
+        self.assertEqual(xp_na_garrafa, 0)
+        self.assertEqual(xp_depois, 2, "XP de guilda continuou travado depois da garrafa")
+
+    async def test_bottle_overwrites_inicio_chapter(self):
+        """Linha já existente em 'inicio' (o default do schema) tem que subir."""
+        conn = self._make_conn()
+        user_id = 9503
+        conn.execute(
+            "INSERT INTO quest_progress (user_id, current_chapter) VALUES (?, 'inicio')",
+            (user_id,),
+        )
+        conn.commit()
+
+        await self._pescar(conn, user_id, com_garrafa=True)
+
+        self.assertEqual(self._chapter(conn, user_id), "garrafa_encontrada")
+
+    async def test_bottle_does_not_regress_an_advanced_chapter(self):
+        """Quem já entregou o selo não pode voltar para 'garrafa_encontrada'."""
+        conn = self._make_conn()
+        user_id = 9504
+        conn.execute(
+            "INSERT INTO quest_progress (user_id, current_chapter) VALUES (?, 'acesso_liberado')",
+            (user_id,),
+        )
+        conn.commit()
+
+        await self._pescar(conn, user_id, com_garrafa=True)
+
+        self.assertEqual(self._chapter(conn, user_id), "acesso_liberado")
+
+    async def test_ler_garrafa_persists_chapter_and_keeps_xp_flowing(self):
+        """Validação ponta a ponta: pescar a garrafa, ler, e continuar pescando."""
+        conn = self._make_conn()
+        user_id = 9505
+
+        await self._pescar(conn, user_id, com_garrafa=True)
+
+        interaction = self._make_interaction(user_id)
+        cog = self._cog_sistema(conn)
+        await cog.ler_garrafa.callback(cog, interaction)
+
+        row = conn.execute(
+            "SELECT current_chapter, inventory FROM quest_progress WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+        self.assertEqual(row["current_chapter"], "acesso_liberado")
+        self.assertEqual(json.loads(row["inventory"]).get("selo_capitao"), 1)
+
+        antes = get_guild_rank(conn, user_id)["xp"]
+        await self._pescar(conn, user_id, com_garrafa=False)
+        self.assertEqual(get_guild_rank(conn, user_id)["xp"], antes + 2)
+
+
+class CovoWaitTimeTests(unittest.IsolatedAsyncioTestCase):
+    """Regressão do Covo que entregava na hora.
+
+    `wait_time` estava `00` — zero, apesar do comentário ao lado dizer "5
+    minutos". A armadilha lançada nascia em 'working' com `timer_end = agora`,
+    a re-renderização seguinte já via `remaining <= 0` e promovia para 'ready'
+    na mesma interação: as 5 capturas saíam instantaneamente e o único freio
+    era o `reset_time`. Valor correto: 600s.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def _seed(self, conn, user_id):
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, wallet) VALUES (?, ?, ?)",
+            (user_id, "Tester", 500),
+        )
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+
+    def test_covo_wait_time_is_ten_minutes(self):
+        self.assertEqual(economia.TRAP_TYPES["covo_basico"]["wait_time"], 600)
+
+    def test_no_trap_has_a_zero_wait_time(self):
+        """Qualquer armadilha com espera 0 volta a entregar na hora."""
+        for key, stats in economia.TRAP_TYPES.items():
+            with self.subTest(armadilha=key):
+                self.assertGreater(stats["wait_time"], 0)
+
+    async def test_launching_the_covo_leaves_it_working_not_ready(self):
+        """O caminho que o bug tornava instantâneo: lançar e voltar no painel."""
+        conn = self._make_conn()
+        user_id = 9701
+        self._seed(conn, user_id)
+        set_trap(conn, user_id, {"type": "covo_basico", "status": "idle", "timer_end": 0})
+
+        view = economia.GaldinoView(user_id, "Tester")
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            # Abre o painel (estado idle) e clica em "Jogar".
+            abrir = self._make_interaction(user_id)
+            await view.trap_manager.callback(abrir)
+            botao = abrir.response.send_message.call_args.kwargs["view"].children[0]
+            await botao.callback(self._make_interaction(user_id))
+
+            trap = get_trap(conn, user_id)
+            self.assertEqual(trap["status"], "working")
+            restante = trap["timer_end"] - datetime.now().timestamp()
+            self.assertGreater(restante, 540, "armadilha lançada já estava quase pronta")
+
+            # Voltar ao painel não pode promover para 'ready'.
+            voltar = self._make_interaction(user_id)
+            await view.trap_manager.callback(voltar)
+            self.assertEqual(get_trap(conn, user_id)["status"], "working")
+
+        embed = voltar.response.send_message.call_args.kwargs["embed"]
+        self.assertIn("Trabalhando", embed.description)
+
+
+class LimiarDeRankTests(unittest.TestCase):
+    """A escada de ranks é definida por `req_xp` do rank de DESTINO.
+
+    Os dois pontos que resolviam promoção comparavam o XP com o `req_xp` do
+    rank ATUAL, deslocando a escada um degrau para baixo: F (req_xp 0)
+    promovia no primeiro lance e o rank A saía por 16.000 XP acumulados em
+    vez dos 41.000 da tabela.
+    """
+
+    def test_cost_to_leave_each_rank_is_the_next_ranks_requirement(self):
+        esperado = {
+            "F": ("E", 500),
+            "E": ("D", 1500),
+            "D": ("C", 4000),
+            "C": ("B", 10000),
+            "B": ("A", 25000),
+        }
+        for rank, alvo in esperado.items():
+            with self.subTest(rank=rank):
+                self.assertEqual(economia.next_rank_requirement(rank), alvo)
+
+    def test_rank_a_is_the_top_of_the_ladder(self):
+        self.assertEqual(economia.next_rank_requirement("A"), (None, None))
+
+    def test_rank_a_costs_the_tables_real_requirement(self):
+        """O req_xp 25.000 do rank A tinha virado número morto: ninguém lia."""
+        _, custo = economia.next_rank_requirement("B")
+        self.assertEqual(custo, economia.GUILD_RANKS["A"]["req_xp"])
+        self.assertEqual(custo, 25000)
+
+    def test_full_ladder_costs_41000_accumulated(self):
+        """F -> A somando cada degrau: 500+1500+4000+10000+25000."""
+        total, rank = 0, "F"
+        while True:
+            proximo, custo = economia.next_rank_requirement(rank)
+            if not proximo:
+                break
+            total += custo
+            rank = proximo
+        self.assertEqual(rank, "A")
+        self.assertEqual(total, 41000)
+
+    def test_unknown_rank_falls_back_to_f(self):
+        """Rank fora da escada (lixo no banco) não pode explodir."""
+        self.assertEqual(economia.next_rank_requirement("ZZZ"), ("E", 500))
+
+
+class PromocaoNaFronteiraTests(unittest.IsolatedAsyncioTestCase):
+    """Promoção na fronteira exata de XP, pelos dois caminhos que promovem."""
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name, display_name=name),
+            response=SimpleNamespace(
+                send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock()
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def _seed(self, conn, user_id, rank, xp):
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, guild_rank, guild_xp) VALUES (?, ?, ?, ?)",
+            (user_id, "Tester", rank, xp),
+        )
+        conn.execute(
+            "INSERT INTO quest_progress (user_id, current_chapter) VALUES (?, 'acesso_liberado')",
+            (user_id,),
+        )
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+
+    async def _ask_promo(self, conn, user_id):
+        view = economia.GuildView(user_id, "Tester")
+        abrir = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia, "get_local_file", return_value=(None, None)):
+            await view.talk_jenna.callback(abrir)
+            select = abrir.response.send_message.call_args.kwargs["view"].children[0]
+            select._values = ["ask_promo"]
+            await select.callback(self._make_interaction(user_id))
+
+    async def _pescar(self, conn, user_id):
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia, "get_local_file", return_value=(None, None)):
+            await economia.pescar.callback(self._make_interaction(user_id))
+
+    async def test_jenna_promotes_exactly_at_the_threshold(self):
+        conn = self._make_conn()
+        self._seed(conn, 7601, "E", 1500)
+        await self._ask_promo(conn, 7601)
+        self.assertEqual(get_guild_rank(conn, 7601), {"rank": "D", "xp": 0})
+
+    async def test_jenna_refuses_one_xp_below_the_threshold(self):
+        conn = self._make_conn()
+        self._seed(conn, 7602, "E", 1499)
+        await self._ask_promo(conn, 7602)
+        self.assertEqual(get_guild_rank(conn, 7602), {"rank": "E", "xp": 1499})
+
+    async def test_jenna_promotes_b_to_a_only_at_25000(self):
+        """O degrau que o bug mais encurtava: B->A saía por 10.000."""
+        conn = self._make_conn()
+        self._seed(conn, 7603, "B", 24999)
+        await self._ask_promo(conn, 7603)
+        self.assertEqual(get_guild_rank(conn, 7603)["rank"], "B")
+
+        conn2 = self._make_conn()
+        self._seed(conn2, 7604, "B", 25000)
+        await self._ask_promo(conn2, 7604)
+        self.assertEqual(get_guild_rank(conn2, 7604), {"rank": "A", "xp": 0})
+
+    async def test_fishing_does_not_promote_f_on_the_first_cast(self):
+        """Com o req_xp do rank atual (F = 0) a condição era sempre verdadeira
+        e todo jogador virava rank E no primeiro peixe."""
+        conn = self._make_conn()
+        user_id = 7605
+        self._seed(conn, user_id, "F", 0)
+
+        # Vara inicial é tier 0, então a captura vale 2 XP de guilda.
+        await self._pescar(conn, user_id)
+
+        self.assertEqual(get_guild_rank(conn, user_id), {"rank": "F", "xp": 2})
+
+    async def test_fishing_promotes_when_the_cast_crosses_the_threshold(self):
+        conn = self._make_conn()
+        user_id = 7606
+        # 498 + 2 XP (peixe tier 0 da vara inicial) = 500, exatamente o req_xp
+        # do rank E — a fronteira, sem sobra.
+        self._seed(conn, user_id, "F", 498)
+
+        await self._pescar(conn, user_id)
+
+        self.assertEqual(get_guild_rank(conn, user_id), {"rank": "E", "xp": 0})
 
 
 class ConsumeSelectInventoryTests(unittest.IsolatedAsyncioTestCase):
