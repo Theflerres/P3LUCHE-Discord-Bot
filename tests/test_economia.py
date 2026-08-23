@@ -12,8 +12,16 @@ import discord
 
 from cogs import economia
 from economy_db import (
+    FORGE_BASE_COST,
+    FORGE_GROWTH,
+    FORGE_REQUIRED_RANK,
     MISSION_DAILY_CAP,
     add_guild_xp,
+    forge_level_cost,
+    forge_luck_multiplier,
+    get_forge_level,
+    set_forge_level,
+    try_upgrade_forge,
     add_inventory_item,
     ensure_user,
     ensure_v4_tables,
@@ -1923,7 +1931,12 @@ class LegacyResurrectionTests(unittest.IsolatedAsyncioTestCase):
         set_current_rod(conn, user_id, "vara_ouro")
 
         self.assertEqual(get_current_rod(conn, user_id), "vara_ouro")
-        self.assertEqual(get_rod_upgrades(conn, user_id), {"luck": 0, "cd": 0})
+        # Todos os níveis nascem zerados. Checa os valores em vez do dicionário
+        # inteiro: o teste é sobre a linha irmã ter sido recriada, e travar a
+        # forma do dict fazia uma coluna nova quebrar um teste de ressurreição
+        # de linha.
+        upgrades = get_rod_upgrades(conn, user_id)
+        self.assertTrue(all(v == 0 for v in upgrades.values()), upgrades)
         self.assertIsNone(get_cooldowns(conn, user_id)["last_fish"])
 
 
@@ -2755,7 +2768,16 @@ class ConsumeSelectInventoryTests(unittest.IsolatedAsyncioTestCase):
         self._account(conn, user_id, caixa_misteriosa=2)
         saldo_antes = get_wallet(conn, user_id)
 
-        with patch.object(economia.random, "randint", return_value=500):
+        # Fixa o RESULTADO, não o randint. Desde que a caixa passou a sortear
+        # a faixa com random() antes do valor, patchar só o randint deixava
+        # ~8% das execuções caírem no ramo de item — que não paga Sachê — e o
+        # teste falhava de forma intermitente. Este teste é sobre o item ser
+        # consumido e o prêmio sobreviver ao sync seguinte, não sobre a
+        # distribuição (essa é coberta em CaixaMisteriosaTests).
+        with patch.object(
+            economia, "abrir_caixa_misteriosa",
+            return_value={"tipo": "dinheiro", "valor": 500, "item": None},
+        ):
             await self._use(conn, user_id, "caixa_misteriosa")
 
         self.assertEqual(get_inventory(conn, user_id)["caixa_misteriosa"], 1)
@@ -3275,6 +3297,407 @@ class RedeDeArrastoTests(unittest.TestCase):
         for key in economia.TRAP_TYPES:
             with self.subTest(armadilha=key):
                 self.assertGreater(self._liquido_por_hora(key), 0)
+
+
+class ForjaDoAbismoTests(unittest.IsolatedAsyncioTestCase):
+    """Item 3: escada sem teto de fim de jogo.
+
+    O catálogo permanente do jogo soma 695.050 Sachês e a renda de topo passa
+    de 1,6 milhão por HORA — qualquer sink de valor fixo é consumido no mesmo
+    dia em que é lançado. O custo cresce geometricamente e o benefício
+    linearmente; é essa assimetria que faz a escada sempre ganhar da renda que
+    ela própria habilita.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name, display_name=name),
+            response=SimpleNamespace(
+                send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock()
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def _mestre(self, conn, user_id, wallet=10**9, scrap=10**6, rod="vara_void", rank="A"):
+        """Jogador que cumpre os dois requisitos da forja."""
+        conn.execute("INSERT INTO economy (user_id, user_name) VALUES (?, ?)", (user_id, "Tester"))
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+        set_current_rod(conn, user_id, rod)
+        set_guild_rank(conn, user_id, rank, 0)
+        modify_wallet(conn, user_id, wallet, "Tester")
+        modify_scrap(conn, user_id, scrap)
+
+    # ------------------------------------------------ custo
+    def test_first_level_costs_the_base(self):
+        self.assertEqual(forge_level_cost(1), {"saches": 50_000, "scrap": 500})
+
+    def test_cost_follows_the_declared_geometric_curve(self):
+        for n in (1, 5, 10, 20, 30, 40):
+            with self.subTest(nivel=n):
+                esperado = int(FORGE_BASE_COST * FORGE_GROWTH ** (n - 1))
+                self.assertEqual(forge_level_cost(n)["saches"], esperado)
+
+    def test_scrap_cost_is_linear(self):
+        for n in (1, 7, 25):
+            with self.subTest(nivel=n):
+                self.assertEqual(forge_level_cost(n)["scrap"], 500 * n)
+
+    def test_accumulated_cost_matches_the_published_table(self):
+        """Os marcos que foram para a proposta aprovada. A tabela publicada
+        arredondou, então a tolerância é relativa, não exata."""
+        acumulado = 0
+        marcos = {10: 2_040_000, 20: 31_200_000, 30: 433_500_000}
+        for n in range(1, 31):
+            acumulado += forge_level_cost(n)["saches"]
+            if n in marcos:
+                with self.subTest(nivel=n):
+                    self.assertAlmostEqual(acumulado / marcos[n], 1.0, delta=0.05)
+
+    def test_cost_grows_faster_than_the_bonus(self):
+        """A propriedade que faz a escada nunca ser esgotada: custo geométrico
+        contra benefício linear."""
+        for n in range(1, 40):
+            razao_custo = forge_level_cost(n + 1)["saches"] / forge_level_cost(n)["saches"]
+            razao_bonus = forge_luck_multiplier(n + 1) / forge_luck_multiplier(n)
+            with self.subTest(nivel=n):
+                self.assertGreater(razao_custo, razao_bonus)
+
+    def test_invalid_level_is_rejected(self):
+        for n in (0, -1):
+            with self.subTest(nivel=n):
+                with self.assertRaises(ValueError):
+                    forge_level_cost(n)
+
+    # ------------------------------------------------ bônus
+    def test_bonus_is_linear_not_compound(self):
+        for nivel, esperado in [(0, 1.0), (1, 1.015), (10, 1.15), (20, 1.30), (30, 1.45)]:
+            with self.subTest(nivel=nivel):
+                self.assertAlmostEqual(forge_luck_multiplier(nivel), esperado, places=6)
+
+    def test_bonus_floors_at_one_for_garbage_levels(self):
+        self.assertEqual(forge_luck_multiplier(0), 1.0)
+        self.assertEqual(forge_luck_multiplier(-5), 1.0)
+
+    async def test_bonus_multiplies_rod_luck_and_upgrades_instead_of_replacing(self):
+        """O ponto de integração: a forja é mais um fator na cadeia, não um
+        substituto da sorte da vara nem dos upgrades do Galdino."""
+        conn = self._make_conn()
+        user_id = 8801
+        self._mestre(conn, user_id, wallet=0, scrap=0)
+        conn.execute(
+            "INSERT INTO quest_progress (user_id, current_chapter) VALUES (?, 'acesso_liberado')",
+            (user_id,),
+        )
+        conn.execute("UPDATE rod_upgrades SET luck_level = 5 WHERE user_id = ?", (user_id,))
+        conn.commit()
+
+        async def pescar_uma(forge_level):
+            set_forge_level(conn, user_id, forge_level)
+            conn.execute("UPDATE user_cooldowns SET last_fish = NULL WHERE user_id = ?", (user_id,))
+            conn.execute("UPDATE users SET wallet = 0 WHERE user_id = ?", (user_id,))
+            conn.commit()
+            # Peixe e valor fixos: só o multiplicador da forja varia entre as
+            # duas chamadas, então a razão dos ganhos é a razão dos bônus.
+            alvo = next(p for p in economia.FISH_DB if p[0] == "Truta")
+            with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                    patch.object(economia, "get_local_file", return_value=(None, None)), \
+                    patch.object(economia.random, "choice", return_value=alvo), \
+                    patch.object(economia.random, "randint", return_value=50), \
+                    patch.object(economia, "get_current_weather",
+                                 return_value=("normal", economia.WEATHER_EFFECTS["normal"])):
+                await economia.pescar.callback(self._make_interaction(user_id))
+            return get_wallet(conn, user_id)
+
+        sem_forja = await pescar_uma(0)
+        com_forja = await pescar_uma(20)
+
+        # 50 (valor) x 6.6 (sorte da Devoradora) x 1.5 (upgrades luck 5) = 495
+        self.assertEqual(sem_forja, 495)
+        # ... x 1.30 (forja 20) = 643
+        self.assertEqual(com_forja, 643)
+        self.assertAlmostEqual(com_forja / sem_forja, 1.30, delta=0.01)
+
+    # ------------------------------------------------ persistência
+    def test_forge_level_defaults_to_zero_and_round_trips(self):
+        conn = self._make_conn()
+        user_id = 8802
+        self.assertEqual(get_forge_level(conn, user_id), 0)
+        set_forge_level(conn, user_id, 7)
+        self.assertEqual(get_forge_level(conn, user_id), 7)
+        self.assertEqual(get_rod_upgrades(conn, user_id)["forge"], 7)
+
+    def test_forge_level_never_goes_negative(self):
+        conn = self._make_conn()
+        user_id = 8803
+        set_forge_level(conn, user_id, -3)
+        self.assertEqual(get_forge_level(conn, user_id), 0)
+
+    def test_forge_level_survives_a_following_v4_command(self):
+        """Mesmo contrato de set_guild_rank: o sync do comando seguinte não
+        pode reverter a gravação."""
+        conn = self._make_conn()
+        user_id = 8804
+        self._mestre(conn, user_id)
+        set_forge_level(conn, user_id, 4)
+        sync_user_to_economy(conn, user_id)
+        modify_wallet(conn, user_id, 1, "Tester")
+        self.assertEqual(get_forge_level(conn, user_id), 4)
+
+    # ------------------------------------------------ desbloqueio
+    def test_locked_without_a_tier5_rod(self):
+        conn = self._make_conn()
+        user_id = 8805
+        self._mestre(conn, user_id, rod="vara_iridium")
+        r = try_upgrade_forge(conn, user_id, economia.FORGE_ALLOWED_RODS)
+        self.assertFalse(r["success"])
+        self.assertEqual(r["reason"], "locked_rod")
+        self.assertEqual(get_forge_level(conn, user_id), 0)
+
+    def test_locked_without_rank_a(self):
+        conn = self._make_conn()
+        user_id = 8806
+        self._mestre(conn, user_id, rank="B")
+        r = try_upgrade_forge(conn, user_id, economia.FORGE_ALLOWED_RODS)
+        self.assertFalse(r["success"])
+        self.assertEqual(r["reason"], "locked_rank")
+        self.assertEqual(get_forge_level(conn, user_id), 0)
+
+    def test_both_tier5_rods_unlock(self):
+        for rod in ("vara_quantum", "vara_void"):
+            with self.subTest(vara=rod):
+                conn = self._make_conn()
+                user_id = 8807
+                self._mestre(conn, user_id, rod=rod)
+                self.assertTrue(try_upgrade_forge(conn, user_id, economia.FORGE_ALLOWED_RODS)["success"])
+
+    def test_allowed_rods_is_derived_from_rod_stats(self):
+        esperado = {k for k, v in economia.ROD_STATS.items() if v["tier"] >= 5}
+        self.assertEqual(set(economia.FORGE_ALLOWED_RODS), esperado)
+        self.assertTrue(esperado)
+
+    def test_gate_is_rechecked_inside_the_transaction(self):
+        """A view fica aberta 180s; trocar de vara depois de abri-la não pode
+        deixar a compra passar."""
+        conn = self._make_conn()
+        user_id = 8808
+        self._mestre(conn, user_id, rod="vara_void")
+        set_current_rod(conn, user_id, "vara_bambu")
+        r = try_upgrade_forge(conn, user_id, economia.FORGE_ALLOWED_RODS)
+        self.assertFalse(r["success"])
+        self.assertEqual(r["reason"], "locked_rod")
+
+    # ------------------------------------------------ compra
+    def test_purchase_debits_both_currencies_and_raises_the_level(self):
+        conn = self._make_conn()
+        user_id = 8809
+        self._mestre(conn, user_id, wallet=60_000, scrap=1_000)
+
+        r = try_upgrade_forge(conn, user_id, economia.FORGE_ALLOWED_RODS)
+
+        self.assertTrue(r["success"])
+        self.assertEqual(r["level"], 1)
+        self.assertEqual(get_wallet(conn, user_id), 10_000)
+        self.assertEqual(get_scrap(conn, user_id), 500)
+        self.assertEqual(get_forge_level(conn, user_id), 1)
+
+    def test_purchase_is_refused_without_enough_saches(self):
+        conn = self._make_conn()
+        user_id = 8810
+        self._mestre(conn, user_id, wallet=49_999, scrap=10_000)
+        r = try_upgrade_forge(conn, user_id, economia.FORGE_ALLOWED_RODS)
+        self.assertEqual(r["reason"], "insufficient_saches")
+        self.assertEqual(get_wallet(conn, user_id), 49_999)
+        self.assertEqual(get_scrap(conn, user_id), 10_000)
+
+    def test_purchase_is_refused_without_enough_scrap(self):
+        conn = self._make_conn()
+        user_id = 8811
+        self._mestre(conn, user_id, wallet=10**7, scrap=499)
+        r = try_upgrade_forge(conn, user_id, economia.FORGE_ALLOWED_RODS)
+        self.assertEqual(r["reason"], "insufficient_scrap")
+        self.assertEqual(get_forge_level(conn, user_id), 0)
+        self.assertEqual(get_wallet(conn, user_id), 10**7, "cobrou Sachê numa compra recusada")
+
+    def test_each_purchase_buys_exactly_one_level_at_the_current_price(self):
+        conn = self._make_conn()
+        user_id = 8812
+        self._mestre(conn, user_id)
+        for esperado in (1, 2, 3, 4, 5):
+            antes = get_wallet(conn, user_id)
+            r = try_upgrade_forge(conn, user_id, economia.FORGE_ALLOWED_RODS)
+            with self.subTest(nivel=esperado):
+                self.assertEqual(r["level"], esperado)
+                self.assertEqual(antes - get_wallet(conn, user_id), forge_level_cost(esperado)["saches"])
+
+    def test_ladder_has_no_ceiling(self):
+        """Sem teto de nível: o único freio é o preço."""
+        conn = self._make_conn()
+        user_id = 8813
+        self._mestre(conn, user_id, wallet=10**12, scrap=10**7)
+        for _ in range(30):
+            self.assertTrue(try_upgrade_forge(conn, user_id, economia.FORGE_ALLOWED_RODS)["success"])
+        self.assertEqual(get_forge_level(conn, user_id), 30)
+
+    # ------------------------------------------------ UI
+    async def test_locked_player_sees_the_requirements(self):
+        conn = self._make_conn()
+        user_id = 8814
+        self._mestre(conn, user_id, rod="vara_bambu", rank="F")
+
+        view = economia.GaldinoView(user_id, "Tester")
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await view.forge_btn.callback(interaction)
+
+        embed = interaction.response.send_message.call_args.kwargs["embed"]
+        nomes = [f.name for f in embed.fields]
+        self.assertTrue(any("Tier 5" in n for n in nomes))
+        self.assertTrue(any(f"Rank {FORGE_REQUIRED_RANK}" in n for n in nomes))
+        self.assertTrue(all(n.startswith("❌") for n in nomes), nomes)
+        self.assertNotIn("view", interaction.response.send_message.call_args.kwargs)
+
+    async def test_unlocked_player_gets_the_forge_panel(self):
+        conn = self._make_conn()
+        user_id = 8815
+        self._mestre(conn, user_id)
+
+        view = economia.GaldinoView(user_id, "Tester")
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await view.forge_btn.callback(interaction)
+
+        kwargs = interaction.response.send_message.call_args.kwargs
+        self.assertIsInstance(kwargs["view"], economia.ForgeView)
+        self.assertIn("Nível 0", kwargs["embed"].title)
+
+    async def test_forging_from_the_panel_raises_the_level(self):
+        conn = self._make_conn()
+        user_id = 8816
+        self._mestre(conn, user_id)
+
+        view = economia.ForgeView(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await view.forjar.callback(self._make_interaction(user_id))
+
+        self.assertEqual(get_forge_level(conn, user_id), 1)
+
+    async def test_another_player_cannot_use_the_panel(self):
+        conn = self._make_conn()
+        dono, intruso = 8817, 8818
+        self._mestre(conn, dono)
+        self._mestre(conn, intruso, wallet=0, scrap=0)
+
+        view = economia.ForgeView(dono)
+        interaction = self._make_interaction(intruso)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await view.forjar.callback(interaction)
+
+        self.assertEqual(get_forge_level(conn, dono), 0)
+        self.assertIn("não é sua", interaction.response.send_message.call_args.args[0])
+
+
+class ForjaDrenagemTests(unittest.TestCase):
+    """A razão 1,30 foi escolhida por simulação: a escada precisa drenar a
+    maior parte da renda de 400 dias nos três perfis de jogador."""
+
+    def _simular(self, lances_dia, explores, horas_trap, com_forja):
+        from cogs.ilha import ISLAND_STRUCTURES, island_bonuses
+
+        climas = {"normal": (1.0, 1.0, 0, 0.7), "bad": (0.5, 2.0, 0, 0.2), "good": (1.5, 0.5, 1, 0.1)}
+        media = lambda p: (p[1] + p[2]) / 2
+        iniciais = [p for p in economia.FISH_DB if p[4] == 0 and p[0] not in economia.TRASH_ITEMS]
+        caminho = [
+            "vara_bambu", "vara_treino", "vara_plastico", "vara_fibra", "vara_pesada",
+            "vara_veloz", "vara_ouro", "vara_sonar", "vara_sortuda", "vara_iridium",
+            "vara_magnetica", "vara_sniper", "vara_quantum", "vara_void",
+        ]
+        custo_ilha = sum(
+            ISLAND_STRUCTURES["nucleo"]["cost_saches_per_level"] * n for n in range(1, 5)
+        ) + sum(ISLAND_STRUCTURES[k]["cost_saches"] for k in ("deposito", "oficina", "farol"))
+        bonus = island_bonuses({
+            k: {"level": (4 if k == "nucleo" else 1), "status": "idle", "timer_end": None, "state_json": "{}"}
+            for k in ISLAND_STRUCTURES
+        })
+
+        def ev(rod, ilha, forja):
+            r = economia.ROD_STATS[rod]
+            total = 0.0
+            for _, (lm, tm, tb, peso) in climas.items():
+                pt = max(0.0, min(100.0, r["trash"] * tm)) / 100.0
+                mult = (
+                    r["luck"] * (1 + (bonus["sorte_bonus"] if ilha else 0.0))
+                    * forge_luck_multiplier(forja) * lm
+                )
+                parcial = pt * (1 - economia.TRASH_ROLL_RATIO) * (
+                    sum(map(media, iniciais)) / len(iniciais)
+                ) * mult
+                pool = [p for p in economia.FISH_DB if 0 < p[4] <= r["tier"] + tb] or iniciais
+                parcial += (1 - pt) * (
+                    sum(media(p) for p in pool if p[0] not in economia.TRASH_ITEMS) / len(pool)
+                ) * mult
+                total += peso * parcial
+            return total
+
+        def trap(key):
+            st = economia.TRAP_TYPES[key]
+            pool = [p for p in economia.FISH_DB if p[4] <= st["loot_tier_max"]]
+            ch = 3600 / (st["wait_time"] + st["reset_time"])
+            bruto = ch * st["capacity"] * (sum(economia.fish_sell_price(p[0]) for p in pool) / len(pool))
+            return bruto - ch * (st["break_chance"] / 100) * st["repair_cost"]
+
+        covo, rede = trap("covo_basico"), trap("rede_industrial")
+        wallet = renda = sink = 0.0
+        rod = forja = 0
+        ilha = False
+        for dia in range(1, 401):
+            cd = int(300 * economia.ROD_STATS[caminho[rod]]["cd"] * (1 - (bonus["cd_reducao"] if ilha else 0.0)))
+            n = min(lances_dia, int(24 * 3600 / cd))
+            ganho = ev(caminho[rod], ilha, forja) * n + 200 + min(dia, 60) * 50 + explores * 93.9
+            if horas_trap:
+                ganho += horas_trap * (rede if rod >= 10 else covo)
+            wallet += ganho
+            renda += ganho
+            while rod + 1 < len(caminho) and wallet >= economia.ROD_STATS[caminho[rod + 1]]["price"]:
+                wallet -= economia.ROD_STATS[caminho[rod + 1]]["price"]
+                sink += economia.ROD_STATS[caminho[rod + 1]]["price"]
+                rod += 1
+            if not ilha and wallet >= custo_ilha:
+                wallet -= custo_ilha
+                sink += custo_ilha
+                ilha = True
+            if com_forja and economia.ROD_STATS[caminho[rod]]["tier"] >= 5:
+                while wallet >= forge_level_cost(forja + 1)["saches"]:
+                    forja += 1
+                    wallet -= forge_level_cost(forja)["saches"]
+                    sink += forge_level_cost(forja)["saches"]
+        return {"wallet": wallet, "sink": sink, "renda": renda, "forja": forja}
+
+    PERFIS = [(8, 0, 0, "casual"), (30, 3, 2, "ativo"), (96, 3, 6, "hardcore")]
+
+    def test_without_the_forge_almost_nothing_is_drained(self):
+        """A contraprova: sem a forja o catálogo inteiro é ruído."""
+        for lances, expl, ht, nome in self.PERFIS:
+            r = self._simular(lances, expl, ht, com_forja=False)
+            with self.subTest(perfil=nome):
+                self.assertLess(r["sink"] / r["renda"], 0.01)
+
+    def test_the_forge_drains_the_bulk_of_the_income(self):
+        for lances, expl, ht, nome in self.PERFIS:
+            r = self._simular(lances, expl, ht, com_forja=True)
+            with self.subTest(perfil=nome):
+                self.assertGreater(r["sink"] / r["renda"], 0.80)
+
+    def test_leftover_balance_is_savings_toward_the_next_level(self):
+        """O saldo parado no dia 400 não é dinheiro sem destino: é menos do
+        que custa o próximo nível, ou seja, poupança a caminho dele."""
+        for lances, expl, ht, nome in self.PERFIS:
+            r = self._simular(lances, expl, ht, com_forja=True)
+            with self.subTest(perfil=nome):
+                self.assertLess(r["wallet"], forge_level_cost(r["forja"] + 1)["saches"])
 
 
 class TetoDeMissoesTests(unittest.IsolatedAsyncioTestCase):

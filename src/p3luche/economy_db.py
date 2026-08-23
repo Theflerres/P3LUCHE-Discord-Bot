@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS user_rods (
 CREATE TABLE IF NOT EXISTS rod_upgrades (
     user_id INTEGER PRIMARY KEY REFERENCES users(user_id),
     luck_level INTEGER DEFAULT 0,
-    cd_level INTEGER DEFAULT 0
+    cd_level INTEGER DEFAULT 0,
+    forge_level INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS user_trap (
     user_id INTEGER PRIMARY KEY REFERENCES users(user_id),
@@ -134,6 +135,13 @@ def ensure_v4_tables(conn: sqlite3.Connection) -> None:
     try:
         cursor.execute(
             "ALTER TABLE user_cooldowns ADD COLUMN last_memoria TIMESTAMP"
+        )
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            raise
+    try:
+        cursor.execute(
+            "ALTER TABLE rod_upgrades ADD COLUMN forge_level INTEGER DEFAULT 0"
         )
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e):
@@ -548,11 +556,15 @@ def set_current_rod(conn: sqlite3.Connection, user_id: int, rod_key: str) -> Non
 def get_rod_upgrades(conn: sqlite3.Connection, user_id: int) -> dict:
     ensure_user(conn, user_id)
     row = conn.execute(
-        "SELECT luck_level, cd_level FROM rod_upgrades WHERE user_id = ?", (user_id,)
+        "SELECT luck_level, cd_level, forge_level FROM rod_upgrades WHERE user_id = ?",
+        (user_id,),
     ).fetchone()
     return {
         "luck": _coerce_int(row["luck_level"] if row else 0),
         "cd": _coerce_int(row["cd_level"] if row else 0),
+        # A forja não é um upgrade do Galdino (custa Sachê, não tem teto), mas
+        # mora na mesma linha e vem junto para quem já lê os upgrades.
+        "forge": _coerce_int(row["forge_level"] if row else 0),
     }
 
 
@@ -601,6 +613,159 @@ def try_upgrade_rod(
         sync_user_to_economy(conn, user_id)
         conn.commit()
         return {"success": True, "reason": None, "scrap": new_scrap, "level": new_level, "cost": cost}
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# --- FORJA DO ABISMO ---
+# Escada sem teto de fim de jogo. Existe porque o catálogo permanente do jogo
+# soma 695.050 Sachês e a renda de topo passa de 1,6 milhão por HORA: qualquer
+# sink de valor fixo é consumido no mesmo dia em que é lançado, e o jogador
+# volta a acumular sem destino.
+#
+# O custo cresce geometricamente (×1,30 por nível) e o benefício cresce
+# LINEARMENTE (+1,5 pontos percentuais por nível). É essa assimetria que faz a
+# escada sempre ganhar da renda que ela própria habilita — existe realimentação
+# (mais bônus -> mais renda -> próximo nível mais rápido), mas ela converge
+# porque a razão custo/renda diverge para o infinito.
+#
+# A razão 1,30 com base 50.000 foi escolhida por simulação de 400 dias nos três
+# perfis de jogador; ver a proposta "Recalibragem de Scrap Seas".
+FORGE_BASE_COST = 50_000
+FORGE_GROWTH = 1.30
+FORGE_SCRAP_PER_LEVEL = 500
+FORGE_BONUS_PER_LEVEL = 0.015
+FORGE_REQUIRED_RANK = "A"
+
+
+def forge_level_cost(level: int) -> dict:
+    """Custo para comprar o nível `level` (1-indexado)."""
+    if level < 1:
+        raise ValueError(f"nível de forja inválido: {level!r}")
+    return {
+        "saches": int(FORGE_BASE_COST * FORGE_GROWTH ** (level - 1)),
+        "scrap": FORGE_SCRAP_PER_LEVEL * level,
+    }
+
+
+def forge_luck_multiplier(level: int) -> float:
+    """Multiplicador de valor de captura de uma forja em `level`.
+
+    Linear no número de níveis, não composto: nível 10 = 1,15 (e não 1,015^10).
+    Entra na cadeia de multiplicação da captura ao lado da sorte da vara e dos
+    upgrades do Galdino — nenhum dos três substitui os outros.
+    """
+    return 1.0 + max(0, _coerce_int(level)) * FORGE_BONUS_PER_LEVEL
+
+
+def get_forge_level(conn: sqlite3.Connection, user_id: int) -> int:
+    ensure_user(conn, user_id)
+    row = conn.execute(
+        "SELECT forge_level FROM rod_upgrades WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    return _coerce_int(row["forge_level"] if row else 0)
+
+
+def set_forge_level(conn: sqlite3.Connection, user_id: int, level: int) -> None:
+    """Grava o nível da forja. Mesmo contrato de set_guild_rank: escreve na v4
+    e propaga para a legada no mesmo commit.
+
+    `economy` não tem coluna para a forja — sync_user_to_economy é chamado
+    ainda assim porque ele reescreve a linha legada inteira a partir da v4, e
+    pular a chamada aqui deixaria a legada defasada nos outros campos.
+    """
+    ensure_user(conn, user_id)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "UPDATE rod_upgrades SET forge_level = ? WHERE user_id = ?",
+            (max(0, _coerce_int(level)), user_id),
+        )
+        sync_user_to_economy(conn, user_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def try_upgrade_forge(
+    conn: sqlite3.Connection,
+    user_id: int,
+    allowed_rods,
+    required_rank: str = FORGE_REQUIRED_RANK,
+) -> dict:
+    """Compra atomicamente o PRÓXIMO nível da forja.
+
+    Vara e rank são reavaliados aqui dentro, não só na UI — mesmo motivo do
+    gate de tier em start_island_construction: a view fica aberta por até 180s
+    e o jogador pode trocar de vara nesse meio-tempo. `allowed_rods` chega de
+    fora porque o mapa de tiers das varas (ROD_STATS) mora no cog, não nesta
+    camada.
+    """
+    ensure_user(conn, user_id)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rod_row = conn.execute(
+            "SELECT current_rod FROM user_rods WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        rod = (rod_row["current_rod"] if rod_row else None) or "vara_bambu"
+
+        user_row = conn.execute(
+            "SELECT wallet, scrap, guild_rank FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        wallet = _coerce_int(user_row["wallet"] if user_row else 0)
+        scrap = _coerce_int(user_row["scrap"] if user_row else 0)
+        rank = (user_row["guild_rank"] if user_row else None) or "F"
+
+        up_row = conn.execute(
+            "SELECT forge_level FROM rod_upgrades WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        level = _coerce_int(up_row["forge_level"] if up_row else 0)
+        cost = forge_level_cost(level + 1)
+
+        base = {
+            "level": level,
+            "next_level": level + 1,
+            "cost_saches": cost["saches"],
+            "cost_scrap": cost["scrap"],
+            "wallet": wallet,
+            "scrap": scrap,
+            "rod": rod,
+            "rank": rank,
+        }
+
+        def recusa(motivo):
+            conn.commit()
+            return {"success": False, "reason": motivo, **base}
+
+        if rod not in allowed_rods:
+            return recusa("locked_rod")
+        if rank != required_rank:
+            return recusa("locked_rank")
+        if wallet < cost["saches"]:
+            return recusa("insufficient_saches")
+        if scrap < cost["scrap"]:
+            return recusa("insufficient_scrap")
+
+        conn.execute(
+            "UPDATE users SET wallet = ?, scrap = ? WHERE user_id = ?",
+            (wallet - cost["saches"], scrap - cost["scrap"], user_id),
+        )
+        conn.execute(
+            "UPDATE rod_upgrades SET forge_level = ? WHERE user_id = ?",
+            (level + 1, user_id),
+        )
+        sync_user_to_economy(conn, user_id)
+        conn.commit()
+        return {
+            "success": True,
+            "reason": None,
+            **base,
+            "level": level + 1,
+            "wallet": wallet - cost["saches"],
+            "scrap": scrap - cost["scrap"],
+        }
     except Exception:
         conn.rollback()
         raise

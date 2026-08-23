@@ -35,8 +35,12 @@ from cogs.pesca_visuals import (
 # vem o único ponto de leitura dos bônus.
 from cogs.ilha import get_island_bonuses
 from economy_db import (
+    FORGE_REQUIRED_RANK,
     MISSION_DAILY_CAP,
     add_guild_xp,
+    forge_level_cost,
+    forge_luck_multiplier,
+    get_forge_level,
     add_inventory_item,
     ensure_user,
     ensure_v4_tables,
@@ -63,6 +67,7 @@ from economy_db import (
     sync_user_to_economy,
     try_register_mission_completion,
     try_spend_wallet,
+    try_upgrade_forge,
     try_upgrade_rod,
     mission_slots_left,
     missions_completed_today,
@@ -1058,7 +1063,7 @@ async def pescar(interaction: discord.Interaction):
 
     row = cursor.execute("""
         SELECT u.wallet, u.fish_count, u.guild_rank, u.guild_xp, u.scrap,
-               ur.current_rod, ru.luck_level, ru.cd_level,
+               ur.current_rod, ru.luck_level, ru.cd_level, ru.forge_level,
                uc.last_fish,
                q.current_chapter
         FROM users u
@@ -1090,6 +1095,12 @@ async def pescar(interaction: discord.Interaction):
     ilha_bonus = get_island_bonuses(conn, user_id)
 
     luck_bonus = 1 + (upgrades.get("luck", 0) * 0.10) + ilha_bonus["sorte_bonus"]
+    # Forja do Abismo: fator SEPARADO na cadeia, não somado ao luck_bonus.
+    # Somar diluiria o efeito (o luck_bonus já é uma base 1 + acréscimos),
+    # enquanto multiplicar mantém a promessa da mecânica: +1,5% por nível em
+    # cima do que a vara e os upgrades já rendem, seja qual for esse valor.
+    forge_level = row['forge_level'] or 0
+    forge_mult = forge_luck_multiplier(forge_level)
     cd_reduction = 1 - (upgrades.get("cd", 0) * 0.05) - ilha_bonus["cd_reducao"]
 
     # 4. LÓGICA DE COOLDOWN
@@ -1214,8 +1225,14 @@ async def pescar(interaction: discord.Interaction):
     # Cálculo de Valor (Aplicando Clima)
     is_trash = nome in TRASH_ITEMS
 
-    # Fórmula: ValorBase * SorteVara * Upgrade * Clima
-    base_val = int(random.randint(v_min, v_max) * rod_data['luck'] * luck_bonus * w_stats['luck_mod'])
+    # Fórmula: ValorBase * SorteVara * (Upgrades+Ilha) * Forja * Clima
+    base_val = int(
+        random.randint(v_min, v_max)
+        * rod_data['luck']
+        * luck_bonus
+        * forge_mult
+        * w_stats['luck_mod']
+    )
     if used_bait: base_val = int(base_val * 1.5)
 
     valor = 0
@@ -3212,6 +3229,118 @@ def process_afk_trap(trap_json):
             
     return new_json, rewards, broken
 
+# --- FORJA DO ABISMO ---
+# Varas que habilitam a forja. Derivado de ROD_STATS em vez de escrito à mão
+# para que uma vara de tier 5 nova entre sozinha no requisito.
+FORGE_ALLOWED_RODS = frozenset(k for k, v in ROD_STATS.items() if v["tier"] >= 5)
+
+
+def forge_status(conn, user_id: int) -> dict:
+    """Estado da forja para exibição: nível, custo do próximo e requisitos."""
+    nivel = get_forge_level(conn, user_id)
+    rod = get_current_rod(conn, user_id) or "vara_bambu"
+    rank = get_guild_rank(conn, user_id)["rank"]
+    custo = forge_level_cost(nivel + 1)
+    tem_vara = rod in FORGE_ALLOWED_RODS
+    tem_rank = rank == FORGE_REQUIRED_RANK
+    return {
+        "nivel": nivel,
+        "proximo": nivel + 1,
+        "custo_saches": custo["saches"],
+        "custo_scrap": custo["scrap"],
+        "bonus_atual": forge_luck_multiplier(nivel),
+        "bonus_proximo": forge_luck_multiplier(nivel + 1),
+        "wallet": get_wallet(conn, user_id),
+        "scrap": get_scrap(conn, user_id),
+        "rod": rod,
+        "rank": rank,
+        "tem_vara": tem_vara,
+        "tem_rank": tem_rank,
+        "desbloqueado": tem_vara and tem_rank,
+    }
+
+
+def build_forge_embed(estado: dict) -> discord.Embed:
+    embed = discord.Embed(
+        title=f"🌀 Forja do Abismo — Nível {estado['nivel']}",
+        description=(
+            "🔧 **Galdino:** 'A Fenda cospe um metal que não devia existir. "
+            "Eu bato nele, você paga. Não tem fim.'"
+        ),
+        color=discord.Color.dark_purple(),
+    )
+    embed.add_field(
+        name="Bônus atual",
+        value=f"**+{(estado['bonus_atual'] - 1) * 100:.1f}%** de valor de captura",
+        inline=True,
+    )
+    embed.add_field(
+        name=f"Nível {estado['proximo']}",
+        value=f"**+{(estado['bonus_proximo'] - 1) * 100:.1f}%**",
+        inline=True,
+    )
+    embed.add_field(name="​", value="​", inline=True)
+    embed.add_field(
+        name="Custo do próximo nível",
+        value=f"💰 {estado['custo_saches']:,} Sachês\n⚙️ {estado['custo_scrap']:,} Sucata".replace(",", "."),
+        inline=True,
+    )
+    embed.add_field(
+        name="Você tem",
+        value=f"💰 {estado['wallet']:,}\n⚙️ {estado['scrap']:,}".replace(",", "."),
+        inline=True,
+    )
+    embed.set_footer(text="A escada não tem teto — cada nível custa 30% mais que o anterior.")
+    return embed
+
+
+class ForgeView(discord.ui.View):
+    """Compra de um nível por clique. Sem lote: o custo cresce 30% a cada
+    nível, então um botão de "comprar N" esconderia do jogador quanto ele
+    está gastando de verdade."""
+
+    def __init__(self, user_id: int):
+        super().__init__(timeout=180)
+        self.user_id = user_id
+
+    @discord.ui.button(label="Forjar próximo nível", style=discord.ButtonStyle.danger, emoji="🔨")
+    async def forjar(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.user_id:
+            return await interaction.response.send_message("❌ Essa forja não é sua.", ephemeral=True)
+
+        conn = get_bot_instance().db_conn
+        # try_upgrade_forge relê vara, rank, saldo e nível dentro da própria
+        # transação: nada do que foi capturado quando a view abriu é usado
+        # para decidir (a view fica de pé por até 180s).
+        resultado = try_upgrade_forge(conn, self.user_id, FORGE_ALLOWED_RODS)
+
+        if not resultado["success"]:
+            motivos = {
+                "locked_rod": "🔒 Requer uma vara de **Tier 5** equipada.",
+                "locked_rank": f"🔒 Requer **Rank {FORGE_REQUIRED_RANK}** da Guilda.",
+                "insufficient_saches": (
+                    f"💸 Faltam Sachês: precisa de **{resultado['cost_saches']:,}**, "
+                    f"tem {resultado['wallet']:,}."
+                ).replace(",", "."),
+                "insufficient_scrap": (
+                    f"⚙️ Falta sucata: precisa de **{resultado['cost_scrap']:,}**, "
+                    f"tem {resultado['scrap']:,}."
+                ).replace(",", "."),
+            }
+            return await interaction.response.send_message(
+                motivos.get(resultado["reason"], "❌ Não foi possível forjar agora."),
+                ephemeral=True,
+            )
+
+        estado = forge_status(conn, self.user_id)
+        await interaction.response.edit_message(embed=build_forge_embed(estado), view=self)
+        await interaction.followup.send(
+            f"🌀 **Forja nível {resultado['level']}!** "
+            f"Bônus de captura agora é **+{(forge_luck_multiplier(resultado['level']) - 1) * 100:.1f}%**.",
+            ephemeral=True,
+        )
+
+
 # --- VIEW DA OFICINA DO GALDINO (RECICLAGEM & UPGRADES) ---
 class GaldinoView(discord.ui.View):
     def __init__(self, user_id, user_name):
@@ -3287,7 +3416,46 @@ class GaldinoView(discord.ui.View):
         view.add_item(b1); view.add_item(b2)
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
-    # --- BOTÃO 3: EXAMINAR MÁQUINA (QUEST + GERENCIAMENTO HÍBRIDO) ---
+    # --- BOTÃO 3: FORJA DO ABISMO (ESCADA SEM TETO DE FIM DE JOGO) ---
+    @discord.ui.button(label="Forja do Abismo", style=discord.ButtonStyle.danger, emoji="🌀", row=1)
+    async def forge_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        conn = get_bot_instance().db_conn
+        estado = forge_status(conn, self.user_id)
+
+        # Bloqueado: explica o requisito em vez de esconder. Mesmo padrão da
+        # quest do Covo, que mostra o progresso 0/50 em vez de omitir a
+        # máquina — requisito invisível vira requisito inexistente para quem
+        # está jogando.
+        if not estado["desbloqueado"]:
+            embed = discord.Embed(
+                title="🌀 Forja do Abismo",
+                description=(
+                    "🔒 **Galdino:** 'Isso aí não é pra qualquer um. Volta quando "
+                    "tiver equipamento e patente pra encarar.'\n\n"
+                    "**Requisitos:**"
+                ),
+                color=discord.Color.dark_grey(),
+            )
+            embed.add_field(
+                name=f"{'✅' if estado['tem_vara'] else '❌'} Vara de Tier 5 equipada",
+                value=" ou ".join(ROD_STATS[k]["name"] for k in FORGE_ALLOWED_RODS)
+                + f"\n*Equipada: {ROD_STATS.get(estado['rod'], {}).get('name', estado['rod'])}*",
+                inline=False,
+            )
+            embed.add_field(
+                name=f"{'✅' if estado['tem_rank'] else '❌'} Rank {FORGE_REQUIRED_RANK} da Guilda",
+                value=f"*Atual: Rank {estado['rank']}*",
+                inline=False,
+            )
+            return await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        await interaction.response.send_message(
+            embed=build_forge_embed(estado),
+            view=ForgeView(self.user_id),
+            ephemeral=True,
+        )
+
+    # --- BOTÃO 4: EXAMINAR MÁQUINA (QUEST + GERENCIAMENTO HÍBRIDO) ---
     @discord.ui.button(label="Examinar Máquina", style=discord.ButtonStyle.secondary, emoji="🦀", row=1)
     async def trap_manager(self, interaction: discord.Interaction, button: discord.ui.Button):
         # O decorator @discord.ui.button substitui este atributo por um
