@@ -589,6 +589,134 @@ def consume_fish(conn: sqlite3.Connection, user_id: int, fish_name: str, amount:
     return True
 
 
+def get_trap(conn: sqlite3.Connection, user_id: int) -> dict:
+    """Estado da armadilha AFK lido da v4 (user_trap).
+
+    Devolve o mesmo formato que a coluna legada `economy.afk_trap` usa
+    ({} quando não há armadilha), para os chamadores não precisarem saber de
+    onde veio.
+    """
+    ensure_user(conn, user_id)
+    row = conn.execute(
+        "SELECT trap_type, status, timer_end, durability FROM user_trap WHERE user_id = ?",
+        (user_id,),
+    ).fetchone()
+    if not row or not row["trap_type"]:
+        return {}
+    return {
+        "type": row["trap_type"],
+        "status": row["status"],
+        "timer_end": row["timer_end"],
+        "durability": row["durability"],
+    }
+
+
+def set_trap(conn: sqlite3.Connection, user_id: int, trap: dict | None) -> None:
+    """Grava o estado da armadilha na v4 e propaga para a legada.
+
+    Mesmo motivo do set_inventory_item: gravar direto em `economy.afk_trap`
+    não chega na v4 (sync_user_from_economy usa INSERT OR IGNORE e nunca
+    atualiza uma linha existente de user_trap), então o estado era revertido
+    pelo sync_user_to_economy do comando seguinte — uma armadilha coletada
+    voltava para 'ready' e podia ser coletada de novo, indefinidamente.
+    """
+    ensure_user(conn, user_id)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        if not trap:
+            conn.execute(
+                "UPDATE user_trap SET trap_type = NULL, status = NULL, timer_end = NULL, durability = NULL WHERE user_id = ?",
+                (user_id,),
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO user_trap (user_id, trap_type, status, timer_end, durability)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET
+                    trap_type = excluded.trap_type,
+                    status = excluded.status,
+                    timer_end = excluded.timer_end,
+                    durability = excluded.durability
+                """,
+                (
+                    user_id,
+                    trap.get("type"),
+                    trap.get("status"),
+                    trap.get("timer_end"),
+                    trap.get("durability"),
+                ),
+            )
+        sync_user_to_economy(conn, user_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def get_guild_rank(conn: sqlite3.Connection, user_id: int) -> dict:
+    """Rank/XP de guilda lidos da v4 (users).
+
+    A coluna legada `economy.guild_rank`/`guild_xp` é derivada de users por
+    sync_user_to_economy, então ela é a cópia — não a fonte.
+    """
+    ensure_user(conn, user_id)
+    row = conn.execute(
+        "SELECT guild_rank, guild_xp FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    if not row:
+        return {"rank": "F", "xp": 0}
+    return {"rank": row["guild_rank"] or "F", "xp": _coerce_int(row["guild_xp"], 0)}
+
+
+def set_guild_rank(conn: sqlite3.Connection, user_id: int, rank: str, xp: int) -> None:
+    """Grava rank/XP de guilda na v4 e propaga para a legada.
+
+    Mesmo motivo do set_trap: gravar direto em `economy` não chega em users,
+    e o sync_user_to_economy do comando seguinte reescreve economy a partir de
+    users — uma promoção gravada só na legada era revertida na hora seguinte.
+    """
+    ensure_user(conn, user_id)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute(
+            "UPDATE users SET guild_rank = ?, guild_xp = ? WHERE user_id = ?",
+            (rank or "F", max(0, _coerce_int(xp, 0)), user_id),
+        )
+        sync_user_to_economy(conn, user_id)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def add_guild_xp(conn: sqlite3.Connection, user_id: int, delta: int) -> int:
+    """Soma `delta` ao XP de guilda relendo o valor atual dentro da transação.
+
+    Existe para os caminhos de recompensa de missão em grupo não dependerem de
+    um ensure_user() feito por acaso na linha anterior (era o `modify_wallet`
+    que os protegia): sem essa releitura, um `UPDATE users SET guild_xp =
+    guild_xp + ?` seguido de sync_user_to_economy() propaga para `economy` um
+    `users` que pode estar defasado em relação à legada.
+    """
+    ensure_user(conn, user_id)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT guild_xp FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        new_xp = max(0, _coerce_int(row["guild_xp"] if row else 0) + delta)
+        conn.execute(
+            "UPDATE users SET guild_xp = ? WHERE user_id = ?", (new_xp, user_id)
+        )
+        sync_user_to_economy(conn, user_id)
+        conn.commit()
+        return new_xp
+    except Exception:
+        conn.rollback()
+        raise
+
+
 def log_fish_sale(conn: sqlite3.Connection, fish_name: str, sale_price: int, user_id: int) -> None:
     conn.execute(
         "INSERT INTO fish_sales_history (fish_name, sale_price, user_id) VALUES (?, ?, ?)",

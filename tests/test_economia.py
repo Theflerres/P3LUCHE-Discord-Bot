@@ -6,20 +6,27 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import discord
+
 from cogs import economia
 from economy_db import (
+    add_guild_xp,
     add_inventory_item,
     ensure_user,
     ensure_v4_tables,
     get_cooldowns,
     get_current_rod,
+    get_guild_rank,
     get_inventory,
     get_rod_upgrades,
     get_scrap,
+    get_trap,
     get_wallet,
     modify_scrap,
     modify_wallet,
     set_cooldown,
+    set_guild_rank,
+    set_trap,
     sync_user_to_economy,
 )
 
@@ -1178,6 +1185,451 @@ class RodSelectEquipTests(unittest.IsolatedAsyncioTestCase):
             detalhes_field.value,
             "pescar() usou a vara antiga (vara_bambu) mesmo depois da troca — bug reportado não corrigido",
         )
+
+
+class TrapAutoTransitionTests(unittest.IsolatedAsyncioTestCase):
+    """Regressão: quando o timer da armadilha vencia, as transições
+    automáticas (working->ready e cooldown->idle) faziam
+    `await self.trap_manager(interaction, button)`. Mas @discord.ui.button
+    troca esse atributo por um discord.ui.Button na instância da View, que
+    não é chamável — todo jogador que voltasse na máquina depois do timer
+    vencer tomava TypeError em vez do painel.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def _make_view(self, user_id):
+        view = economia.GaldinoView(user_id, "Tester")
+        # O atributo continua sendo um Button (não chamável): é exatamente
+        # essa a premissa do bug, então o teste avisaria caso alguém
+        # "consertasse" removendo o decorator em vez de corrigir a chamada.
+        self.assertIsInstance(view.trap_manager, discord.ui.Button)
+        self.assertFalse(callable(view.trap_manager))
+        return view
+
+    async def _click(self, view, interaction):
+        """Dispara pelo mesmo caminho que o discord.py usa (Button.callback),
+        não pelo método interno — senão o teste não passa pelo atributo que
+        quebrava."""
+        await view.trap_manager.callback(interaction)
+
+    def _seed(self, conn, user_id):
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, wallet) VALUES (?, ?, ?)",
+            (user_id, "Tester", 500),
+        )
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+
+    async def test_expired_working_timer_renders_ready_panel_without_crashing(self):
+        conn = self._make_conn()
+        user_id = 7101
+        self._seed(conn, user_id)
+        # Timer já vencido: é o estado que dispara a transição automática.
+        set_trap(conn, user_id, {"type": "covo_basico", "status": "working", "timer_end": 1})
+
+        view = self._make_view(user_id)
+        interaction = self._make_interaction(user_id)
+
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await self._click(view, interaction)
+
+        # Antes do fix isto estourava TypeError: 'Button' object is not callable.
+        interaction.response.send_message.assert_awaited_once()
+        _, kwargs = interaction.response.send_message.call_args
+        self.assertIn("READY", kwargs["embed"].title)
+        self.assertEqual(get_trap(conn, user_id)["status"], "ready")
+
+    async def test_expired_cooldown_timer_renders_idle_panel_without_crashing(self):
+        conn = self._make_conn()
+        user_id = 7102
+        self._seed(conn, user_id)
+        set_trap(conn, user_id, {"type": "covo_basico", "status": "cooldown", "timer_end": 1})
+
+        view = self._make_view(user_id)
+        interaction = self._make_interaction(user_id)
+
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await self._click(view, interaction)
+
+        interaction.response.send_message.assert_awaited_once()
+        _, kwargs = interaction.response.send_message.call_args
+        self.assertIn("IDLE", kwargs["embed"].title)
+        self.assertEqual(get_trap(conn, user_id)["status"], "idle")
+
+    async def test_unexpired_working_timer_still_shows_the_waiting_panel(self):
+        """Contraprova: sem timer vencido não há transição, então o painel
+        continua sendo o de espera (o fix não mexeu nesse caminho)."""
+        conn = self._make_conn()
+        user_id = 7103
+        self._seed(conn, user_id)
+        future = datetime.now().timestamp() + 600
+        set_trap(conn, user_id, {"type": "covo_basico", "status": "working", "timer_end": future})
+
+        view = self._make_view(user_id)
+        interaction = self._make_interaction(user_id)
+
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await self._click(view, interaction)
+
+        _, kwargs = interaction.response.send_message.call_args
+        self.assertIn("WORKING", kwargs["embed"].title)
+        self.assertEqual(get_trap(conn, user_id)["status"], "working")
+
+
+class JennaPromotionPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    """Regressão: a promoção da Capitã Jenna fazia
+    `UPDATE economy SET guild_rank, guild_xp`, ou seja, escrevia só na tabela
+    legada, deixando `users` (v4) desatualizado.
+
+    Atenção ao mecanismo exato: guild_rank/guild_xp NÃO são revertidos por um
+    comando v4 qualquer, porque sync_user_from_economy() faz upsert dessas
+    duas colunas de volta para users (diferente de user_trap/user_rods, que
+    usam INSERT OR IGNORE). O que reverte é a janela entre a promoção e o
+    próximo ensure_user(): os caminhos de recompensa de missão em grupo
+    (economia.py:1049 e :1325) fazem `UPDATE users SET guild_xp = guild_xp+?`
+    seguido de sync_user_to_economy() SEM ensure_user antes — então leem o
+    users obsoleto e reescrevem economy a partir dele, apagando a promoção.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name),
+            response=SimpleNamespace(
+                send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock()
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    async def _ask_promo(self, conn, user_id):
+        """Abre o menu real da Jenna e seleciona 'Pedir Promoção'.
+
+        JennaSelect é uma classe local dentro de talk_jenna, então o único
+        jeito fiel de exercitá-la é pegar a view que o botão envia.
+        """
+        view = economia.GuildView(user_id, "Tester")
+        open_interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia, "get_local_file", return_value=(None, None)):
+            await view.talk_jenna.callback(open_interaction)
+
+            _, kwargs = open_interaction.response.send_message.call_args
+            select = kwargs["view"].children[0]
+            select._values = ["ask_promo"]
+
+            promo_interaction = self._make_interaction(user_id)
+            await select.callback(promo_interaction)
+        return promo_interaction
+
+    async def test_promotion_survives_the_next_v4_command(self):
+        conn = self._make_conn()
+        user_id = 7201
+        # Rank E (req_xp 500) com 600 XP: promoção elegível para D, sobrando
+        # 100 XP. Rank F não serve aqui porque seu req_xp é 0 — promoveria
+        # com qualquer XP e não exercitaria a checagem.
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, wallet, guild_rank, guild_xp) VALUES (?, ?, ?, ?, ?)",
+            (user_id, "Tester", 100, "E", 600),
+        )
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+
+        promo_interaction = await self._ask_promo(conn, user_id)
+
+        promo_interaction.response.edit_message.assert_awaited_once()
+        _, kwargs = promo_interaction.response.edit_message.call_args
+        self.assertIn("Rank D", kwargs["embed"].description)
+        # Lê users direto, sem get_guild_rank(): ele chama ensure_user ->
+        # sync_user_from_economy, que consertaria a dessincronia e mascararia
+        # o bug antes da etapa de reprodução abaixo.
+        v4 = conn.execute(
+            "SELECT guild_rank, guild_xp FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        self.assertEqual((v4["guild_rank"], v4["guild_xp"]), ("D", 100))
+
+        # Recompensa de missão em grupo, exatamente como economia.py:1049-1050:
+        # escreve users direto e sincroniza para economy sem passar por
+        # ensure_user. Pré-fix, users ainda dizia E/600 aqui e este sync
+        # devolvia o jogador para o rank E.
+        conn.execute(
+            "UPDATE users SET guild_xp = guild_xp + ? WHERE user_id = ?", (50, user_id)
+        )
+        sync_user_to_economy(conn, user_id)
+
+        self.assertEqual(get_guild_rank(conn, user_id)["rank"], "D")
+        legacy = conn.execute(
+            "SELECT guild_rank, guild_xp FROM economy WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        self.assertEqual(
+            legacy["guild_rank"],
+            "D",
+            "promoção revertida pelo sync do comando seguinte — bug original",
+        )
+        # 100 de sobra da promoção + 50 da recompensa; pré-fix dava 650.
+        self.assertEqual(legacy["guild_xp"], 150)
+
+    async def test_promotion_refused_without_enough_xp_leaves_rank_untouched(self):
+        conn = self._make_conn()
+        user_id = 7202
+        # Rank E exige 500 XP; com 10 a promoção tem que ser recusada.
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, wallet, guild_rank, guild_xp) VALUES (?, ?, ?, ?, ?)",
+            (user_id, "Tester", 100, "E", 10),
+        )
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+
+        promo_interaction = await self._ask_promo(conn, user_id)
+
+        _, kwargs = promo_interaction.response.edit_message.call_args
+        self.assertIn("XP suficiente", kwargs["embed"].description)
+        self.assertEqual(get_guild_rank(conn, user_id), {"rank": "E", "xp": 10})
+
+
+class GuildRankHelperTests(unittest.TestCase):
+    """Helpers v4 de rank/XP: mesmo contrato de set_trap/set_inventory_item
+    (grava na v4 e propaga para a legada no mesmo commit)."""
+
+    def test_set_guild_rank_writes_v4_and_propagates_to_legacy(self):
+        conn = _make_pescar_conn()
+        user_id = 7301
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, guild_rank, guild_xp) VALUES (?, ?, ?, ?)",
+            (user_id, "Tester", "F", 0),
+        )
+        conn.commit()
+
+        set_guild_rank(conn, user_id, "D", 250)
+
+        users_row = conn.execute(
+            "SELECT guild_rank, guild_xp FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        self.assertEqual((users_row["guild_rank"], users_row["guild_xp"]), ("D", 250))
+        legacy = conn.execute(
+            "SELECT guild_rank, guild_xp FROM economy WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        self.assertEqual((legacy["guild_rank"], legacy["guild_xp"]), ("D", 250))
+
+    def test_get_guild_rank_defaults_and_normalizes(self):
+        conn = _make_pescar_conn()
+        user_id = 7302
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, guild_rank, guild_xp) VALUES (?, ?, ?, ?)",
+            (user_id, "Tester", None, "42"),
+        )
+        conn.commit()
+
+        self.assertEqual(get_guild_rank(conn, user_id), {"rank": "F", "xp": 42})
+
+    def test_set_guild_rank_clamps_negative_xp(self):
+        conn = _make_pescar_conn()
+        user_id = 7303
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, guild_rank, guild_xp) VALUES (?, ?, ?, ?)",
+            (user_id, "Tester", "F", 0),
+        )
+        conn.commit()
+
+        set_guild_rank(conn, user_id, "E", -5)
+
+        self.assertEqual(get_guild_rank(conn, user_id), {"rank": "E", "xp": 0})
+
+
+
+class GuildXpStalePropagationTests(unittest.IsolatedAsyncioTestCase):
+    """Etapa 1c: escrita crua em `users` a partir de estado defasado.
+
+    Achado real desta etapa: os dois pontos citados no ticket
+    (economia.py:1051 e :1327) já estavam protegidos por acaso — o
+    `modify_wallet` da linha anterior chama ensure_user. O ponto que
+    realmente perdia dado era _finalize_pescar, que grava
+    `guild_xp`/`guild_rank` ABSOLUTOS a partir do snapshot lido no início de
+    pescar() — snapshot esse que é anterior à recompensa de missão de grupo
+    concedida no meio do mesmo comando.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name, display_name=name),
+            response=SimpleNamespace(
+                send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock()
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def _seed(self, conn, user_id, rank, xp):
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, wallet, guild_rank, guild_xp) VALUES (?, ?, ?, ?, ?)",
+            (user_id, "Tester", 0, rank, xp),
+        )
+        # Capítulo que habilita XP de guilda na pescaria.
+        conn.execute(
+            "INSERT INTO quest_progress (user_id, current_chapter) VALUES (?, 'acesso_liberado')",
+            (user_id,),
+        )
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+
+    def _arm_group_mission(self, conn, user_id):
+        """Party de um membro só com a missão f1 (fish_count, alvo 5, 40 XP)
+        a uma pescaria de fechar — a próxima captura paga a recompensa."""
+        conn.execute(
+            "INSERT INTO parties (leader_id, leader_name, members_json, active_mission_id, mission_progress, mission_target) VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, "Tester", json.dumps([]), "f1", 4, 5),
+        )
+        conn.commit()
+
+    async def _pescar(self, conn, user_id):
+        """Pesca forçando um peixe de tier baixo (XP de guilda = 2), para o
+        número esperado ser determinístico."""
+        interaction = self._make_interaction(user_id)
+        real_choice = economia.random.choice
+
+        def low_tier(seq):
+            cands = [i for i in seq if isinstance(i, tuple) and len(i) == 6 and 0 < i[4] <= 1]
+            return cands[0] if cands else real_choice(seq)
+
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia.random, "choice", side_effect=low_tier):
+            await economia.pescar.callback(interaction)
+        return interaction
+
+    async def test_group_mission_reward_is_not_clobbered_by_pescar_finalize(self):
+        conn = self._make_conn()
+        user_id = 7401
+        self._seed(conn, user_id, "E", 100)
+        self._arm_group_mission(conn, user_id)
+
+        await self._pescar(conn, user_id)
+
+        # 100 iniciais + 40 da missão de grupo + 2 da pescaria (tier baixo).
+        # Pré-fix isto dava 102: _finalize_pescar gravava 100+2 absoluto,
+        # apagando os 40 concedidos em economia.py:1051 no mesmo comando.
+        v4 = conn.execute(
+            "SELECT guild_xp FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        self.assertEqual(
+            v4["guild_xp"],
+            142,
+            "XP da missão de grupo foi sobrescrito pelo snapshot de pescar()",
+        )
+        legacy = conn.execute(
+            "SELECT guild_xp FROM economy WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        self.assertEqual(legacy["guild_xp"], 142)
+
+    async def test_promotion_then_group_reward_keeps_promoted_rank(self):
+        """Cenário exato pedido no ticket: promoção E/600 -> D/100, seguida de
+        recompensa de missão de grupo. Rank tem que continuar D e o XP tem que
+        somar, nunca voltar para o estado pré-promoção."""
+        conn = self._make_conn()
+        user_id = 7402
+        self._seed(conn, user_id, "E", 600)
+
+        # Promoção pelo fluxo real da Jenna (mesmo caminho da etapa 1b).
+        view = economia.GuildView(user_id, "Tester")
+        open_interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia, "get_local_file", return_value=(None, None)):
+            await view.talk_jenna.callback(open_interaction)
+            _, kwargs = open_interaction.response.send_message.call_args
+            select = kwargs["view"].children[0]
+            select._values = ["ask_promo"]
+            await select.callback(self._make_interaction(user_id))
+
+        self.assertEqual(get_guild_rank(conn, user_id), {"rank": "D", "xp": 100})
+
+        # Recompensa de missão de grupo logo depois.
+        self._arm_group_mission(conn, user_id)
+        await self._pescar(conn, user_id)
+
+        # D exige 1500 XP para subir, então 142 não promove de novo.
+        self.assertEqual(
+            get_guild_rank(conn, user_id),
+            {"rank": "D", "xp": 142},
+            "rank/XP reverteram para o estado anterior à promoção",
+        )
+
+
+class AddGuildXpHelperTests(unittest.TestCase):
+    """add_guild_xp: relê o XP dentro da transação, em vez de somar sobre um
+    `users` que pode estar defasado em relação à legada."""
+
+    def _desynced_user(self, conn, user_id):
+        """Deixa `users` para trás da legada de propósito — é o estado em que
+        um incremento cru propaga dado obsoleto para economy."""
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, guild_rank, guild_xp) VALUES (?, ?, ?, ?)",
+            (user_id, "Tester", "E", 100),
+        )
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+        conn.execute(
+            "UPDATE economy SET guild_xp = ? WHERE user_id = ?", (500, user_id)
+        )
+        conn.commit()
+
+    def test_raw_increment_plus_sync_propagates_stale_xp(self):
+        """Contraste: é exatamente este par de statements que estava nos
+        sites de recompensa de grupo. Sem um ensure_user antes ele soma sobre
+        o `users` defasado e escreve o resultado obsoleto na legada."""
+        conn = _make_pescar_conn()
+        user_id = 7500
+        self._desynced_user(conn, user_id)
+
+        conn.execute(
+            "UPDATE users SET guild_xp = guild_xp + ? WHERE user_id = ?", (50, user_id)
+        )
+        sync_user_to_economy(conn, user_id)
+
+        legacy = conn.execute(
+            "SELECT guild_xp FROM economy WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        self.assertEqual(legacy["guild_xp"], 150)  # perdeu 400 de XP
+
+    def test_add_guild_xp_reads_fresh_state_instead_of_stale_users(self):
+        """Mesmo ponto de partida do teste acima, agora pelo helper: o
+        ensure_user interno reconcilia antes de somar."""
+        conn = _make_pescar_conn()
+        user_id = 7501
+        self._desynced_user(conn, user_id)
+
+        novo = add_guild_xp(conn, user_id, 50)
+
+        self.assertEqual(novo, 550)
+        self.assertEqual(get_guild_rank(conn, user_id)["xp"], 550)
+        legacy = conn.execute(
+            "SELECT guild_xp FROM economy WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        self.assertEqual(legacy["guild_xp"], 550)
+
+    def test_add_guild_xp_clamps_at_zero(self):
+        conn = _make_pescar_conn()
+        user_id = 7502
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, guild_rank, guild_xp) VALUES (?, ?, ?, ?)",
+            (user_id, "Tester", "E", 30),
+        )
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+
+        self.assertEqual(add_guild_xp(conn, user_id, -100), 0)
+        self.assertEqual(get_guild_rank(conn, user_id)["xp"], 0)
+
 
 
 if __name__ == "__main__":

@@ -31,13 +31,16 @@ from cogs.pesca_visuals import (
     resolve_weather_asset,
 )
 from economy_db import (
+    add_guild_xp,
     add_inventory_item,
     ensure_user,
     ensure_v4_tables,
     get_cooldowns,
+    get_guild_rank,
     get_inventory,
     get_rod_upgrades,
     get_scrap,
+    get_trap,
     get_wallet,
     log_fish_sale,
     modify_scrap,
@@ -45,6 +48,8 @@ from economy_db import (
     seed_market_prices,
     set_cooldown,
     set_current_rod,
+    set_guild_rank,
+    set_trap,
     sync_user_from_economy,
     sync_user_to_economy,
     try_spend_wallet,
@@ -739,12 +744,16 @@ async def _finalize_pescar(interaction: discord.Interaction, ctx: dict):
             add_inventory_item(conn, user_id, key, delta)
     fresh_inv = get_inventory(conn, user_id)
 
+    # Rank/XP saem pelo helper v4 (BEGIN IMMEDIATE + sync), igual ao resto da
+    # camada. fish_count continua sendo delta e user_name é idempotente, então
+    # esses dois seguem no UPDATE direto.
+    set_guild_rank(conn, user_id, current_rank, new_xp_total)
     conn.execute(
         """
-        UPDATE users SET fish_count = fish_count + 1, guild_xp = ?, guild_rank = ?, user_name = ?
+        UPDATE users SET fish_count = fish_count + 1, user_name = ?
         WHERE user_id = ?
         """,
-        (new_xp_total, current_rank, interaction.user.name, user_id),
+        (interaction.user.name, user_id),
     )
     sync_user_to_economy(conn, user_id)
     if valor > 0 and not ctx.get("is_trash"):
@@ -1044,8 +1053,12 @@ async def pescar(interaction: discord.Interaction):
                     for member_id in unique_members:
                         share = base_share + remainder if member_id == leader_id else base_share
                         modify_wallet(conn, member_id, share)
-                        conn.execute("UPDATE users SET guild_xp = guild_xp + ? WHERE user_id = ?", (reward_xp, member_id))
-                        sync_user_to_economy(conn, member_id)
+                        # add_guild_xp relê o XP dentro da própria transação.
+                        # O UPDATE cru + sync_user_to_economy que havia aqui só
+                        # não propagava dado obsoleto porque o modify_wallet
+                        # acima chama ensure_user por acaso — dependência frágil
+                        # da linha anterior.
+                        add_guild_xp(conn, member_id, reward_xp)
 
                     cursor.execute("UPDATE parties SET active_mission_id = NULL, mission_progress = 0 WHERE leader_id = ?", (my_party['leader_id'],))
                     mission_msg = f"\n🎉 **MISSÃO CUMPRIDA!**\nGrupo completou: **{m_data['title']}**\nPrêmio: 💰 {reward_money} | ⭐ {reward_xp} XP!"
@@ -1056,9 +1069,15 @@ async def pescar(interaction: discord.Interaction):
         xp_table = {0: 2, 1: 10, 2: 25, 3: 100, 4: 500}
         xp_ganho = xp_table.get(tier_p, 2)
 
-    new_xp_total = (row['guild_xp'] or 0) + xp_ganho
+    # Rank/XP vêm do estado FRESCO, não do snapshot lido no início de
+    # pescar(): a recompensa de missão de grupo logo acima já incrementou
+    # guild_xp deste mesmo jogador, e uma promoção da Jenna pode ter entrado
+    # na janela de await do lance. Somar sobre `row` e gravar o absoluto em
+    # _finalize_pescar descartava as duas coisas.
+    _guild_atual = get_guild_rank(conn, user_id)
+    new_xp_total = _guild_atual['xp'] + xp_ganho
     
-    current_rank = row['guild_rank'] if row['guild_rank'] else 'F'
+    current_rank = _guild_atual['rank']
     rank_info = GUILD_RANKS.get(current_rank, GUILD_RANKS['F'])
     
     if rank_info['next'] and new_xp_total >= rank_info['req_xp']:
@@ -1320,8 +1339,10 @@ async def explorar(interaction: discord.Interaction):
                 for mid in unique_mems:
                     share = base_share + remainder if mid == leader_id else base_share
                     modify_wallet(conn, mid, share)
-                    conn.execute("UPDATE users SET guild_xp = guild_xp + ? WHERE user_id = ?", (rx, mid))
-                    sync_user_to_economy(conn, mid)
+                    # Mesmo motivo do caminho de pescar: releitura dentro da
+                    # transação em vez de depender do ensure_user do
+                    # modify_wallet acima.
+                    add_guild_xp(conn, mid, rx)
                 cursor.execute("UPDATE parties SET active_mission_id=NULL, mission_progress=0 WHERE leader_id=?", (my_party['leader_id'],))
                 mission_msg = f"\n🎉 **Missão Completa!** Ganharam {rw} Sachês!"
 
@@ -2196,7 +2217,6 @@ class GuildView(discord.ui.View):
                     return await interaction.response.send_message("⛔ Essa seleção não é sua.", ephemeral=True)
 
                 choice = self.values[0]
-                cursor = get_bot_instance().db_conn.cursor()
 
                 if choice == 'intro':
                     text = get_dialogue('jenna', 'intro')
@@ -2227,10 +2247,12 @@ class GuildView(discord.ui.View):
                     return
 
                 if choice == 'ask_promo':
-                    # Recarrega os dados
-                    row = cursor.execute("SELECT guild_rank, guild_xp FROM economy WHERE user_id = ?", (self.user_id,)).fetchone()
-                    curr_rank = row['guild_rank'] if row and row['guild_rank'] else 'F'
-                    xp_val = row['guild_xp'] if row and row['guild_xp'] else 0
+                    # Recarrega os dados da v4 (users): a legada economy é
+                    # derivada e podia estar desatualizada na hora de decidir
+                    # a promoção.
+                    gr = get_guild_rank(get_bot_instance().db_conn, self.user_id)
+                    curr_rank = gr['rank']
+                    xp_val = gr['xp']
                     rdata = GUILD_RANKS.get(curr_rank, GUILD_RANKS['F'])
                     next_key = rdata['next']
                     if not next_key:
@@ -2244,8 +2266,9 @@ class GuildView(discord.ui.View):
                             return
                         new_rank = next_key
                         new_xp = xp_val - rdata['req_xp']
-                        cursor.execute("UPDATE economy SET guild_rank = ?, guild_xp = ? WHERE user_id = ?", (new_rank, new_xp, self.user_id))
-                        get_bot_instance().db_conn.commit()
+                        # Grava na v4: UPDATE só em economy era revertido pelo
+                        # sync_user_to_economy do comando seguinte.
+                        set_guild_rank(get_bot_instance().db_conn, self.user_id, new_rank, new_xp)
                         await interaction.response.edit_message(embed=discord.Embed(description=f"🛡️ **Promoção Concedida!** Agora você é **Rank {new_rank}**."), view=self.view)
                         return
                     else:
@@ -2717,12 +2740,21 @@ class GaldinoView(discord.ui.View):
     # --- BOTÃO 3: EXAMINAR MÁQUINA (QUEST + GERENCIAMENTO HÍBRIDO) ---
     @discord.ui.button(label="Examinar Máquina", style=discord.ButtonStyle.secondary, emoji="🦀", row=1)
     async def trap_manager(self, interaction: discord.Interaction, button: discord.ui.Button):
-        cursor = get_bot_instance().db_conn.cursor()
-        row = cursor.execute("SELECT wallet, afk_trap, inventory FROM economy WHERE user_id = ?", (self.user_id,)).fetchone()
-        
-        trap_data = json.loads(row['afk_trap']) if row['afk_trap'] and row['afk_trap'] != "{}" else None
-        wallet = row['wallet']
-        inv = json.loads(row['inventory']) if row['inventory'] else {}
+        # O decorator @discord.ui.button substitui este atributo por um
+        # discord.ui.Button na instância da View, então `self.trap_manager`
+        # não é chamável. As transições automáticas de estado (working->ready,
+        # cooldown->idle) precisam re-renderizar o painel, então a lógica vive
+        # em _render_trap_manager, que é uma corrotina normal.
+        await self._render_trap_manager(interaction)
+
+    async def _render_trap_manager(self, interaction: discord.Interaction):
+        conn = get_bot_instance().db_conn
+        # Estado e mochila vêm da v4 (user_trap / user_inventory). A coluna
+        # legada `economy.afk_trap` é reescrita a partir de user_trap por
+        # sync_user_to_economy, então ler dela dava um estado que ia ser
+        # descartado — e gravar nela não chegava na v4.
+        trap_data = get_trap(conn, self.user_id) or None
+        inv = get_inventory(conn, self.user_id)
 
         embed = discord.Embed(title="🦀 Oficina de Armadilhas", color=discord.Color.dark_orange())
 
@@ -2749,20 +2781,28 @@ class GaldinoView(discord.ui.View):
                 btn_craft = discord.ui.Button(label="Montar Protótipo (-50 Lixos)", style=discord.ButtonStyle.success, emoji="🛠️")
                 
                 async def craft_callback(inter):
+                    # Relê a mochila na hora de gastar: entre montar o embed e
+                    # clicar no botão o jogador pode ter gasto o lixo em outro
+                    # fluxo (reciclar no Galdino, por exemplo).
+                    inv_fresh = get_inventory(conn, self.user_id)
+                    if sum(inv_fresh.get(t, 0) for t in TRASH_ITEMS) < meta:
+                        return await inter.response.send_message("❌ Você não tem mais lixo suficiente.", ephemeral=True)
+
                     # Consome 50 lixos
                     removidos = 0
                     for t in TRASH_ITEMS:
-                        while inv.get(t, 0) > 0 and removidos < meta:
-                            inv[t] -= 1
-                            removidos += 1
-                    
+                        disponivel = inv_fresh.get(t, 0)
+                        se_gasta = min(disponivel, meta - removidos)
+                        if se_gasta > 0:
+                            add_inventory_item(conn, self.user_id, t, -se_gasta)
+                            removidos += se_gasta
+                        if removidos >= meta:
+                            break
+
                     # Instala Covo Básico (Grátis na primeira vez)
                     # Status Idle para ele poder dar o start manual
-                    new_trap = {"type": "covo_basico", "status": "idle", "timer_end": 0}
-                    
-                    cursor.execute("UPDATE economy SET inventory = ?, afk_trap = ? WHERE user_id = ?", (json.dumps(inv), json.dumps(new_trap), self.user_id))
-                    get_bot_instance().db_conn.commit()
-                    
+                    set_trap(conn, self.user_id, {"type": "covo_basico", "status": "idle", "timer_end": 0})
+
                     await inter.response.send_message(f"{get_dialogue('galdino', 'afk_success')}\n(Agora clique em 'Examinar Máquina' novamente para usar!)", ephemeral=True)
 
                 btn_craft.callback = craft_callback
@@ -2792,12 +2832,11 @@ class GaldinoView(discord.ui.View):
             
             btn_repair = discord.ui.Button(label=f"Consertar ({stats['repair_cost']} $)", style=discord.ButtonStyle.danger, emoji="🔨")
             async def repair_cb(inter):
-                curr_wallet = cursor.execute("SELECT wallet FROM economy WHERE user_id=?", (self.user_id,)).fetchone()[0]
-                if curr_wallet < stats['repair_cost']: return await inter.response.send_message("💸 Falta dinheiro.", ephemeral=True)
-                
+                if not try_spend_wallet(conn, self.user_id, stats['repair_cost'], inter.user.name):
+                    return await inter.response.send_message("💸 Falta dinheiro.", ephemeral=True)
+
                 trap_data['status'] = 'idle'
-                cursor.execute("UPDATE economy SET wallet = wallet - ?, afk_trap = ? WHERE user_id = ?", (stats['repair_cost'], json.dumps(trap_data), self.user_id))
-                get_bot_instance().db_conn.commit()
+                set_trap(conn, self.user_id, trap_data)
                 await inter.response.send_message("🔨 **Consertado!**", ephemeral=True)
             
             btn_repair.callback = repair_cb
@@ -2811,9 +2850,8 @@ class GaldinoView(discord.ui.View):
                 view.add_item(discord.ui.Button(label="Aguarde...", disabled=True))
             else:
                 trap_data['status'] = 'ready'
-                cursor.execute("UPDATE economy SET afk_trap = ? WHERE user_id = ?", (json.dumps(trap_data), self.user_id))
-                get_bot_instance().db_conn.commit()
-                return await self.trap_manager(interaction, button)
+                set_trap(conn, self.user_id, trap_data)
+                return await self._render_trap_manager(interaction)
 
         elif t_status == "ready":
             embed.description = f"🐟 **Rede Cheia!** Capacidade: {stats['capacity']}.\n*Cuidado: Pode rasgar ao puxar.*"
@@ -2821,32 +2859,35 @@ class GaldinoView(discord.ui.View):
             
             btn_collect = discord.ui.Button(label="Puxar Rede", style=discord.ButtonStyle.success, emoji="🎣")
             async def collect_cb(inter):
-                # Re-check DB
-                fresh_row = cursor.execute("SELECT afk_trap FROM economy WHERE user_id = ?", (self.user_id,)).fetchone()
-                fresh_trap = json.loads(fresh_row['afk_trap'])
+                # Relê o estado na v4, não na legada: a legada é derivada e
+                # podia ainda dizer 'ready' depois de uma coleta já feita,
+                # liberando a mesma rede duas vezes.
+                fresh_trap = get_trap(conn, self.user_id)
                 if fresh_trap.get('status') != 'ready': return await inter.response.send_message("❌ Estado inválido.", ephemeral=True)
+
+                # Fecha a rede ANTES de pagar o loot: se a entrega falhar no
+                # meio, o jogador perde a coleta — o inverso deixaria a rede
+                # 'ready' com o loot já creditado, que é o dupe.
+                if random.randint(1, 100) <= stats['break_chance']:
+                    fresh_trap['status'] = 'broken'
+                    sufixo = "\n\n💥 **CRACK!** A rede rasgou!"
+                else:
+                    fresh_trap['status'] = 'cooldown'
+                    fresh_trap['timer_end'] = now_ts + stats['reset_time']
+                    sufixo = "\n\n🕸️ Limpando a rede..."
+                set_trap(conn, self.user_id, fresh_trap)
 
                 rewards = []
                 pool = [p[0] for p in FISH_DB if p[4] <= stats['loot_tier_max']]
                 for _ in range(stats['capacity']):
                     fish = random.choice(pool)
-                    inv[fish] = inv.get(fish, 0) + 1
+                    add_inventory_item(conn, self.user_id, fish, 1)
                     rewards.append(fish)
 
-                from collections import Counter
                 c = Counter(rewards)
-                reward_str = ", ".join([f"{k} x{v}" for k,v in c.items()])
-                
-                if random.randint(1, 100) <= stats['break_chance']:
-                    trap_data['status'] = 'broken'
-                    msg = f"💰 **Coleta:** {reward_str}\n\n💥 **CRACK!** A rede rasgou!"
-                else:
-                    trap_data['status'] = 'cooldown'
-                    trap_data['timer_end'] = now_ts + stats['reset_time']
-                    msg = f"💰 **Coleta:** {reward_str}\n\n🕸️ Limpando a rede..."
+                reward_str = ", ".join([f"{k} x{v}" for k, v in c.items()])
+                msg = f"💰 **Coleta:** {reward_str}{sufixo}"
 
-                cursor.execute("UPDATE economy SET inventory = ?, afk_trap = ? WHERE user_id = ?", (json.dumps(inv), json.dumps(trap_data), self.user_id))
-                get_bot_instance().db_conn.commit()
                 await inter.response.send_message(msg, ephemeral=True)
             
             btn_collect.callback = collect_cb
@@ -2859,9 +2900,8 @@ class GaldinoView(discord.ui.View):
                 view.add_item(discord.ui.Button(label="Limpando...", disabled=True))
             else:
                 trap_data['status'] = 'idle'
-                cursor.execute("UPDATE economy SET afk_trap = ? WHERE user_id = ?", (json.dumps(trap_data), self.user_id))
-                get_bot_instance().db_conn.commit()
-                return await self.trap_manager(interaction, button)
+                set_trap(conn, self.user_id, trap_data)
+                return await self._render_trap_manager(interaction)
 
         elif t_status == "idle":
             embed.description = "A armadilha está limpa e pronta.\nJogar na água?"
@@ -2871,8 +2911,7 @@ class GaldinoView(discord.ui.View):
             async def start_cb(inter):
                 trap_data['status'] = 'working'
                 trap_data['timer_end'] = now_ts + stats['wait_time']
-                cursor.execute("UPDATE economy SET afk_trap = ? WHERE user_id = ?", (json.dumps(trap_data), self.user_id))
-                get_bot_instance().db_conn.commit()
+                set_trap(conn, self.user_id, trap_data)
                 await inter.response.send_message("🌊 **Lançada!**", ephemeral=True)
             
             btn_start.callback = start_cb
@@ -2884,13 +2923,11 @@ class GaldinoView(discord.ui.View):
                 btn_buy = discord.ui.Button(label="Comprar Rede Industrial (1500$)", style=discord.ButtonStyle.secondary, row=1)
                 async def buy_better_cb(inter):
                     s_ind = TRAP_TYPES["rede_industrial"]
-                    curr_wallet = cursor.execute("SELECT wallet FROM economy WHERE user_id=?", (self.user_id,)).fetchone()[0]
-                    if curr_wallet < s_ind['cost']: return await inter.response.send_message("💸 Falta dinheiro.", ephemeral=True)
-                    
+                    if not try_spend_wallet(conn, self.user_id, s_ind['cost'], inter.user.name):
+                        return await inter.response.send_message("💸 Falta dinheiro.", ephemeral=True)
+
                     # Substitui a trap atual
-                    new_trap = {"type": "rede_industrial", "status": "idle", "timer_end": 0}
-                    cursor.execute("UPDATE economy SET wallet = wallet - ?, afk_trap = ? WHERE user_id = ?", (s_ind['cost'], json.dumps(new_trap), self.user_id))
-                    get_bot_instance().db_conn.commit()
+                    set_trap(conn, self.user_id, {"type": "rede_industrial", "status": "idle", "timer_end": 0})
                     await inter.response.send_message("✅ **Upgrade!** Você comprou a Rede de Arrasto.", ephemeral=True)
                 
                 btn_buy.callback = buy_better_cb
@@ -2969,25 +3006,19 @@ class ValeriusShopSelect(discord.ui.Select):
         
         item_key = self.values[0]
         data = SHOP_ITEMS[item_key]
-        
-        cursor = get_bot_instance().db_conn.cursor()
-        
-        # Verifica Saldo
-        row = cursor.execute("SELECT wallet, inventory FROM economy WHERE user_id = ?", (self.user_id,)).fetchone()
-        if row['wallet'] < data['price']:
+
+        conn = get_bot_instance().db_conn
+
+        # Camada v4, não a tabela legada: debitar `economy.wallet` e gravar o
+        # item em `economy.inventory` era desfeito por sync_user_to_economy()
+        # no comando seguinte — o jogador pagava e a compra sumia. try_spend_wallet
+        # ainda relê o saldo dentro da própria transação, então a checagem e o
+        # débito não podem divergir.
+        if not try_spend_wallet(conn, self.user_id, data['price'], interaction.user.name):
             return await interaction.response.send_message("💰 **Valerius:** 'Sem ouro, sem conversa.' (Saldo insuficiente)", ephemeral=True)
-        
-        # Processa a Compra
-        inv = json.loads(row['inventory']) if row['inventory'] else {}
-        
-        # Se for vara, equipa ou guarda
-        inv[item_key] = inv.get(item_key, 0) + 1
-        
-        # Atualiza o banco (Desconta dinheiro + Adiciona item)
-        cursor.execute("UPDATE economy SET wallet = wallet - ?, inventory = ? WHERE user_id = ?", 
-                      (data['price'], json.dumps(inv), self.user_id))
-        get_bot_instance().db_conn.commit()
-        
+
+        add_inventory_item(conn, self.user_id, item_key, 1)
+
         await interaction.response.send_message(f"🤝 **Negócio Fechado!**\nVocê comprou: **{data['name']}** por {data['price']} Sachês.\n*Valerius sorri enquanto conta as moedas.*", ephemeral=True)
 
 
