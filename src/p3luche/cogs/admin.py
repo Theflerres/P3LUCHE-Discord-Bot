@@ -34,6 +34,7 @@ from config import (
 )
 from economy_db import (
     get_wallet,
+    has_account,
     modify_wallet,
     reset_all_players,
     reset_player_progress,
@@ -664,8 +665,7 @@ class AdminCog(commands.Cog):
         conn = get_bot_instance().db_conn
         cursor = conn.cursor()
 
-        row = cursor.execute("SELECT 1 FROM economy WHERE user_id = ?", (user_id,)).fetchone()
-        if not row:
+        if not has_account(conn, user_id):
             return await interaction.response.send_message("Crie uma conta pescando primeiro.", ephemeral=True)
 
         cursor.execute("UPDATE quest_progress SET current_chapter = 'inicio' WHERE user_id = ?", (user_id,))

@@ -36,12 +36,17 @@ from economy_db import (
     ensure_user,
     ensure_v4_tables,
     get_cooldowns,
+    get_current_rod,
+    get_fish_count,
     get_guild_rank,
     get_inventory,
     get_rod_upgrades,
     get_scrap,
+    get_top_players,
     get_trap,
+    get_user_names,
     get_wallet,
+    has_account,
     log_fish_sale,
     modify_scrap,
     modify_wallet,
@@ -627,8 +632,8 @@ async def loja(interaction: discord.Interaction):
         if not item_stats: return await inter.response.send_message("❌ Item sumiu.", ephemeral=True)
 
         conn = get_bot_instance().db_conn
-        has_account = conn.execute("SELECT 1 FROM economy WHERE user_id = ?", (inter.user.id,)).fetchone()
-        if not has_account: return await inter.response.send_message("❌ Crie conta com /eco pescar.", ephemeral=True)
+        if not has_account(conn, inter.user.id):
+            return await inter.response.send_message("❌ Crie conta com /eco pescar.", ephemeral=True)
 
         tipo = item_stats.get('type')
 
@@ -680,10 +685,11 @@ async def comprar(interaction: discord.Interaction, item: str):
     price = data['price']
     conn = get_bot_instance().db_conn
 
-    # Exige conta já existente (não cria uma nova aqui) — mesmo gate de
-    # antes, só que checando a tabela legada em vez de reler manualmente.
-    has_account = conn.execute("SELECT 1 FROM economy WHERE user_id = ?", (user_id,)).fetchone()
-    if not has_account: return await interaction.response.send_message("❌ Use /eco pescar primeiro.", ephemeral=True)
+    # Exige conta já existente (não cria uma nova aqui). has_account() lê
+    # `users` e, de propósito, não chama ensure_user — senão o próprio
+    # portão criaria a conta que ele deveria estar barrando.
+    if not has_account(conn, user_id):
+        return await interaction.response.send_message("❌ Use /eco pescar primeiro.", ephemeral=True)
 
     # --- COMPRA E ARMAZENAMENTO (atômico: relê saldo fresco na hora de gravar) ---
     if not try_spend_wallet(conn, user_id, price, interaction.user.name):
@@ -819,9 +825,7 @@ async def pescar(interaction: discord.Interaction):
     # tabelas v4 (users/user_rods/rod_upgrades/user_cooldowns) com as linhas
     # e defaults corretos (wallet=0, vara_bambu, cooldown livre etc.), então
     # o fluxo cai direto na primeira pescaria de verdade, na mesma chamada.
-    is_new_account = not cursor.execute(
-        "SELECT 1 FROM economy WHERE user_id = ?", (user_id,)
-    ).fetchone()
+    is_new_account = not has_account(conn, user_id)
     ensure_user(conn, user_id, interaction.user.name)
     if is_new_account:
         sync_user_to_economy(conn, user_id)
@@ -884,18 +888,13 @@ async def pescar(interaction: discord.Interaction):
 
     # 5. CONSUMO DE ITENS
     used_bait = False; used_magnet = False; used_firewall = False; used_chip = False
-    # Fallback de compatibilidade com a coluna legada 'baits' (só leitura —
-    # a escrita dela agora é 100% derivada do inventário via sync_user_to_economy).
-    legacy_row = cursor.execute("SELECT baits FROM economy WHERE user_id = ?", (user_id,)).fetchone()
-    legacy_baits = (legacy_row['baits'] if legacy_row and legacy_row['baits'] else 0)
+    # O fallback que lia `economy.baits` saiu: essa coluna é derivada de
+    # inv['isca'] por sync_user_to_economy, então ela nunca podia divergir
+    # do inventário v4 — o ramo `elif legacy_baits` era inalcançável.
 
     # Consome isca
-    if inv.get("isca", 0) > 0: 
+    if inv.get("isca", 0) > 0:
         inv["isca"] -= 1
-        if legacy_baits > 0: legacy_baits -= 1
-        used_bait = True
-    elif legacy_baits > 0: 
-        legacy_baits -= 1
         used_bait = True
     
     if inv.get("isca", 0) <= 0: inv.pop("isca", None)
@@ -1253,8 +1252,8 @@ async def explorar(interaction: discord.Interaction):
     cursor = conn.cursor()
 
     # 1. VERIFICAÇÕES BÁSICAS
-    has_account = cursor.execute("SELECT 1 FROM economy WHERE user_id = ?", (user_id,)).fetchone()
-    if not has_account: return await interaction.response.send_message("❌ Crie uma conta pescando primeiro.", ephemeral=True)
+    if not has_account(conn, user_id):
+        return await interaction.response.send_message("❌ Crie uma conta pescando primeiro.", ephemeral=True)
     ensure_user(conn, user_id, interaction.user.name)
 
     quest = cursor.execute("SELECT current_chapter, inventory FROM quest_progress WHERE user_id = ?", (user_id,)).fetchone()
@@ -1808,16 +1807,22 @@ class InventoryView(discord.ui.View):
 @eco_group.command(name="saldo", description="Veja sua carteira, inventário e equipe varas.")
 async def saldo(interaction: discord.Interaction, usuario: discord.Member = None):
     target = usuario or interaction.user
-    cursor = get_bot_instance().db_conn.cursor()
-    row = cursor.execute("SELECT wallet, fish_count, current_rod, baits, inventory FROM economy WHERE user_id = ?", (target.id,)).fetchone()
-    
-    if not row:
+    conn = get_bot_instance().db_conn
+
+    if not has_account(conn, target.id):
         return await interaction.response.send_message("❌ Usuário sem conta bancária. Use /eco pescar primeiro!", ephemeral=True)
+
+    # Tudo da v4. `economy.baits` era derivada de inv['isca'], então a
+    # contagem de iscas sai do próprio inventário.
+    inv = get_inventory(conn, target.id)
+    wallet = get_wallet(conn, target.id)
+    fish_count = get_fish_count(conn, target.id)
+    rod_key = get_current_rod(conn, target.id)
+    baits = inv.get("isca", 0)
 
     # --- 1. PROCESSA INVENTÁRIO (VISUAL) ---
     inv_text = "Mochila vazia."
     try:
-        inv = json.loads(row['inventory']) if row['inventory'] else {}
         if inv:
             rarity_map = {'common': '⚪', 'uncommon': '🟢', 'rare': '🔵', 'epic': '🟣', 'legendary': '🟠', 'mythic': '✨'}
             item_list = []
@@ -1838,7 +1843,6 @@ async def saldo(interaction: discord.Interaction, usuario: discord.Member = None
     except: inv_text = "Erro de leitura."
 
     # --- 2. PROCESSA VARA ATUAL ---
-    rod_key = row['current_rod'] if row['current_rod'] else "vara_bambu"
     if rod_key not in ROD_STATS: rod_key = "vara_bambu"
     rod_data = ROD_STATS[rod_key]
 
@@ -1848,10 +1852,10 @@ async def saldo(interaction: discord.Interaction, usuario: discord.Member = None
     
     if target.avatar: embed.set_thumbnail(url=target.avatar.url)
     
-    embed.add_field(name="💳 Finanças", value=f"💰 **{row['wallet']}** Sachês\n🐟 **{row['fish_count']}** Peixes", inline=False)
+    embed.add_field(name="💳 Finanças", value=f"💰 **{wallet}** Sachês\n🐟 **{fish_count}** Peixes", inline=False)
     
     stats_str = f"⏱️ CD: {int(rod_data['cd']*5)}m | 🎲 Sorte: x{rod_data['luck']}"
-    embed.add_field(name="🎣 Equipado", value=f"**{rod_data['name']}**\n*{stats_str}*\n🪱 **{row['baits']}** Iscas", inline=False)
+    embed.add_field(name="🎣 Equipado", value=f"**{rod_data['name']}**\n*{stats_str}*\n🪱 **{baits}** Iscas", inline=False)
     
     embed.add_field(name="🎒 Mochila", value=inv_text, inline=False)
     
@@ -1859,9 +1863,8 @@ async def saldo(interaction: discord.Interaction, usuario: discord.Member = None
     view = None
     # O menu só aparece se você estiver olhando seu próprio saldo
     if target.id == interaction.user.id:
-        # Recupera inventário para ver quais varas o jogador tem
-        try: inv_data = json.loads(row['inventory']) if row['inventory'] else {}
-        except: inv_data = {}
+        # Mesmo inventário v4 já lido acima.
+        inv_data = inv
         
         # Cria lista de varas possuídas (Bambu é padrão + Varas compradas)
         owned_rods = ["vara_bambu"] 
@@ -1946,10 +1949,10 @@ async def diario(interaction: discord.Interaction):
 
 @eco_group.command(name="rank", description="Hall da Fama.")
 async def rank(interaction: discord.Interaction):
-    cursor = get_bot_instance().db_conn.cursor()
-    rows_m = cursor.execute("SELECT user_name, wallet FROM economy ORDER BY wallet DESC LIMIT 10").fetchall()
-    rows_f = cursor.execute("SELECT user_name, fish_count FROM economy ORDER BY fish_count DESC LIMIT 10").fetchall()
-    
+    conn = get_bot_instance().db_conn
+    rows_m = get_top_players(conn, "wallet", 10)
+    rows_f = get_top_players(conn, "fish_count", 10)
+
     def fmt(rows, type_v):
         txt = ""
         for i, r in enumerate(rows):
@@ -2054,18 +2057,18 @@ class PartyKickSelect(discord.ui.Select):
         self.leader_id = leader_id
         
         # Busca os nomes dos membros no banco para o menu ficar bonito
-        cursor = get_bot_instance().db_conn.cursor()
-        placeholders = ','.join('?' for _ in member_ids)
         # Traz apenas quem NÃO é o líder (não pode se auto-expulsar)
-        query = f"SELECT user_id, user_name FROM economy WHERE user_id IN ({placeholders}) AND user_id != ?"
-        rows = cursor.execute(query, (*member_ids, leader_id)).fetchall()
-        
+        nomes = get_user_names(
+            get_bot_instance().db_conn,
+            [m for m in member_ids if m != leader_id],
+        )
+
         options = []
-        for r in rows:
+        for uid, nome in nomes.items():
             options.append(discord.SelectOption(
-                label=r['user_name'], 
-                value=str(r['user_id']), 
-                description=f"ID: {r['user_id']}",
+                label=nome,
+                value=str(uid),
+                description=f"ID: {uid}",
                 emoji="👢"
             ))
             
@@ -2167,9 +2170,9 @@ class GuildView(discord.ui.View):
     async def talk_jenna(self, interaction: discord.Interaction, button: discord.ui.Button):
         # Mostra um menu para o usuário escolher o tópico da conversa com a Capitã
         cursor = get_bot_instance().db_conn.cursor()
-        row = cursor.execute("SELECT guild_rank, guild_xp FROM economy WHERE user_id = ?", (self.user_id,)).fetchone()
-        rank = row['guild_rank'] if row and row['guild_rank'] else 'F'
-        xp = row['guild_xp'] if row and row['guild_xp'] else 0
+        _guilda = get_guild_rank(get_bot_instance().db_conn, self.user_id)
+        rank = _guilda['rank']
+        xp = _guilda['xp']
 
         # Checa automaticamente se o jogador tem o selo e registra acesso (não remove item)
         try:
@@ -2184,16 +2187,15 @@ class GuildView(discord.ui.View):
                     has_seal = False
 
             if not has_seal:
-                erow = cursor.execute("SELECT inventory FROM economy WHERE user_id = ?", (self.user_id,)).fetchone()
-                if erow and erow['inventory']:
-                    try:
-                        e_inv = json.loads(erow['inventory'])
-                        if e_inv.get('selo_capitao'):
-                            has_seal = True
-                    except:
-                        has_seal = False
+                # Mochila da v4 (o selo pode ter vindo da loja/presente, que
+                # gravam em user_inventory, não no JSON legado).
+                if get_inventory(get_bot_instance().db_conn, self.user_id).get('selo_capitao'):
+                    has_seal = True
 
-            if has_seal and (not qrow or qrow.get('current_chapter') != 'acesso_liberado'):
+            # qrow é um sqlite3.Row, que não tem .get() — o AttributeError
+            # caía no `except Exception: pass` lá embaixo e o registro do
+            # selo nunca acontecia para quem já tinha linha em quest_progress.
+            if has_seal and (not qrow or qrow['current_chapter'] != 'acesso_liberado'):
                 cursor.execute("INSERT INTO quest_progress (user_id, inventory, current_chapter) VALUES (?, '{\"selo_capitao\": 1}', 'acesso_liberado') ON CONFLICT(user_id) DO UPDATE SET inventory = '{\"selo_capitao\": 1}', current_chapter = 'acesso_liberado'", (self.user_id,))
                 get_bot_instance().db_conn.commit()
         except Exception:
@@ -2297,15 +2299,16 @@ class GuildView(discord.ui.View):
         user_id = interaction.user.id
         user_name = interaction.user.display_name
 
-        cursor = get_bot_instance().db_conn.cursor()
-        row = cursor.execute("SELECT guild_rank, guild_xp, fish_count FROM economy WHERE user_id = ?", (user_id,)).fetchone()
-        
-        if not row: 
+        conn = get_bot_instance().db_conn
+
+        if not has_account(conn, user_id):
             # Erro continua invisível pra não poluir o chat
             return await interaction.response.send_message("❌ Erro de registro. Use /eco pescar para criar conta.", ephemeral=True)
 
-        current_rank = row['guild_rank'] if row['guild_rank'] else 'F'
-        xp_atual = row['guild_xp'] if row['guild_xp'] else 0
+        _guilda = get_guild_rank(conn, user_id)
+        current_rank = _guilda['rank']
+        xp_atual = _guilda['xp']
+        peixes = get_fish_count(conn, user_id)
         
         # Pega dados do rank atual
         rank_data = GUILD_RANKS.get(current_rank, GUILD_RANKS["F"])
@@ -2331,7 +2334,7 @@ class GuildView(discord.ui.View):
         embed.set_thumbnail(url=interaction.user.display_avatar.url)
 
         embed.add_field(name="🎖️ Rank Atual", value=f"**{current_rank}** - {rank_data['name']}", inline=True)
-        embed.add_field(name="🎣 Histórico", value=f"{row['fish_count']} Peixes", inline=True)
+        embed.add_field(name="🎣 Histórico", value=f"{peixes} Peixes", inline=True)
         embed.add_field(name="📈 Progresso", value=desc_progresso, inline=False)
         
         # Footer motivacional
@@ -2400,11 +2403,10 @@ class GuildView(discord.ui.View):
             embed.description = f"Você está no comando do esquadrão **{self.user_name}'s Party**."
             
             # Lista de Membros Formatada
-            placeholders = ','.join('?' for _ in members_ids)
             member_names = []
             if members_ids:
-                rows = cursor.execute(f"SELECT user_name FROM economy WHERE user_id IN ({placeholders})", tuple(members_ids)).fetchall()
-                member_names = [f"👤 {r['user_name']}" for r in rows]
+                nomes = get_user_names(get_bot_instance().db_conn, members_ids)
+                member_names = [f"👤 {n}" for n in nomes.values()]
             
             list_txt = "\n".join(member_names) if member_names else "*Nenhum marinheiro recrutado.*"
             
@@ -2435,8 +2437,7 @@ class GuildView(discord.ui.View):
     @discord.ui.button(label="Quadro de Missões", style=discord.ButtonStyle.secondary, emoji="📜", row=1)
     async def mission_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
         cursor = get_bot_instance().db_conn.cursor()
-        row = cursor.execute("SELECT guild_rank FROM economy WHERE user_id = ?", (self.user_id,)).fetchone()
-        user_rank = row['guild_rank'] if row else "F"
+        user_rank = get_guild_rank(get_bot_instance().db_conn, self.user_id)['rank']
 
         party = cursor.execute("SELECT active_mission_id, mission_progress, mission_target FROM parties WHERE leader_id = ?", (self.user_id,)).fetchone()
         
@@ -2480,7 +2481,8 @@ class GuildView(discord.ui.View):
 async def guilda(interaction: discord.Interaction):
     # 1. TRAVA DE ACESSO (O Portão da Cidade)
     user_id = interaction.user.id
-    cursor = get_bot_instance().db_conn.cursor()
+    conn = get_bot_instance().db_conn
+    cursor = conn.cursor()
     quest = cursor.execute("SELECT current_chapter FROM quest_progress WHERE user_id = ?", (user_id,)).fetchone()
     
     # Verifica se tem acesso liberado (quest da garrafa concluída ou cidade descoberta e selo entregue)
@@ -2493,17 +2495,21 @@ async def guilda(interaction: discord.Interaction):
     # Se quiser forçar liberação para testar, comente o if acima e descomente: liberado = True
     
     if not liberado:
-        # Verifica se por acaso ele tem o rank (bug fix)
-        eco = cursor.execute("SELECT guild_rank FROM economy WHERE user_id = ?", (user_id,)).fetchone()
-        if eco and eco['guild_rank']: liberado = True
+        # Verifica se por acaso ele tem o rank (bug fix). Mantém a semântica
+        # antiga: só conta se o jogador JÁ tem conta — get_guild_rank sozinho
+        # devolveria 'F' até para quem nunca jogou, escancarando o portão.
+        if has_account(conn, user_id) and get_guild_rank(conn, user_id)['rank']:
+            liberado = True
 
     if not liberado:
         return await interaction.response.send_message("🚫 **Acesso Negado.**\nOs guardas barram sua entrada.\n*\"Apenas membros credenciados. Vá falar com a Capitã Mara se tiver o Selo.\"*", ephemeral=True)
 
     # 2. SE ENTROU:
-    # Garante que ele tem um Rank inicial no banco
-    cursor.execute("INSERT OR IGNORE INTO economy (user_id, user_name, guild_rank) VALUES (?, ?, 'F')", (user_id, interaction.user.name))
-    get_bot_instance().db_conn.commit()
+    # Garante a linha do jogador na v4 (users.guild_rank já nasce 'F'). Antes
+    # isto era um INSERT OR IGNORE direto em `economy`: desde a etapa 3 nada
+    # no runtime lê guild_rank da legada, então aquele INSERT só criava uma
+    # linha legada órfã, sem contrapartida em `users`.
+    ensure_user(conn, user_id, interaction.user.name)
     
     # Mostra a "Recepção"
     embed = discord.Embed(title="🏛️ Guilda de Porto Solare", description="Bem-vindo ao quartel general. Selecione uma ação no terminal.", color=discord.Color.dark_blue())

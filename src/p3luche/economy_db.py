@@ -366,6 +366,68 @@ def _coerce_int(value: object, default: int = 0) -> int:
         return default
 
 
+def has_account(conn: sqlite3.Connection, user_id: int) -> bool:
+    """O jogador já tem conta? Leitura pura — NÃO cria linha nenhuma.
+
+    Deliberadamente não chama ensure_user(): os call sites usam isto como
+    portão de "use /eco pescar primeiro", e ensure_user criaria a linha em
+    `users`, fazendo o portão passar a aceitar todo mundo.
+
+    Fonte é `users` (v4), não mais `economy`. As duas ficam equivalentes na
+    prática: migrate_to_normalized() roda no boot (main.py) e cria uma linha
+    em `users` para cada linha da legada.
+    """
+    ensure_v4_tables(conn)
+    row = conn.execute(
+        "SELECT 1 FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    return row is not None
+
+
+def get_fish_count(conn: sqlite3.Connection, user_id: int) -> int:
+    ensure_user(conn, user_id)
+    row = conn.execute(
+        "SELECT fish_count FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    return _coerce_int(row["fish_count"] if row else 0)
+
+
+def get_user_names(conn: sqlite3.Connection, user_ids) -> dict:
+    """Nomes de exibição de vários jogadores de uma vez: {user_id: user_name}.
+
+    Leitura pura (sem ensure_user): serve para montar listas de membros de
+    grupo, onde criar conta para um id inexistente seria efeito colateral
+    indesejado. Ids sem linha simplesmente não aparecem no resultado — mesmo
+    comportamento do SELECT ... IN (...) que isto substitui.
+    """
+    ids = [int(u) for u in user_ids]
+    if not ids:
+        return {}
+    ensure_v4_tables(conn)
+    placeholders = ",".join("?" for _ in ids)
+    rows = conn.execute(
+        f"SELECT user_id, user_name FROM users WHERE user_id IN ({placeholders})",
+        tuple(ids),
+    ).fetchall()
+    return {r["user_id"]: r["user_name"] for r in rows}
+
+
+def get_top_players(conn: sqlite3.Connection, field: str, limit: int = 10) -> list:
+    """Ranking por `field` ('wallet' ou 'fish_count'). Leitura pura.
+
+    Devolve lista de dicts {"user_name": ..., <field>: ...} já ordenada,
+    para o call site montar o embed sem tocar em SQL.
+    """
+    if field not in ("wallet", "fish_count"):
+        raise ValueError(f"campo de ranking inválido: {field!r}")
+    ensure_v4_tables(conn)
+    rows = conn.execute(
+        f"SELECT user_name, {field} FROM users ORDER BY {field} DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    return [{"user_name": r["user_name"], field: _coerce_int(r[field])} for r in rows]
+
+
 def get_wallet(conn: sqlite3.Connection, user_id: int) -> int:
     ensure_user(conn, user_id)
     row = conn.execute("SELECT wallet FROM users WHERE user_id = ?", (user_id,)).fetchone()

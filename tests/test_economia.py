@@ -22,6 +22,8 @@ from economy_db import (
     get_scrap,
     get_trap,
     get_wallet,
+    get_top_players,
+    get_user_names,
     modify_scrap,
     modify_wallet,
     set_cooldown,
@@ -578,6 +580,10 @@ class ExplorarTests(unittest.IsolatedAsyncioTestCase):
             (user_id,),
         )
         conn.commit()
+        # Materializa a linha v4. Depois da etapa 3 o portão "tem conta?" de
+        # /eco explorar lê `users`, não mais a legada — e todo jogador vivo
+        # tem essa linha (migrate_to_normalized roda no boot, em main.py).
+        ensure_user(conn, user_id, "Tester")
 
     async def test_second_explorar_during_open_view_window_is_rejected_by_cooldown(self):
         conn = self._make_conn()
@@ -647,6 +653,9 @@ class ExplorarTests(unittest.IsolatedAsyncioTestCase):
             "INSERT INTO economy (user_id, user_name, wallet) VALUES (?, ?, ?)", (user_id, "Pobre", 10)
         )
         conn.commit()
+        # Mesmo motivo de _make_city_spotted_user: o portão "tem conta?" lê a
+        # v4 desde a etapa 3, então a conta precisa existir lá.
+        ensure_user(conn, user_id, "Pobre")
 
         interaction = self._make_interaction(user_id)
         with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
@@ -763,6 +772,12 @@ class GaldinoTuneBtnTests(unittest.IsolatedAsyncioTestCase):
         # abriu (que ainda dizia "Custo: 100" pros dois cliques).
         self.assertEqual(get_scrap(conn, user_id), 1000 - 100 - 200)
 
+        # Sucata gasta e nível ganho continuam valendo depois de um comando
+        # v4 seguinte — trava contra uma regressão do "escreve só na legada".
+        modify_wallet(conn, user_id, 1)
+        self.assertEqual(get_rod_upgrades(conn, user_id)["luck"], 2)
+        self.assertEqual(get_scrap(conn, user_id), 1000 - 100 - 200)
+
     async def test_insufficient_scrap_refuses_without_changing_state(self):
         conn = self._make_conn()
         user_id = 61
@@ -840,6 +855,15 @@ class EnergeticoFixTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertIsNone(legacy["last_fish"])
         self.assertIn("Energético bebido", interaction.response.send_message.call_args.args[0])
+
+        # O item TEM que ter saído da mochila. Este teste só olhava cooldown e
+        # mensagem — foi essa lacuna que deixou o bug do "item usado que volta"
+        # passar batido pela suíte inteira antes das etapas 1-3.
+        self.assertNotIn("energetico", get_inventory(conn, user_id))
+        # E precisa continuar fora depois de um comando v4 qualquer, que é
+        # quando o sync legada->v4 ressuscitava o item.
+        modify_wallet(conn, user_id, 1)
+        self.assertNotIn("energetico", get_inventory(conn, user_id))
 
 
 class IscaEletricaDiscontinuedTests(unittest.TestCase):
@@ -1888,6 +1912,665 @@ class LegacyResurrectionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_current_rod(conn, user_id), "vara_ouro")
         self.assertEqual(get_rod_upgrades(conn, user_id), {"luck": 0, "cd": 0})
         self.assertIsNone(get_cooldowns(conn, user_id)["last_fish"])
+
+
+
+class LegacyReadRetirementTests(unittest.IsolatedAsyncioTestCase):
+    """Etapa 3 — os fluxos que liam `economy` agora leem a v4.
+
+    O que importa validar aqui: o jogador vê a MESMA coisa de antes, e a
+    leitura passou a refletir a v4 mesmo quando a legada está defasada (o que
+    antes produzia tela desatualizada).
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        user = SimpleNamespace(
+            id=user_id, name=name, display_name=name, avatar=None,
+            display_avatar=SimpleNamespace(url="http://x/a.png"),
+        )
+        return SimpleNamespace(
+            user=user,
+            response=SimpleNamespace(
+                send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock()
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    def _account(self, conn, user_id, name="Tester", **cols):
+        campos = ", ".join(cols)
+        marks = ", ".join("?" for _ in cols)
+        sufixo = f", {campos}" if cols else ""
+        valores = f", {marks}" if cols else ""
+        conn.execute(
+            f"INSERT INTO economy (user_id, user_name{sufixo}) VALUES (?, ?{valores})",
+            (user_id, name, *cols.values()),
+        )
+        conn.commit()
+        ensure_user(conn, user_id, name)
+
+    # ------------------------------------------------------------ /eco saldo
+    async def test_saldo_shows_wallet_fish_rod_baits_and_backpack_from_v4(self):
+        conn = self._make_conn()
+        user_id = 9001
+        self._account(
+            conn, user_id, "Tester",
+            wallet=1234, fish_count=7, current_rod="vara_ouro",
+            inventory=json.dumps({"isca": 4, "energetico": 2}),
+        )
+
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await economia.saldo.callback(interaction)
+
+        _, kwargs = interaction.response.send_message.call_args
+        embed = kwargs["embed"]
+        financas = next(f for f in embed.fields if "Finanças" in f.name)
+        self.assertIn("1234", financas.value)
+        self.assertIn("7", financas.value)
+
+        equipado = next(f for f in embed.fields if "Equipado" in f.name)
+        self.assertIn("Vara de Ouro", equipado.value)
+        # `baits` saía de economy.baits, que era derivada de inv['isca'].
+        self.assertIn("**4** Iscas", equipado.value)
+
+        mochila = next(f for f in embed.fields if "Mochila" in f.name)
+        self.assertIn("Energético", mochila.value)
+
+    async def test_saldo_reflects_v4_when_legacy_row_is_stale(self):
+        """O ganho concreto da etapa 3: antes a tela vinha da legada, então um
+        estado defasado nela aparecia para o jogador."""
+        conn = self._make_conn()
+        user_id = 9002
+        self._account(conn, user_id, "Tester", wallet=100, inventory=json.dumps({"isca": 1}))
+        modify_wallet(conn, user_id, 900)
+        add_inventory_item(conn, user_id, "isca", 9)
+
+        conn.execute(
+            "UPDATE economy SET wallet = ?, baits = ?, inventory = ? WHERE user_id = ?",
+            (100, 1, json.dumps({"isca": 1}), user_id),
+        )
+        conn.commit()
+
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await economia.saldo.callback(interaction)
+
+        _, kwargs = interaction.response.send_message.call_args
+        embed = kwargs["embed"]
+        self.assertIn("1000", next(f for f in embed.fields if "Finanças" in f.name).value)
+        self.assertIn("**10** Iscas", next(f for f in embed.fields if "Equipado" in f.name).value)
+
+    async def test_saldo_keeps_legacy_display_name_keys_working(self):
+        """Chaves antigas por nome de exibição ('Teclado do Arquiteto') existem
+        igual em user_inventory — sync_user_from_economy copia a chave crua —
+        então o mapa name_to_key continua sendo necessário."""
+        conn = self._make_conn()
+        user_id = 9003
+        self._account(
+            conn, user_id, "Tester",
+            inventory=json.dumps({"Teclado do Arquiteto": 1}),
+        )
+        self.assertIn("Teclado do Arquiteto", get_inventory(conn, user_id))
+
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await economia.saldo.callback(interaction)
+
+        _, kwargs = interaction.response.send_message.call_args
+        mochila = next(f for f in kwargs["embed"].fields if "Mochila" in f.name)
+        self.assertIn("MÍTICO", mochila.value)
+
+    async def test_saldo_refuses_without_account_and_does_not_create_one(self):
+        conn = self._make_conn()
+        user_id = 9004
+
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await economia.saldo.callback(interaction)
+
+        args, _ = interaction.response.send_message.call_args
+        self.assertIn("sem conta bancária", args[0])
+        # O portão não pode criar a conta que ele está barrando.
+        self.assertIsNone(
+            conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        )
+
+    # ------------------------------------------------------------- /eco rank
+    async def test_rank_leaderboard_orders_by_v4_values(self):
+        conn = self._make_conn()
+        for uid, nome, wallet, peixes in [
+            (9101, "Rico", 5000, 1),
+            (9102, "Medio", 900, 50),
+            (9103, "Pobre", 10, 5),
+        ]:
+            self._account(conn, uid, nome, wallet=wallet, fish_count=peixes)
+
+        interaction = self._make_interaction(9101)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await economia.rank.callback(interaction)
+
+        _, kwargs = interaction.response.send_message.call_args
+        campos = {f.name: f.value for f in kwargs["embed"].fields}
+        dinheiro = next(v for k, v in campos.items() if "💰" in k or "Rico" in v)
+        self.assertLess(dinheiro.index("Rico"), dinheiro.index("Medio"))
+        self.assertLess(dinheiro.index("Medio"), dinheiro.index("Pobre"))
+
+    def test_get_top_players_rejects_arbitrary_columns(self):
+        conn = self._make_conn()
+        with self.assertRaises(ValueError):
+            get_top_players(conn, "wallet; DROP TABLE users", 10)
+
+    # ------------------------------------------------------ nomes de membros
+    def test_get_user_names_skips_unknown_ids_and_does_not_create_rows(self):
+        conn = self._make_conn()
+        self._account(conn, 9201, "Alfa")
+        self._account(conn, 9202, "Beta")
+
+        nomes = get_user_names(conn, [9201, 9202, 9299])
+
+        self.assertEqual(nomes, {9201: "Alfa", 9202: "Beta"})
+        self.assertIsNone(
+            conn.execute("SELECT 1 FROM users WHERE user_id = ?", (9299,)).fetchone()
+        )
+
+    def test_get_user_names_handles_empty_list(self):
+        self.assertEqual(get_user_names(self._make_conn(), []), {})
+
+    # --------------------------------------------- selo da guilda (v4)
+    async def test_guild_seal_is_detected_from_v4_inventory(self):
+        """O selo comprado/presenteado vai para user_inventory; antes só era
+        visto se estivesse no JSON legado."""
+        conn = self._make_conn()
+        user_id = 9301
+        self._account(conn, user_id, "Tester")
+        add_inventory_item(conn, user_id, "selo_capitao", 1)
+        conn.execute(
+            "INSERT INTO quest_progress (user_id, current_chapter) VALUES (?, 'inicio')",
+            (user_id,),
+        )
+        conn.commit()
+
+        view = economia.GuildView(user_id, "Tester")
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia, "get_local_file", return_value=(None, None)):
+            await view.talk_jenna.callback(interaction)
+
+        chapter = conn.execute(
+            "SELECT current_chapter FROM quest_progress WHERE user_id = ?", (user_id,)
+        ).fetchone()["current_chapter"]
+        self.assertEqual(chapter, "acesso_liberado")
+
+    async def test_card_btn_shows_rank_from_v4(self):
+        conn = self._make_conn()
+        user_id = 9302
+        self._account(conn, user_id, "Tester", guild_rank="E", guild_xp=100)
+        set_guild_rank(conn, user_id, "D", 250)
+        conn.execute(
+            "UPDATE economy SET guild_rank = ?, guild_xp = ? WHERE user_id = ?",
+            ("E", 100, user_id),
+        )
+        conn.commit()
+
+        view = economia.GuildView(user_id, "Tester")
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia, "get_local_file", return_value=(None, None)):
+            await view.card_btn.callback(interaction)
+
+        _, kwargs = interaction.response.send_message.call_args
+        rank_field = next(f for f in kwargs["embed"].fields if "Rank Atual" in f.name)
+        # Legada plantada com E/100; o cartão tem que mostrar o D/250 da v4.
+        self.assertIn("**D**", rank_field.value)
+        progresso = next(f for f in kwargs["embed"].fields if "Progresso" in f.name)
+        self.assertIn("250", progresso.value)
+
+
+class LerGarrafaV4Tests(unittest.IsolatedAsyncioTestCase):
+    """/ler_garrafa passou a olhar user_inventory em vez do JSON legado."""
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _cog(self, conn):
+        from cogs.sistema import SistemaCog
+
+        return SistemaCog(SimpleNamespace(db_conn=conn))
+
+    def _make_interaction(self, user_id):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name="Tester", display_name="Tester"),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    async def test_bottle_in_v4_inventory_is_accepted(self):
+        conn = self._make_conn()
+        user_id = 9401
+        conn.execute("INSERT INTO economy (user_id, user_name) VALUES (?, ?)", (user_id, "T"))
+        conn.commit()
+        ensure_user(conn, user_id, "T")
+        add_inventory_item(conn, user_id, "garrafa_incrustada", 1)
+
+        interaction = self._make_interaction(user_id)
+        await self._cog(conn).ler_garrafa.callback(self._cog(conn), interaction)
+
+        interaction.response.defer.assert_awaited()
+
+    async def test_without_bottle_is_refused(self):
+        conn = self._make_conn()
+        user_id = 9402
+        conn.execute("INSERT INTO economy (user_id, user_name) VALUES (?, ?)", (user_id, "T"))
+        conn.commit()
+        ensure_user(conn, user_id, "T")
+
+        interaction = self._make_interaction(user_id)
+        await self._cog(conn).ler_garrafa.callback(self._cog(conn), interaction)
+
+        args, _ = interaction.response.send_message.call_args
+        self.assertIn("não tem nenhuma", args[0])
+
+    async def test_quest_progress_route_still_works(self):
+        """A rota original (quest_progress.inventory) não foi tocada."""
+        conn = self._make_conn()
+        user_id = 9403
+        conn.execute("INSERT INTO economy (user_id, user_name) VALUES (?, ?)", (user_id, "T"))
+        conn.execute(
+            "INSERT INTO quest_progress (user_id, inventory) VALUES (?, ?)",
+            (user_id, json.dumps({"garrafa_incrustada": 1})),
+        )
+        conn.commit()
+        ensure_user(conn, user_id, "T")
+
+        interaction = self._make_interaction(user_id)
+        await self._cog(conn).ler_garrafa.callback(self._cog(conn), interaction)
+
+        interaction.response.defer.assert_awaited()
+
+
+
+class ConsumeSelectInventoryTests(unittest.IsolatedAsyncioTestCase):
+    """ConsumeSelect: o item consumido some da mochila e CONTINUA fora depois
+    de um comando v4 seguinte.
+
+    A suíte só checava cooldown e mensagem de sucesso — nenhuma asserção de
+    que o item saiu do inventário. Foi por essa fresta que o bug do "item
+    usado que volta" atravessou a suíte inteira: a remoção ia só para o JSON
+    legado e o sync do comando seguinte trazia o item de volta.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+    def _account(self, conn, user_id, **itens):
+        ensure_user(conn, user_id, "Tester")
+        for chave, qtd in itens.items():
+            add_inventory_item(conn, user_id, chave, qtd)
+
+    async def _use(self, conn, user_id, item_key):
+        select = economia.ConsumeSelect(user_id, get_inventory(conn, user_id))
+        select._values = [item_key]
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await select.callback(interaction)
+        return interaction
+
+    def _next_v4_command(self, conn, user_id):
+        """Qualquer helper v4 que dispare o ciclo ensure_user + sync — é nesse
+        ponto que a ressurreição acontecia."""
+        modify_wallet(conn, user_id, 1)
+
+    # ------------------------------------------------------------ energético
+    async def test_using_one_of_a_stack_decrements_and_stays_decremented(self):
+        conn = self._make_conn()
+        user_id = 9501
+        self._account(conn, user_id, energetico=3)
+
+        await self._use(conn, user_id, "energetico")
+
+        self.assertEqual(get_inventory(conn, user_id)["energetico"], 2)
+        self._next_v4_command(conn, user_id)
+        self.assertEqual(
+            get_inventory(conn, user_id)["energetico"],
+            2,
+            "estoque voltou ao valor antigo depois do comando seguinte",
+        )
+
+    async def test_using_the_last_copy_removes_the_key_for_good(self):
+        conn = self._make_conn()
+        user_id = 9502
+        self._account(conn, user_id, energetico=1)
+
+        await self._use(conn, user_id, "energetico")
+
+        self.assertNotIn("energetico", get_inventory(conn, user_id))
+        self._next_v4_command(conn, user_id)
+        self.assertNotIn("energetico", get_inventory(conn, user_id))
+        # A cópia legada também some (é reescrita a partir da v4).
+        legacy = conn.execute(
+            "SELECT inventory FROM economy WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        self.assertNotIn("energetico", json.loads(legacy["inventory"]))
+
+    # ------------------------------------------------------- caixa misteriosa
+    async def test_mystery_box_is_consumed_and_prize_persists(self):
+        conn = self._make_conn()
+        user_id = 9503
+        self._account(conn, user_id, caixa_misteriosa=2)
+        saldo_antes = get_wallet(conn, user_id)
+
+        with patch.object(economia.random, "randint", return_value=500):
+            await self._use(conn, user_id, "caixa_misteriosa")
+
+        self.assertEqual(get_inventory(conn, user_id)["caixa_misteriosa"], 1)
+        self.assertEqual(get_wallet(conn, user_id), saldo_antes + 500)
+
+        self._next_v4_command(conn, user_id)
+        self.assertEqual(get_inventory(conn, user_id)["caixa_misteriosa"], 1)
+        self.assertEqual(get_wallet(conn, user_id), saldo_antes + 500 + 1)
+
+    # ------------------------------------------------------------------ rede
+    async def test_hand_net_is_consumed_and_profit_persists(self):
+        conn = self._make_conn()
+        user_id = 9504
+        self._account(conn, user_id, rede=1)
+
+        with patch.object(economia.random, "randint", return_value=30):
+            await self._use(conn, user_id, "rede")
+
+        self.assertNotIn("rede", get_inventory(conn, user_id))
+        self.assertEqual(get_wallet(conn, user_id), 90)  # 3 x 30
+
+        self._next_v4_command(conn, user_id)
+        self.assertNotIn("rede", get_inventory(conn, user_id))
+        self.assertEqual(get_wallet(conn, user_id), 91)
+
+    # ------------------------------------- itens passivos NÃO são consumidos
+    async def test_passive_buff_is_not_consumed_by_the_menu(self):
+        """firewall/ima/chip são gastos por /eco pescar, não aqui — o menu só
+        explica. Consumir aqui seria roubar o item do jogador."""
+        conn = self._make_conn()
+        user_id = 9505
+        self._account(conn, user_id, firewall=1)
+
+        interaction = await self._use(conn, user_id, "firewall")
+
+        self.assertIn("passivo", interaction.response.send_message.call_args.args[0])
+        self.assertEqual(get_inventory(conn, user_id)["firewall"], 1)
+        self._next_v4_command(conn, user_id)
+        self.assertEqual(get_inventory(conn, user_id)["firewall"], 1)
+
+    async def test_bait_is_not_consumed_by_the_menu(self):
+        conn = self._make_conn()
+        user_id = 9506
+        self._account(conn, user_id, isca=5)
+
+        await self._use(conn, user_id, "isca")
+
+        self.assertEqual(get_inventory(conn, user_id)["isca"], 5)
+        self._next_v4_command(conn, user_id)
+        self.assertEqual(get_inventory(conn, user_id)["isca"], 5)
+
+    # ------------------------------------------------------------- recusas
+    async def test_using_an_item_you_no_longer_have_is_refused(self):
+        """A view fica aberta até 180s: o item pode ter sido gasto em outro
+        fluxo entre abrir o menu e clicar."""
+        conn = self._make_conn()
+        user_id = 9507
+        self._account(conn, user_id, energetico=1)
+
+        select = economia.ConsumeSelect(user_id, {"energetico": 1})
+        select._values = ["energetico"]
+        # Gasto por fora depois do menu montado.
+        add_inventory_item(conn, user_id, "energetico", -1)
+
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await select.callback(interaction)
+
+        self.assertIn("não tem mais", interaction.response.send_message.call_args.args[0])
+        self.assertNotIn("energetico", get_inventory(conn, user_id))
+        self.assertIsNotNone(get_cooldowns(conn, user_id) is not None)
+
+
+class ValeriusShopPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    """ValeriusShopSelect (loja de varas do NPC) — não tinha teste nenhum.
+    Migrado na etapa 1: antes debitava `economy.wallet` e gravava em
+    `economy.inventory`, e o sync do comando seguinte desfazia a compra.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+    async def _buy(self, conn, user_id, rod_key):
+        select = economia.ValeriusShopSelect(user_id)
+        select._values = [rod_key]
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await select.callback(interaction)
+        return interaction
+
+    async def test_purchase_debits_wallet_adds_rod_and_both_persist(self):
+        conn = self._make_conn()
+        user_id = 9601
+        ensure_user(conn, user_id, "Tester")
+        preco = economia.SHOP_ITEMS["vara_ouro"]["price"]
+        modify_wallet(conn, user_id, preco + 100)
+
+        interaction = await self._buy(conn, user_id, "vara_ouro")
+
+        self.assertIn("Negócio Fechado", interaction.response.send_message.call_args.args[0])
+        self.assertEqual(get_wallet(conn, user_id), 100)
+        self.assertEqual(get_inventory(conn, user_id)["vara_ouro"], 1)
+
+        # Comando v4 seguinte: a compra não pode desaparecer nem o saldo voltar.
+        modify_wallet(conn, user_id, 0)
+        self.assertEqual(get_wallet(conn, user_id), 100)
+        self.assertEqual(get_inventory(conn, user_id)["vara_ouro"], 1)
+
+    async def test_insufficient_funds_refuses_without_touching_state(self):
+        conn = self._make_conn()
+        user_id = 9602
+        ensure_user(conn, user_id, "Tester")
+        modify_wallet(conn, user_id, 10)
+
+        interaction = await self._buy(conn, user_id, "vara_ouro")
+
+        self.assertIn("Sem ouro", interaction.response.send_message.call_args.args[0])
+        self.assertEqual(get_wallet(conn, user_id), 10)
+        self.assertNotIn("vara_ouro", get_inventory(conn, user_id))
+
+    async def test_purchase_does_not_auto_equip(self):
+        """A vara comprada vai para a mochila; equipar é passo separado
+        (RodSelect) — mesma regra já validada em /eco loja."""
+        conn = self._make_conn()
+        user_id = 9603
+        ensure_user(conn, user_id, "Tester")
+        modify_wallet(conn, user_id, economia.SHOP_ITEMS["vara_ouro"]["price"])
+
+        await self._buy(conn, user_id, "vara_ouro")
+
+        self.assertEqual(get_current_rod(conn, user_id), "vara_bambu")
+
+
+class TrapCollectPersistenceTests(unittest.IsolatedAsyncioTestCase):
+    """Coleta da armadilha AFK: o loot entra na mochila, a rede sai de
+    'ready', e nada disso volta atrás no comando seguinte.
+
+    Sem isto, só as transições automáticas de timer tinham teste — o caminho
+    que de fato pagava o loot (e onde estava o dupe) ficava descoberto.
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+    async def _open_and_get_collect_button(self, conn, user_id):
+        view = economia.GaldinoView(user_id, "Tester")
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)):
+            await view.trap_manager.callback(interaction)
+        painel = interaction.response.send_message.call_args.kwargs["view"]
+        return next(c for c in painel.children if c.label == "Puxar Rede")
+
+    def _ready_trap(self, conn, user_id):
+        conn.execute(
+            "INSERT INTO economy (user_id, user_name, wallet) VALUES (?, ?, ?)",
+            (user_id, "Tester", 0),
+        )
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+        set_trap(conn, user_id, {"type": "covo_basico", "status": "ready", "timer_end": 0})
+
+    async def test_collect_pays_loot_closes_net_and_both_persist(self):
+        conn = self._make_conn()
+        user_id = 9701
+        self._ready_trap(conn, user_id)
+
+        botao = await self._open_and_get_collect_button(conn, user_id)
+        click = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia.random, "randint", return_value=100):  # não quebra
+            await botao.callback(click)
+
+        inv = get_inventory(conn, user_id)
+        capacidade = economia.TRAP_TYPES["covo_basico"]["capacity"]
+        self.assertEqual(sum(inv.values()), capacidade)
+        self.assertEqual(get_trap(conn, user_id)["status"], "cooldown")
+
+        # Comando v4 seguinte não pode devolver a rede para 'ready' (isso era
+        # o dupe: coletar de novo o mesmo loot) nem sumir com o loot pago.
+        modify_wallet(conn, user_id, 1)
+        self.assertEqual(get_trap(conn, user_id)["status"], "cooldown")
+        self.assertEqual(sum(get_inventory(conn, user_id).values()), capacidade)
+
+    async def test_broken_net_state_also_persists(self):
+        conn = self._make_conn()
+        user_id = 9702
+        self._ready_trap(conn, user_id)
+
+        botao = await self._open_and_get_collect_button(conn, user_id)
+        click = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia.random, "randint", return_value=1):  # quebra
+            await botao.callback(click)
+
+        self.assertIn("CRACK", click.response.send_message.call_args.args[0])
+        self.assertEqual(get_trap(conn, user_id)["status"], "broken")
+        modify_wallet(conn, user_id, 1)
+        self.assertEqual(get_trap(conn, user_id)["status"], "broken")
+
+    async def test_second_click_on_a_stale_panel_is_refused(self):
+        """O painel fica aberto: clicar duas vezes não pode pagar o loot duas
+        vezes. O callback relê o estado na v4 antes de liberar."""
+        conn = self._make_conn()
+        user_id = 9703
+        self._ready_trap(conn, user_id)
+
+        botao = await self._open_and_get_collect_button(conn, user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia.random, "randint", return_value=100):
+            await botao.callback(self._make_interaction(user_id))
+            total_apos_1a = sum(get_inventory(conn, user_id).values())
+
+            segundo = self._make_interaction(user_id)
+            await botao.callback(segundo)
+
+        self.assertIn("Estado inválido", segundo.response.send_message.call_args.args[0])
+        self.assertEqual(sum(get_inventory(conn, user_id).values()), total_apos_1a)
+
+
+
+class GuildaEntryV4Tests(unittest.IsolatedAsyncioTestCase):
+    """/eco guilda: a entrada garantia o rank inicial com um INSERT OR IGNORE
+    direto em `economy`. Desde a etapa 3 nada no runtime lê guild_rank da
+    legada, então aquele INSERT só criava linha legada órfã — trocado por
+    ensure_user(), que dá a mesma garantia na v4 (users.guild_rank nasce 'F').
+    """
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Tester"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name, display_name=name),
+            response=SimpleNamespace(send_message=AsyncMock()),
+        )
+
+    async def _enter(self, conn, user_id):
+        interaction = self._make_interaction(user_id)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia.os.path, "exists", return_value=False):
+            await economia.guilda.callback(interaction)
+        return interaction
+
+    async def test_entry_via_quest_guarantees_the_v4_row_with_initial_rank(self):
+        conn = self._make_conn()
+        user_id = 9801
+        # Rota da quest: libera sem exigir conta prévia.
+        conn.execute(
+            "INSERT INTO quest_progress (user_id, current_chapter) VALUES (?, 'acesso_liberado')",
+            (user_id,),
+        )
+        conn.commit()
+        self.assertIsNone(
+            conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        )
+
+        interaction = await self._enter(conn, user_id)
+
+        _, kwargs = interaction.response.send_message.call_args
+        self.assertIn("Guilda de Porto Solare", kwargs["embed"].title)
+        # A garantia antiga ("rank inicial no banco") preservada, agora na v4.
+        self.assertEqual(get_guild_rank(conn, user_id), {"rank": "F", "xp": 0})
+
+    async def test_entry_does_not_reset_an_existing_rank(self):
+        conn = self._make_conn()
+        user_id = 9802
+        conn.execute(
+            "INSERT INTO quest_progress (user_id, current_chapter) VALUES (?, 'acesso_liberado')",
+            (user_id,),
+        )
+        conn.commit()
+        ensure_user(conn, user_id, "Tester")
+        set_guild_rank(conn, user_id, "C", 900)
+
+        await self._enter(conn, user_id)
+
+        self.assertEqual(get_guild_rank(conn, user_id), {"rank": "C", "xp": 900})
+
+    async def test_entry_is_still_refused_without_quest_or_account(self):
+        conn = self._make_conn()
+        user_id = 9803
+
+        interaction = await self._enter(conn, user_id)
+
+        args, _ = interaction.response.send_message.call_args
+        self.assertIn("Acesso Negado", args[0])
+        # O portão não pode criar a conta que ele está barrando.
+        self.assertIsNone(
+            conn.execute("SELECT 1 FROM users WHERE user_id = ?", (user_id,)).fetchone()
+        )
 
 
 

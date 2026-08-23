@@ -16,6 +16,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import MOD_ROLE_IDS, set_bot_instance
+from economy_db import get_inventory
 from cogs.economia import WEATHER_EFFECTS
 from cogs.ilha import ISLAND_HUB_LORE
 from cogs.onboarding import ADD_APP_STEPS
@@ -515,14 +516,12 @@ class SistemaCog(commands.Cog):
                 pass
 
         if not has_bottle:
-            e_row = cursor.execute("SELECT inventory FROM economy WHERE user_id = ?", (user_id,)).fetchone()
-            if e_row and e_row["inventory"]:
-                try:
-                    einv = json.loads(e_row["inventory"]) if isinstance(e_row["inventory"], str) else e_row["inventory"]
-                    if einv and "garrafa_incrustada" in einv:
-                        has_bottle = True
-                except Exception:
-                    pass
+            # Mochila da v4 (user_inventory) em vez do JSON de economy.inventory:
+            # a garrafa pode ter vindo da pesca ou do /debug quest, que gravam
+            # pela v4. get_inventory() já filtra quantidade > 0, então um
+            # resquício com quantidade 0 deixa de contar como "tem a garrafa".
+            if get_inventory(self.bot.db_conn, user_id).get("garrafa_incrustada"):
+                has_bottle = True
 
         if not has_bottle:
             return await interaction.response.send_message(
