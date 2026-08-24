@@ -34,6 +34,7 @@ from cogs.pesca_visuals import (
 # direção não fecha ciclo. O catálogo de construções mora lá, e é de lá que
 # vem o único ponto de leitura dos bônus.
 from cogs.ilha import get_island_bonuses
+from pescador_role import ensure_pescador_role
 from economy_db import (
     FORGE_REQUIRED_RANK,
     MISSION_DAILY_CAP,
@@ -1171,6 +1172,18 @@ async def pescar(interaction: discord.Interaction):
     # um segundo fluxo em paralelo — duplicando a captura dentro do intervalo
     # de um único cooldown. Não mova isto para depois do processamento.
     set_cooldown(conn, user_id, "last_fish", agora_str)
+
+    # Cargo automático "Pescador". Fica DEPOIS da reserva do cooldown de
+    # propósito: ensure_pescador_role pode dar await (add_roles), e a região
+    # entre a leitura de last_fish e o set_cooldown acima é exatamente a
+    # janela de duplicação descrita no comentário anterior — um await ali
+    # dentro a reabriria. Aqui a reserva já está gravada.
+    #
+    # A função não levanta exceção por contrato e não gasta chamada de API
+    # depois da primeira verificação de cada jogador, então o custo em regime
+    # é zero: nem falha de cargo, nem permissão errada, nem cargo apagado
+    # impedem alguém de pescar.
+    await ensure_pescador_role(conn, interaction.user)
 
     # 5. CONSUMO DE ITENS
     used_bait = False; used_magnet = False; used_firewall = False; used_chip = False

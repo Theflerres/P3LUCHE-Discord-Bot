@@ -64,6 +64,12 @@ WARN_CHANNEL_ID = 1349002209794195526
 MOD_ROLE_IDS = [1444846159850901584, 1282147756814766132]
 CREATOR_ID = 299323165937500160
 
+# Cargo concedido automaticamente a quem tem conta na economia. Fica aqui
+# junto dos outros IDs de cargo, e não no .env, porque é o mesmo caso de
+# MOD_ROLE_IDS: identifica um cargo específico deste servidor, não uma
+# configuração de ambiente que muda entre instalações.
+PESCADOR_ROLE_ID = 1457097764088447017
+
 # Canal privado/staff para stack traces e detalhes técnicos de erro (NUNCA o
 # mesmo canal usado para advertências públicas). Configure via .env:
 # ERROR_LOG_CHANNEL_ID=<id_do_canal>. Sem essa variável, o bot não envia

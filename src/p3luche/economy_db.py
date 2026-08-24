@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS users (
     guild_rank TEXT DEFAULT 'F',
     guild_xp INTEGER DEFAULT 0,
     scrap INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    pescador_role_checked INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS user_inventory (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -142,6 +143,13 @@ def ensure_v4_tables(conn: sqlite3.Connection) -> None:
     try:
         cursor.execute(
             "ALTER TABLE rod_upgrades ADD COLUMN forge_level INTEGER DEFAULT 0"
+        )
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e):
+            raise
+    try:
+        cursor.execute(
+            "ALTER TABLE users ADD COLUMN pescador_role_checked INTEGER DEFAULT 0"
         )
     except sqlite3.OperationalError as e:
         if "duplicate column name" not in str(e):
@@ -617,6 +625,37 @@ def try_upgrade_rod(
         conn.rollback()
         raise
 
+
+# --- CARGO AUTOMÁTICO "PESCADOR" ---
+# A flag responde "este jogador já foi verificado?", não "ele tem o cargo?".
+# A distinção importa: a verificação roda no máximo uma vez por jogador, e o
+# nome `..._granted` mentiria nos casos em que a checagem terminou sem
+# conceder nada (jogador que já tinha o cargo, ou membro que saiu do servidor
+# na migração em massa). Quem quer saber se o cargo está lá pergunta ao
+# Discord, não a esta coluna.
+
+
+def pescador_role_checked(conn: sqlite3.Connection, user_id: int) -> bool:
+    """True se este jogador já passou pela verificação do cargo."""
+    ensure_user(conn, user_id)
+    row = conn.execute(
+        "SELECT pescador_role_checked FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    return bool(_coerce_int(row["pescador_role_checked"] if row else 0))
+
+
+def mark_pescador_role_checked(conn: sqlite3.Connection, user_id: int) -> None:
+    """Marca o jogador como verificado — não checa mais o cargo dele.
+
+    Não passa por sync_user_to_economy: a coluna não tem contrapartida na
+    tabela legada `economy` (é estado operacional do bot, não do jogo), então
+    não há nada para propagar. Chamar o sync aqui só custaria uma reescrita
+    inteira da linha legada a cada primeira pescaria de cada jogador.
+    """
+    conn.execute(
+        "UPDATE users SET pescador_role_checked = 1 WHERE user_id = ?", (user_id,)
+    )
+    conn.commit()
 
 # --- FORJA DO ABISMO ---
 # Escada sem teto de fim de jogo. Existe porque o catálogo permanente do jogo
