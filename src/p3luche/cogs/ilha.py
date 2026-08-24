@@ -7,10 +7,10 @@ Distinta da "Ilha do Náufrago" (WORLD_LORE["island"] em cogs/economia.py):
 aquela é a localidade de lore/exploração do drone (/eco explorar). Esta é a
 ilha privada do jogador — conceitos separados por decisão de design.
 
-Nenhum benefício mecânico ou cosmético de construção é implementado ainda
-(pendente de decisão) — apenas existência, custo e desbloqueio de tier.
-Catálogo (nomes, tema e valores) definido pelo dono: tema náufrago/
-sobrevivência pessoal.
+Cada construção concede um bônus mecânico num eixo próprio (cooldown,
+sucata, craft, sorte) e todas escalam por nível — ver ISLAND_BONUS e
+island_bonuses. Catálogo (nomes, tema e valores) definido pelo dono: tema
+náufrago/sobrevivência pessoal.
 """
 from __future__ import annotations
 
@@ -45,9 +45,18 @@ ISLAND_HUB_LORE = {
 # --- CATÁLOGO DE CONSTRUÇÕES (tema náufrago/sobrevivência pessoal) ---
 # "nucleo" é a estrutura-núcleo: evoluí-la sobe o tier geral da ilha
 # (progressão linear). As demais só ficam disponíveis a partir do tier
-# indicado em "unlock_tier" e, nesta fase, têm nível único (construir = feito,
-# sem upgrade) — apenas existência, sem benefício mecânico associado (ainda
-# pendente de decisão, não é placeholder de nome/tema).
+# indicado em "unlock_tier".
+#
+# Fase 3: Baú, Bancada e Farol deixaram de ter nível único e passaram a ter
+# 5 níveis cada. O motivo é dar motivo CONTÍNUO de gasto — construir uma vez
+# e nunca mais voltar fazia a ilha inteira ser um sink de 29.400 Sachês numa
+# economia que passa de milhões, e o jogador de meio de jogo (sem rank A e
+# sem vara de tier 5) não tem a Forja do Abismo para alimentar. Mesmo
+# espírito da Forja, em escala menor e com teto: a ilha é conteúdo de meio de
+# jogo, então a escada acaba.
+#
+# `cost_saches`/`cost_scrap` são o custo do NÍVEL 1; a curva por nível está
+# em _structure_cost.
 ISLAND_STRUCTURES = {
     "nucleo": {
         "name": "Acampamento",
@@ -61,35 +70,51 @@ ISLAND_STRUCTURES = {
     },
     "deposito": {
         "name": "Baú da Maré",
-        "desc": "Onde você guarda o que a maré traz. Ainda sem benefício mecânico associado.",
+        "desc": "Onde você guarda o que a maré traz. Cada nível rende +25% de sucata em toda fonte.",
         "is_core": False,
         "unlock_tier": 1,
-        "max_level": 1,
+        "max_level": 5,
         "cost_saches": 2400,
         "cost_scrap": 240,
         "build_hours": 3,
     },
     "oficina": {
         "name": "Bancada do Náufrago",
-        "desc": "Uma bancada de trabalho improvisada. Ainda sem benefício mecânico associado.",
+        "desc": "Uma bancada improvisada. Barateia o craft em sucata e rende iscas no /eco diario.",
         "is_core": False,
         "unlock_tier": 2,
-        "max_level": 1,
+        "max_level": 5,
         "cost_saches": 4500,
         "cost_scrap": 450,
         "build_hours": 5,
     },
     "farol": {
         "name": "Farol Pessoal",
-        "desc": "Um farol erguido à mão na ponta da ilha. Ainda sem benefício mecânico associado.",
+        "desc": "Um farol erguido à mão na ponta da ilha. Cada nível soma sorte na pescaria.",
         "is_core": False,
         "unlock_tier": 3,
-        "max_level": 1,
+        "max_level": 5,
         "cost_saches": 7500,
         "cost_scrap": 750,
         "build_hours": 8,
     },
 }
+
+# --- CURVA DE CUSTO DOS NÍVEIS (só para as não-núcleo) ---
+# Sachê dobra a cada nível; sucata cresce LINEAR (base x nível). É a mesma
+# assimetria que a Forja do Abismo já usa (FORGE_GROWTH geométrico contra
+# FORGE_SCRAP_PER_LEVEL linear), e aqui ela resolve um problema concreto: as
+# varas de tier alto têm 0-10% de lixo e quase não produzem sucata, então uma
+# curva de sucata geométrica viraria a parede real da ilha em vez do Sachê,
+# que é o recurso que a expansão existe para drenar.
+#
+# Totais das três estruturas, do nível 1 ao 5: 446.400 Sachês e 21.600 de
+# sucata (a ilha de nível 1 inteira, incluindo o Acampamento, custa 29.400).
+STRUCTURE_COST_GROWTH = 2
+# O tempo de obra também cresce por nível, mas com teto: sem ele o nível 5 do
+# Farol pediria 40 horas de espera, e uma obra que atravessa dois dias deixa
+# de ser progressão para virar castigo.
+STRUCTURE_BUILD_HOURS_CAP = 24
 
 
 # --- BÔNUS MECÂNICOS DAS CONSTRUÇÕES ---
@@ -97,13 +122,25 @@ ISLAND_STRUCTURES = {
 # dando "+X% de renda" seriam a mesma construção quatro vezes, e a decisão de
 # qual erguer primeiro deixaria de existir.
 #
-# O núcleo escala com o nível (é a única com mais de um); as demais têm nível
-# único, então o bônus liga quando ela existe.
+# Todas as quatro escalam por nível (o Acampamento sempre escalou; as outras
+# três passaram a escalar na Fase 3). O nível 1 de cada uma vale exatamente o
+# que valia antes — a expansão só acrescenta degraus acima, nunca reduz o que
+# quem já construiu tem.
 ISLAND_BONUS = {
-    "nucleo_cd_por_nivel": 0.02,   # -2% de cooldown de pesca por nível (máx -8%)
-    "deposito_sucata_mult": 1.25,  # +25% em toda fonte de sucata
-    "oficina_craft_mult": 0.5,     # craft custa metade da sucata
-    "farol_sorte": 0.10,           # +10% de sorte, multiplicativo com a vara
+    # -2% de cooldown de pesca por nível (máx -8% no nível 4)
+    "nucleo_cd_por_nivel": 0.02,
+    # +25 pontos percentuais de sucata por nível: 1,25x -> 2,25x no nível 5
+    "deposito_sucata_por_nivel": 0.25,
+    # craft custa metade da sucata no nível 1 e vai caindo 5 pontos por
+    # nível, até 30% no nível 5. Nunca chega a zero de propósito: craft de
+    # graça apagaria a sucata como recurso.
+    "oficina_craft_base": 0.5,
+    "oficina_craft_desconto_por_nivel": 0.05,
+    # +1 Isca Minhoca por dia por nível (1 no nível 1, 5 no nível 5)
+    "oficina_isca_por_nivel": 1,
+    # +10% de sorte no nível 1, +5 pontos por nível acima disso (+30% no 5)
+    "farol_sorte_base": 0.10,
+    "farol_sorte_por_nivel": 0.05,
 }
 
 
@@ -116,15 +153,32 @@ def island_bonuses(structures: dict) -> dict:
     """
     def nivel(chave):
         estado = structures.get(chave)
-        return estado["level"] if estado else 0
+        bruto = estado["level"] if estado else 0
+        # Teto do catálogo aplicado na leitura, não só na compra: nível
+        # gravado acima do máximo (dado velho, correção de catálogo, admin)
+        # não pode pagar bônus que a estrutura não oferece.
+        return max(0, min(bruto, ISLAND_STRUCTURES[chave]["max_level"]))
 
-    nucleo = min(nivel("nucleo"), ISLAND_STRUCTURES["nucleo"]["max_level"])
+    nucleo = nivel("nucleo")
+    deposito = nivel("deposito")
+    oficina = nivel("oficina")
+    farol = nivel("farol")
+
     return {
         "cd_reducao": nucleo * ISLAND_BONUS["nucleo_cd_por_nivel"],
-        "sucata_mult": ISLAND_BONUS["deposito_sucata_mult"] if nivel("deposito") else 1.0,
-        "craft_mult": ISLAND_BONUS["oficina_craft_mult"] if nivel("oficina") else 1.0,
-        "sorte_bonus": ISLAND_BONUS["farol_sorte"] if nivel("farol") else 0.0,
-        "isca_diaria": bool(nivel("oficina")),
+        "sucata_mult": 1.0 + deposito * ISLAND_BONUS["deposito_sucata_por_nivel"],
+        "craft_mult": (
+            ISLAND_BONUS["oficina_craft_base"]
+            - (oficina - 1) * ISLAND_BONUS["oficina_craft_desconto_por_nivel"]
+        ) if oficina else 1.0,
+        "sorte_bonus": (
+            ISLAND_BONUS["farol_sorte_base"]
+            + (farol - 1) * ISLAND_BONUS["farol_sorte_por_nivel"]
+        ) if farol else 0.0,
+        # Quantidade, não booleano: o consumidor (/eco diario) entrega esse
+        # número de iscas. Continua falsy no nível 0, então quem só checava a
+        # verdade do campo segue correto.
+        "isca_diaria": oficina * ISLAND_BONUS["oficina_isca_por_nivel"],
     }
 
 
@@ -136,22 +190,33 @@ def get_island_bonuses(conn, user_id: int) -> dict:
 
 def _structure_cost(structure_key: str, current_level: int) -> dict:
     """Custo/tempo para levar `structure_key` de current_level para o
-    próximo nível. Para estruturas-núcleo o custo escala com o nível alvo
-    (mesmo padrão de try_upgrade_rod); para as demais (max_level=1) é fixo.
+    próximo nível.
+
+    Duas curvas diferentes, de propósito:
+
+    * núcleo (Acampamento): custo LINEAR no nível alvo (mesmo padrão de
+      try_upgrade_rod). Ele é a progressão, não o sink — encarecê-lo trava o
+      acesso às outras construções.
+    * demais: Sachê GEOMÉTRICO (dobra por nível) e sucata LINEAR. O Sachê é
+      o recurso que a expansão existe para drenar; a sucata só acompanha,
+      porque as varas de tier alto quase não produzem lixo e uma curva
+      geométrica dos dois lados deixaria a sucata ser a parede de verdade.
     """
     stats = ISLAND_STRUCTURES[structure_key]
     target_level = current_level + 1
     if stats["is_core"]:
         cost_saches = stats["cost_saches_per_level"] * target_level
         cost_scrap = stats["cost_scrap_per_level"] * target_level
+        build_hours = stats["build_hours"]
     else:
-        cost_saches = stats["cost_saches"]
-        cost_scrap = stats["cost_scrap"]
+        cost_saches = stats["cost_saches"] * STRUCTURE_COST_GROWTH ** (target_level - 1)
+        cost_scrap = stats["cost_scrap"] * target_level
+        build_hours = min(stats["build_hours"] * target_level, STRUCTURE_BUILD_HOURS_CAP)
     return {
         "target_level": target_level,
         "cost_saches": cost_saches,
         "cost_scrap": cost_scrap,
-        "build_hours": stats["build_hours"],
+        "build_hours": build_hours,
     }
 
 
@@ -185,9 +250,10 @@ def _structure_button_spec(structure_key: str, island_tier: int, struct_state: d
         }
 
     if level >= stats["max_level"]:
-        label = "Nível Máximo" if stats["is_core"] else "Construído"
+        # "Construído" saiu: desde a Fase 3 toda estrutura tem escada de
+        # níveis, então o estado final é sempre "no teto", não "existe".
         return {
-            "label": f"✅ {label}: {stats['name']}",
+            "label": f"✅ Nível Máximo: {stats['name']}",
             "style": discord.ButtonStyle.secondary,
             "disabled": True,
         }
@@ -195,10 +261,35 @@ def _structure_button_spec(structure_key: str, island_tier: int, struct_state: d
     cost = _structure_cost(structure_key, level)
     verb = "Evoluir" if level > 0 else "Construir"
     return {
-        "label": f"{verb}: {stats['name']} ({cost['cost_saches']}$ / {cost['cost_scrap']}⚙️)",
+        "label": (
+            f"{verb}: {stats['name']} Nv{cost['target_level']} "
+            f"({cost['cost_saches']}$ / {cost['cost_scrap']}⚙️)"
+        ),
         "style": discord.ButtonStyle.primary,
         "disabled": False,
     }
+
+
+def _bonus_text(structure_key: str, level: int) -> str:
+    """Frase curta do que a estrutura entrega NO NÍVEL ATUAL.
+
+    Lê de island_bonuses em vez de reescrever as contas: uma segunda cópia da
+    fórmula aqui divergiria da real no primeiro reajuste, e o jogador tomaria
+    a decisão de gasto olhando um número que não é o que ele recebe.
+    """
+    if level <= 0:
+        return ""
+    b = island_bonuses({structure_key: {"level": level, "status": "idle", "timer_end": None, "state_json": "{}"}})
+    if structure_key == "nucleo":
+        return f"−{b['cd_reducao'] * 100:.0f}% de cooldown"
+    if structure_key == "deposito":
+        return f"×{b['sucata_mult']:.2f} de sucata"
+    if structure_key == "oficina":
+        iscas = b["isca_diaria"]
+        return f"craft por {b['craft_mult'] * 100:.0f}% da sucata • +{iscas} isca{'s' if iscas > 1 else ''}/dia"
+    if structure_key == "farol":
+        return f"+{b['sorte_bonus'] * 100:.0f}% de sorte"
+    return ""
 
 
 def build_island_embed(user_name: str, island: dict, structures: dict, wallet: int, scrap: int) -> discord.Embed:
@@ -229,10 +320,17 @@ def build_island_embed(user_name: str, island: dict, structures: dict, wallet: i
             status_text = f"🔧 Nível {level}/{stats['max_level']} (pode evoluir)"
         else:
             status_text = "◻️ Não construída"
-        lines.append(f"**{stats['name']}** — {status_text}")
+        linha = f"**{stats['name']}** — {status_text}"
+        # O bônus vigente entra na listagem porque a decisão que o hub pede é
+        # "vale a pena subir mais um nível desta?" — sem o valor atual ao lado
+        # do custo, o jogador não tem como responder sem abrir o código.
+        bonus = _bonus_text(key, level)
+        if bonus:
+            linha += f"\n └ {bonus}"
+        lines.append(linha)
 
     embed.add_field(name="Construções", value="\n".join(lines), inline=False)
-    embed.set_footer(text=f"Ilha de {user_name} • Fase 6: sem benefícios mecânicos ainda (pendente de decisão)")
+    embed.set_footer(text=f"Ilha de {user_name} • Cada nível aumenta o bônus da construção")
     return embed
 
 
@@ -297,8 +395,11 @@ class IlhaHubView(discord.ui.View):
 
         # status idle: tentar iniciar construção/upgrade
         if level >= stats["max_level"]:
-            label = "nível máximo" if stats["is_core"] else "já construída"
-            return await interaction.response.send_message(f"✅ **{stats['name']}** está no {label}.", ephemeral=True)
+            return await interaction.response.send_message(
+                f"✅ **{stats['name']}** já está no nível máximo "
+                f"({stats['max_level']}/{stats['max_level']}).",
+                ephemeral=True,
+            )
 
         cost = _structure_cost(structure_key, level)
         result = start_island_construction(

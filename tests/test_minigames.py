@@ -142,9 +142,10 @@ class BattleViewAntiReplayTests(unittest.IsolatedAsyncioTestCase):
 
 class MemoriaCooldownTests(unittest.IsolatedAsyncioTestCase):
     """Regressão: /eco memoria pagava sem custo real nem cooldown (20-48k
-    Sachês/hora de graça, auditoria Fase 4) — agora tem cooldown real de 300s
-    (mesma base da vara inicial). O valor do prêmio vive em MEMORIA_PREMIO e
-    é balanceamento, não regra deste teste.
+    Sachês/hora de graça, auditoria Fase 4) — agora tem cooldown real, hoje
+    de 1800s (Fase 3). Os valores vivem em MEMORIA_PREMIO/
+    MEMORIA_COOLDOWN_SECONDS e são balanceamento (ver MemoriaPremioTests),
+    não regra deste teste: aqui só se testa que o cooldown é respeitado.
     """
 
     def _make_interaction(self, user_id, name="Tester"):
@@ -243,7 +244,12 @@ class MemoriaViewAntiReplayTests(unittest.IsolatedAsyncioTestCase):
 
 class MemoriaPremioTests(unittest.TestCase):
     """Ajuste de balanceamento: o Aquário rendia mais que a pescaria da faixa
-    de entrada, sem custo e sem depender de equipamento."""
+    de entrada, sem custo e sem depender de equipamento.
+
+    Fase 3 reajustou o PAR (prêmio, cooldown), não só o prêmio: 140 a cada
+    30 minutos = 280/h, contra 244,7/h da Vara de Bambu. O prêmio por rodada
+    subiu e a renda por hora caiu 4,3x — é a frequência que estava errada.
+    """
 
     def _pesca_inicial_por_hora(self):
         """Sachês/hora da Vara de Bambu, o piso da progressão de verdade."""
@@ -265,22 +271,38 @@ class MemoriaPremioTests(unittest.TestCase):
             ev += peso * parcial
         return ev * 3600 / int(300 * r["cd"])
 
-    def test_premio_lowered(self):
-        self.assertEqual(minigames.MEMORIA_PREMIO, 100)
+    def test_premio_and_cooldown_pair(self):
+        """O par inteiro é o balanceamento — o prêmio sozinho não diz nada."""
+        self.assertEqual(minigames.MEMORIA_PREMIO, 140)
+        self.assertEqual(minigames.MEMORIA_COOLDOWN_SECONDS, 1800)
 
     def test_hourly_rate(self):
         por_hora = minigames.MEMORIA_PREMIO * 3600 / minigames.MEMORIA_COOLDOWN_SECONDS
-        self.assertEqual(por_hora, 1200)
+        self.assertEqual(por_hora, 280)
 
-    def test_memoria_pays_less_per_hour_than_the_starter_rod_band(self):
-        """O invariante de desenho: um minijogo sem risco nem equipamento não
-        pode ser a melhor renda de quem está começando."""
+    def test_memoria_sits_just_above_the_starter_rod_band(self):
+        """O invariante de desenho da Fase 3: o Aquário rende um pouco ACIMA
+        da pescaria de entrada — o suficiente para ser uma escolha de renda
+        passiva, longe o bastante de ser um substituto da pescaria ativa.
+
+        A faixa é 10-20% acima. Abaixo disso ninguém joga; muito acima e a
+        vara vira decoração, que era o problema que o valor antigo criava
+        (1.200/h contra 244,7/h, quase 5x).
+        """
         memoria_h = minigames.MEMORIA_PREMIO * 3600 / minigames.MEMORIA_COOLDOWN_SECONDS
         pesca_h = self._pesca_inicial_por_hora()
-        # Ainda é bem acima da pescaria em números absolutos — o Aquário roda
-        # em cooldown próprio e soma. O que a asserção fixa é que a distância
-        # parou de crescer: no valor antigo eram 7,4x a pescaria inicial.
-        self.assertLess(memoria_h / pesca_h, 5.0)
+        razao = memoria_h / pesca_h
+        self.assertGreater(razao, 1.10, f"Aquário caiu para {memoria_h}/h contra {pesca_h:.1f}/h da pesca")
+        self.assertLess(razao, 1.20, f"Aquário subiu para {memoria_h}/h contra {pesca_h:.1f}/h da pesca")
+
+    def test_cooldown_is_a_deliberate_wait_not_a_second_fishing_rod(self):
+        """A espera tem que ser de outra ordem de grandeza que a da vara,
+        senão o Aquário volta a ser uma segunda pescaria rodando em paralelo.
+        """
+        from cogs.economia import ROD_STATS
+
+        cd_vara_inicial = 300 * ROD_STATS["vara_bambu"]["cd"]
+        self.assertGreaterEqual(minigames.MEMORIA_COOLDOWN_SECONDS, 6 * cd_vara_inicial)
 
 
 if __name__ == "__main__":

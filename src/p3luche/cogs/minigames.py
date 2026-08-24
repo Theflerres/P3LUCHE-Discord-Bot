@@ -306,17 +306,32 @@ class MemoriaView(discord.ui.View):
 
 # 300 Sachês garantidos por vitória mereciam custo real de entrada — sem
 # isso, o jogo pagava 20-48k Sachês/hora de graça (auditoria da Fase 4).
-# Mesmo cooldown base da vara inicial (vara_bambu, 5min/300s).
-MEMORIA_COOLDOWN_SECONDS = 300
+#
+# 300s -> 1800s (Fase 3). Enquanto o cooldown era o mesmo da vara inicial, o
+# Aquário era um SUBSTITUTO da pescaria: mesma cadência, mesmo clique, sem
+# equipamento e sem risco. Meia hora o põe numa cadência própria (6x o
+# cooldown base da vara) — é uma escolha de renda passiva com espera, não
+# uma segunda pescaria rodando em paralelo.
+MEMORIA_COOLDOWN_SECONDS = 1800
 
-# 150 -> 100. A 150 por rodada o Aquário rendia 1.800 Sachês/hora garantidos,
-# sem custo de entrada e sem depender de equipamento — mais do que a pescaria
-# da faixa de entrada, mesmo depois do ajuste da vara inicial (244,5/h com a
-# Vara de Bambu). Um minijogo sem risco não pode ser a melhor fonte de renda
-# de quem está começando, senão a vara deixa de ser a progressão principal.
-# A 100 ele fica em 1.200/h: continua sendo um bom complemento, mas o valor
-# não é mais o argumento para ignorar a vara.
-MEMORIA_PREMIO = 100
+# 150 -> 100 -> 140, junto com o cooldown de 5 para 30 minutos (Fase 3).
+#
+# O prêmio SUBIU e mesmo assim o Aquário ficou 4,3x mais barato para a
+# economia, porque o que governa a renda é o par (prêmio, cooldown), não o
+# prêmio sozinho:
+#
+#   antes:  100 x 12 usos/h = 1.200/h  (4,9x a pesca de entrada)
+#   agora:  140 x  2 usos/h =   280/h  (1,14x a pesca de entrada)
+#
+# A referência é a Vara de Bambu pós-Fase 1: 20,39 Sachês por lance com
+# cooldown de 5 min, ou seja 244,7/h. O alvo era ficar POUCO acima dela —
+# o Aquário deve valer a pena, mas não a ponto de a vara virar decoração.
+# 280/h é +14,4%.
+#
+# Subir o prêmio junto com o cooldown é deliberado: a rodada individual tem
+# que parecer melhor do que era, senão a mudança lê como punição pura. O que
+# encolheu foi a frequência, que é onde estava o problema.
+MEMORIA_PREMIO = 140
 
 
 @eco_group.command(name="memoria", description="Jogo da memória do aquário.")

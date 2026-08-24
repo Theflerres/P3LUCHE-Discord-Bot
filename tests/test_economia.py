@@ -3406,20 +3406,31 @@ class ForjaDoAbismoTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
                     patch.object(economia, "get_local_file", return_value=(None, None)), \
                     patch.object(economia.random, "choice", return_value=alvo), \
-                    patch.object(economia.random, "randint", return_value=50), \
+                    patch.object(economia.random, "randint", return_value=500), \
                     patch.object(economia, "get_current_weather",
                                  return_value=("normal", economia.WEATHER_EFFECTS["normal"])):
                 await economia.pescar.callback(self._make_interaction(user_id))
             return get_wallet(conn, user_id)
 
+        # A Devoradora é vara de tier 5, então todo lance já sai com a
+        # manutenção descontada (Item A). O valor sorteado é alto o bastante
+        # para que a manutenção não engula a captura e a razão continue
+        # medindo só a forja.
+        manutencao = economia.rod_maintenance_cost("vara_void")
+
         sem_forja = await pescar_uma(0)
         com_forja = await pescar_uma(20)
 
-        # 50 (valor) x 6.6 (sorte da Devoradora) x 1.5 (upgrades luck 5) = 495
-        self.assertEqual(sem_forja, 495)
-        # ... x 1.30 (forja 20) = 643
-        self.assertEqual(com_forja, 643)
-        self.assertAlmostEqual(com_forja / sem_forja, 1.30, delta=0.01)
+        # 500 (valor) x 6.6 (sorte da Devoradora) x 1.5 (upgrades luck 5)
+        # = 4950 bruto - 1750 de manutenção = 3200
+        self.assertEqual(sem_forja, 4950 - manutencao)
+        # ... x 1.30 (forja 20) = 6435 bruto - 1750 = 4685
+        self.assertEqual(com_forja, 6435 - manutencao)
+        # A razão é sobre o BRUTO: a manutenção é uma subtração fixa, não um
+        # fator, então ela não deve aparecer no multiplicador da forja.
+        self.assertAlmostEqual(
+            (com_forja + manutencao) / (sem_forja + manutencao), 1.30, delta=0.01
+        )
 
     # ------------------------------------------------ persistência
     def test_forge_level_defaults_to_zero_and_round_trips(self):
@@ -3598,6 +3609,141 @@ class ForjaDoAbismoTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(get_forge_level(conn, dono), 0)
         self.assertIn("não é sua", interaction.response.send_message.call_args.args[0])
+
+
+class ManutencaoDeEquipamentoTests(unittest.IsolatedAsyncioTestCase):
+    """Item A: sink complementar da Forja do Abismo.
+
+    Vara de tier >= 4 queima 0,5% do próprio preço a cada lance, descontado
+    do resultado da pescaria — não é uma cobrança à parte, então lance ruim
+    rende zero e nunca dívida. Abaixo do tier 4 (a faixa em que a maioria
+    dos jogadores vive) nada muda.
+    """
+
+    # (preço na loja, manutenção esperada por lance)
+    ESPERADO = {
+        "vara_magnetica": (45_000, 225),
+        "vara_sniper": (60_000, 300),
+        "vara_quantum": (80_000, 400),
+        "vara_void": (350_000, 1_750),
+    }
+
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, name="Mestre"):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name=name, display_name=name),
+            response=SimpleNamespace(
+                send_message=AsyncMock(), edit_message=AsyncMock(), defer=AsyncMock()
+            ),
+            followup=SimpleNamespace(send=AsyncMock()),
+        )
+
+    async def _pescar(self, conn, user_id, rod, sorteio, peixe="Truta"):
+        """Um lance com `rod`, peixe e valor sorteado fixos. Devolve o saldo,
+        que começa zerado — ou seja, exatamente o que o lance pagou."""
+        set_current_rod(conn, user_id, rod)
+        conn.execute("UPDATE user_cooldowns SET last_fish = NULL WHERE user_id = ?", (user_id,))
+        conn.execute("UPDATE users SET wallet = 0 WHERE user_id = ?", (user_id,))
+        conn.commit()
+        alvo = next(p for p in economia.FISH_DB if p[0] == peixe)
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia, "get_local_file", return_value=(None, None)), \
+                patch.object(economia.random, "choice", return_value=alvo), \
+                patch.object(economia.random, "randint", return_value=sorteio), \
+                patch.object(economia, "get_current_weather",
+                             return_value=("normal", economia.WEATHER_EFFECTS["normal"])):
+            await economia.pescar.callback(self._make_interaction(user_id))
+        return get_wallet(conn, user_id)
+
+    def _bruto(self, rod, sorteio):
+        """O que o lance pagaria sem manutenção: só a sorte da vara, sem
+        upgrades do Galdino, sem ilha, sem forja e com clima neutro."""
+        return int(sorteio * economia.ROD_STATS[rod]["luck"])
+
+    # ------------------------------------------------ tabela de custos
+    def test_cost_is_half_a_percent_of_the_rod_price(self):
+        for rod, (preco, custo) in self.ESPERADO.items():
+            with self.subTest(vara=rod):
+                self.assertEqual(economia.ROD_STATS[rod]["price"], preco)
+                self.assertEqual(economia.rod_maintenance_cost(rod), custo)
+                self.assertEqual(custo, int(preco * economia.ROD_MAINTENANCE_RATE))
+
+    def test_rods_below_tier_4_are_free_to_maintain(self):
+        """A faixa de entrada e o meio de jogo não pagam nada: o sink é de
+        equipamento de ponta, não um imposto sobre pescar."""
+        for rod, stats in economia.ROD_STATS.items():
+            if stats["tier"] >= economia.ROD_MAINTENANCE_MIN_TIER:
+                continue
+            with self.subTest(vara=rod):
+                self.assertEqual(economia.rod_maintenance_cost(rod), 0)
+
+    def test_every_tier_4_plus_rod_is_covered_by_the_table(self):
+        """Trava contra vara nova de tier alto entrar sem manutenção."""
+        cobertas = {
+            k for k, v in economia.ROD_STATS.items()
+            if v["tier"] >= economia.ROD_MAINTENANCE_MIN_TIER
+        }
+        self.assertEqual(cobertas, set(self.ESPERADO))
+
+    def test_unknown_rod_costs_nothing(self):
+        self.assertEqual(economia.rod_maintenance_cost("vara_inexistente"), 0)
+
+    # ------------------------------------------------ integração na pesca
+    async def test_each_affected_rod_pays_its_maintenance_per_cast(self):
+        conn = self._make_conn()
+        user_id = 9101
+        ensure_user(conn, user_id, "Mestre")
+        for rod, (_, custo) in self.ESPERADO.items():
+            with self.subTest(vara=rod):
+                pago = await self._pescar(conn, user_id, rod, 5000)
+                self.assertEqual(pago, self._bruto(rod, 5000) - custo)
+
+    async def test_tier3_rod_keeps_the_whole_catch(self):
+        """Contraprova: a Vara de Iridium (tier 3, 12.000) não sofre desconto
+        nenhum, por mais cara que seja perto das varas de tier 1 e 2."""
+        conn = self._make_conn()
+        user_id = 9102
+        ensure_user(conn, user_id, "Mestre")
+        self.assertEqual(economia.ROD_STATS["vara_iridium"]["tier"], 3)
+        pago = await self._pescar(conn, user_id, "vara_iridium", 5000)
+        self.assertEqual(pago, self._bruto("vara_iridium", 5000))
+
+    async def test_a_trash_haul_is_never_charged(self):
+        """Lixo não paga Sachê nenhum, então não há resultado de onde
+        descontar — cobrar aqui viraria a cobrança separada que o desenho
+        descarta de propósito."""
+        conn = self._make_conn()
+        user_id = 9103
+        ensure_user(conn, user_id, "Mestre")
+        pago = await self._pescar(conn, user_id, "vara_void", 5000, peixe="Bota Velha")
+        self.assertEqual(pago, 0)
+        self.assertEqual(get_inventory(conn, user_id).get("Bota Velha", 0), 1)
+
+    async def test_maintenance_never_pushes_the_result_below_zero(self):
+        """Captura menor que a manutenção zera o lance, não abre dívida."""
+        conn = self._make_conn()
+        user_id = 9104
+        ensure_user(conn, user_id, "Mestre")
+        modify_wallet(conn, user_id, 500, "Mestre")
+        conn.execute("UPDATE users SET wallet = 0 WHERE user_id = ?", (user_id,))
+        conn.commit()
+        # Sardinha a 10 com a Devoradora: 66 bruto contra 1.750 de manutenção.
+        pago = await self._pescar(conn, user_id, "vara_void", 10, peixe="Sardinha")
+        self.assertEqual(pago, 0)
+
+    async def test_maintenance_is_deducted_after_the_saches_magnet(self):
+        """O Ímã dobra o BRUTO e a manutenção é subtraída depois. Descontar
+        antes faria o Ímã dobrar o custo junto com o ganho, transformando um
+        consumível de ganho num consumível de despesa."""
+        conn = self._make_conn()
+        user_id = 9105
+        ensure_user(conn, user_id, "Mestre")
+        add_inventory_item(conn, user_id, "ima_saches", 1)
+        pago = await self._pescar(conn, user_id, "vara_void", 5000)
+        bruto = self._bruto("vara_void", 5000)
+        self.assertEqual(pago, bruto * 2 - economia.rod_maintenance_cost("vara_void"))
 
 
 class ForjaDrenagemTests(unittest.TestCase):
@@ -4249,6 +4395,29 @@ class IscaDiariaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_inventory(conn, user_id).get("isca", 0), 1)
         self.assertIn("Bancada", interaction.response.send_message.call_args.args[0])
 
+    async def test_bait_scales_with_the_workshop_level(self):
+        """Fase 3: a Bancada tem 5 níveis e cada um soma uma isca por dia.
+
+        Se este número ficasse preso em 1, evoluir a estrutura não entregaria
+        nada neste eixo e o custo do nível seria cobrado por metade do bônus
+        anunciado.
+        """
+        for nivel, esperado in [(2, 2), (3, 3), (4, 4), (5, 5)]:
+            with self.subTest(nivel=nivel):
+                conn = self._make_conn()
+                user_id = 9980 + nivel
+                ensure_user(conn, user_id, "Tester")
+                conn.execute(
+                    "INSERT INTO user_island_structures (user_id, structure_key, level, status) "
+                    "VALUES (?, 'oficina', ?, 'idle')",
+                    (user_id, nivel),
+                )
+                conn.commit()
+
+                interaction = await self._diario(conn, user_id)
+
+                self.assertEqual(get_inventory(conn, user_id).get("isca", 0), esperado)
+                self.assertIn(f"+{esperado} Isca", interaction.response.send_message.call_args.args[0])
     async def test_bait_is_not_granted_twice_on_the_same_day(self):
         """A trava é a do próprio /eco diario — a isca herda o mesmo portão."""
         conn = self._make_conn()

@@ -232,6 +232,36 @@ ROD_STATS = {
     }
 }
 
+# 1.1 MANUTENÇÃO DE EQUIPAMENTO (sink complementar da Forja do Abismo)
+#
+# Vara de ponta não é só um custo de compra: a partir do tier 4 ela cobra
+# 0,5% do próprio preço a cada lance, descontado do resultado da pescaria —
+# não é uma cobrança separada, então o jogador nunca fica devendo por pescar.
+# É o contrapeso da escada de sorte: a Devoradora rende 6,6x, mas queima
+# 1.750 Sachês por lance, e o tier 3 (a faixa em que a maioria vive) segue
+# sem custo nenhum.
+#
+#   Magnética  (45.000)  ->   225/lance
+#   Sniper .50 (60.000)  ->   300/lance
+#   Quântica   (80.000)  ->   400/lance
+#   Devoradora (350.000) -> 1.750/lance
+ROD_MAINTENANCE_MIN_TIER = 4
+ROD_MAINTENANCE_RATE = 0.005
+
+
+def rod_maintenance_cost(rod_key: str) -> int:
+    """Custo de manutenção por lance da vara `rod_key` (0 se abaixo do tier 4).
+
+    Derivado do preço em ROD_STATS em vez de uma tabela paralela de valores:
+    mexer no preço de uma vara na loja tem que mexer na manutenção dela junto,
+    senão as duas divergem no primeiro reajuste.
+    """
+    stats = ROD_STATS.get(rod_key)
+    if not stats or stats["tier"] < ROD_MAINTENANCE_MIN_TIER:
+        return 0
+    return int(stats["price"] * ROD_MAINTENANCE_RATE)
+
+
 # 2. CONFIGURAÇÃO DA LOJA E ITENS
 SHOP_ITEMS = {
     # --- CONSUMÍVEIS (Buffs para Pesca) ---
@@ -1002,7 +1032,18 @@ async def _finalize_pescar(interaction: discord.Interaction, ctx: dict):
     cd_minutos = int(actual_cd / 60)
     stats_info = f"**{rod_data['name']}**\n(⏱️ {cd_minutos}m | 🎲 x{rod_data['luck']})"
     embed.add_field(name="Detalhes", value=stats_info, inline=True)
-    embed.add_field(name="Lucro", value=f"```diff\n+ {valor} Sachês\n```", inline=True)
+    # `valor` já é líquido; o bruto é reconstruído só para exibir a conta,
+    # de modo que o jogador veja de onde saiu a diferença em vez de achar
+    # que a vara cara está rendendo menos sem motivo.
+    manutencao = ctx.get("manutencao", 0)
+    if manutencao > 0:
+        lucro_txt = (
+            f"```diff\n+ {valor + manutencao} Sachês\n"
+            f"- {manutencao} manutenção\n= {valor} líquido\n```"
+        )
+    else:
+        lucro_txt = f"```diff\n+ {valor} Sachês\n```"
+    embed.add_field(name="Lucro", value=lucro_txt, inline=True)
     iscas_restantes = fresh_inv.get("isca", 0)
     weather_icon = "☀️" if w_key == "normal" else ("⛈️" if w_key == "bad" else "✨")
     embed.set_footer(
@@ -1101,6 +1142,9 @@ async def pescar(interaction: discord.Interaction):
     # cima do que a vara e os upgrades já rendem, seja qual for esse valor.
     forge_level = row['forge_level'] or 0
     forge_mult = forge_luck_multiplier(forge_level)
+    # Manutenção do equipamento: custo fixo por lance das varas de tier >= 4,
+    # descontado do resultado logo abaixo (ver rod_maintenance_cost).
+    manutencao = rod_maintenance_cost(current_rod_key)
     cd_reduction = 1 - (upgrades.get("cd", 0) * 0.05) - ilha_bonus["cd_reducao"]
 
     # 4. LÓGICA DE COOLDOWN
@@ -1236,6 +1280,7 @@ async def pescar(interaction: discord.Interaction):
     if used_bait: base_val = int(base_val * 1.5)
 
     valor = 0
+    manutencao_aplicada = 0
     if is_trash:
         inv[nome] = inv.get(nome, 0) + 1
     else:
@@ -1247,6 +1292,19 @@ async def pescar(interaction: discord.Interaction):
         
         if inv.get("ima_saches", 0) <= 0:
             inv.pop("ima_saches", None)
+
+        # Manutenção: desconto no resultado, DEPOIS de todos os multiplicadores
+        # (sorte da vara, upgrades, ilha, forja, clima, Ímã). Descontar antes
+        # faria o Ímã dobrar o desconto junto com o ganho, o que transformaria
+        # um consumível de ganho num consumível de custo.
+        #
+        # Piso em zero de propósito: o enunciado é "descontado do resultado",
+        # não uma cobrança à parte — um lance ruim rende zero, nunca dívida.
+        # Pelo mesmo motivo o lance que traz LIXO não cobra nada: não houve
+        # resultado do qual descontar.
+        if manutencao > 0:
+            manutencao_aplicada = min(valor, manutencao)
+            valor -= manutencao_aplicada
 
     # 7. PROGRESSO DE MISSÃO EM GRUPO
     mission_msg = ""
@@ -1438,6 +1496,7 @@ async def pescar(interaction: discord.Interaction):
         "new_xp_total": new_xp_total,
         "current_rank": current_rank,
         "used_bait": used_bait,
+        "manutencao": manutencao_aplicada,
         "agora_str": agora_str,
         "w_key": w_key,
         "w_stats": w_stats,
@@ -2422,10 +2481,16 @@ async def diario(interaction: discord.Interaction):
     # de num resgate próprio porque /eco diario já É o portão diário do jogo —
     # um segundo cooldown para a mesma cadência seria estado duplicado, e o
     # jogador teria que lembrar de dois comandos para a mesma rotina.
+    #
+    # A quantidade vem do nível da Bancada (1 por nível), não de um literal:
+    # a partir da Fase 3 a estrutura tem 5 níveis e o número precisa
+    # acompanhar, senão evoluí-la não entrega nada aqui.
     extra_isca = ""
-    if get_island_bonuses(conn, user_id)["isca_diaria"]:
-        add_inventory_item(conn, user_id, "isca", 1)
-        extra_isca = "\n🪱 *Bancada do Náufrago: +1 Isca Minhoca.*"
+    iscas_da_ilha = get_island_bonuses(conn, user_id)["isca_diaria"]
+    if iscas_da_ilha:
+        add_inventory_item(conn, user_id, "isca", iscas_da_ilha)
+        plural = "s" if iscas_da_ilha > 1 else ""
+        extra_isca = f"\n🪱 *Bancada do Náufrago: +{iscas_da_ilha} Isca Minhoca{plural}.*"
 
     await interaction.response.send_message(
         f"📅 **Diário dia {streak}!** Recebeu **{total}** Sachês (bônus de streak: +{bonus}).{extra_isca}"
