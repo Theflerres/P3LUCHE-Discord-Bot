@@ -333,6 +333,119 @@ class TelemetryTests(unittest.TestCase):
 #  COLETORES DO PAINEL
 # ──────────────────────────────────────────────
 
+class ErrorLogFileHandlerTests(unittest.TestCase):
+    """Regressão: o painel desligava o log em arquivo.
+
+    `dashboard_session()` envolve o `bot.run()` em main.py e anexa o
+    TelemetryLogHandler ao logger "P3LUCHE_ERROS" ANTES do setup_hook carregar
+    `cogs.erros`. O guard antigo era `if not logger.handlers:`, então com o
+    painel ligado — que é como o bot roda em produção — o logger já chegava com
+    um handler e o FileHandler NUNCA era criado.
+
+    O efeito era invisível e caro: o jogador recebia a mensagem de erro do
+    handler normalmente, mas nada era gravado em disco. Todo erro de comando
+    existia apenas no anel de 20 posições em memória do painel, e morria junto
+    com o processo. O `bot_erros.log` ficou 3 dias sem uma linha enquanto
+    jogadores relatavam falhas em /eco pescar.
+    """
+
+    def _telemetry_handler(self):
+        from telemetry import TelemetryLogHandler
+
+        return TelemetryLogHandler()
+
+    def test_a_non_file_handler_does_not_satisfy_the_guard(self):
+        """O coração do bug: um handler de OUTRA natureza não pode contar como
+        'o arquivo já está coberto'."""
+        from cogs import erros
+
+        logger = erros.logger
+        handler = self._telemetry_handler()
+        originais = list(logger.handlers)
+        logger.handlers = [handler]
+        try:
+            self.assertFalse(erros._ja_tem_file_handler(erros.ERRO_LOG_FILE))
+        finally:
+            logger.handlers = originais
+
+    def test_the_real_logger_ends_up_with_a_file_handler(self):
+        """Estado final do módulo: o arquivo está coberto de verdade."""
+        import os
+
+        from cogs import erros
+
+        alvos = [
+            os.path.abspath(h.baseFilename)
+            for h in erros.logger.handlers
+            if getattr(h, "baseFilename", None)
+        ]
+        self.assertIn(os.path.abspath(erros.ERRO_LOG_FILE), alvos)
+
+    def test_panel_and_file_coexist(self):
+        """Os dois destinos são complementares, nunca exclusivos: o painel é
+        volátil e pequeno, o arquivo é o registro durável."""
+        from cogs import erros
+
+        logger = erros.logger
+        handler = self._telemetry_handler()
+        logger.addHandler(handler)
+        try:
+            tipos = {type(h).__name__ for h in logger.handlers}
+            self.assertIn("TelemetryLogHandler", tipos)
+            self.assertTrue(erros._ja_tem_file_handler(erros.ERRO_LOG_FILE))
+        finally:
+            logger.removeHandler(handler)
+
+    def test_guard_is_idempotent_for_the_same_file(self):
+        """Recarregar a extensão não pode duplicar a escrita — era a única
+        coisa que o guard antigo realmente protegia, e ela é preservada."""
+        from cogs import erros
+
+        self.assertTrue(erros._ja_tem_file_handler(erros.ERRO_LOG_FILE))
+
+    def test_a_file_handler_for_another_file_does_not_count(self):
+        import logging
+        import os
+        import tempfile
+
+        from cogs import erros
+
+        logger = erros.logger
+        originais = list(logger.handlers)
+        with tempfile.TemporaryDirectory() as pasta:
+            outro = logging.FileHandler(os.path.join(pasta, "outro.log"), encoding="utf-8")
+            logger.handlers = [outro]
+            try:
+                self.assertFalse(erros._ja_tem_file_handler(erros.ERRO_LOG_FILE))
+            finally:
+                logger.handlers = originais
+                outro.close()
+
+    def test_an_error_actually_reaches_the_file_with_the_panel_attached(self):
+        """O teste de ponta a ponta: com o handler do painel pendurado, um
+        logger.error tem que aumentar o arquivo."""
+        import os
+
+        from cogs import erros
+
+        logger = erros.logger
+        handler = self._telemetry_handler()
+        logger.addHandler(handler)
+        try:
+            antes = os.path.getsize(erros.ERRO_LOG_FILE) if os.path.exists(erros.ERRO_LOG_FILE) else 0
+            logger.error("regressao: painel nao pode desligar o arquivo")
+            for h in logger.handlers:
+                try:
+                    h.flush()
+                except Exception:
+                    pass
+            depois = os.path.getsize(erros.ERRO_LOG_FILE)
+        finally:
+            logger.removeHandler(handler)
+
+        self.assertGreater(depois, antes, "logger.error nao chegou ao arquivo com o painel ligado")
+
+
 class FormattingTests(unittest.TestCase):
     def test_uptime_without_days(self):
         self.assertEqual(format_uptime(timedelta(hours=3, minutes=14, seconds=22)), "03:14:22")

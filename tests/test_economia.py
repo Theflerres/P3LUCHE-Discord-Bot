@@ -3611,6 +3611,140 @@ class ForjaDoAbismoTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("não é sua", interaction.response.send_message.call_args.args[0])
 
 
+class FollowupViewContractTests(unittest.IsolatedAsyncioTestCase):
+    """Regressão: `view=None` no followup.send derrubava /eco pescar.
+
+    O discord.py declara `view: BaseView = MISSING` e valida com
+    `if view is not MISSING:` + checagem de tipo, então None estoura em
+    TypeError. O bug quebrava TODA captura de lixo e toda captura de valor
+    zero, e ficou 3 dias em produção invisível.
+
+    A razão de ter passado por 558 testes é o dublê: os outros testes usam
+    `followup.send = AsyncMock()`, que aceita qualquer kwarg sem validar nada.
+    Esta classe usa um dublê que REPRODUZ a regra do discord.py — é isso que
+    fecha a lacuna, não mais um caso de teste no dublê permissivo.
+    """
+
+    class FollowupEstrito:
+        """Aplica a mesma regra de `discord.webhook.async_.Webhook.send`."""
+
+        def __init__(self):
+            self.chamadas = []
+
+        async def send(self, *args, **kwargs):
+            view = kwargs.get("view", discord.utils.MISSING)
+            if view is not discord.utils.MISSING and not isinstance(view, discord.ui.View):
+                raise TypeError(
+                    "expected view parameter to be of type View or LayoutView, "
+                    f"not {view.__class__.__name__}"
+                )
+            self.chamadas.append(kwargs)
+            return SimpleNamespace(id=1, edit=AsyncMock())
+
+    def test_the_double_matches_the_real_discord_py_signature(self):
+        """Trava do próprio dublê: se o discord.py mudar o sentinela ou o
+        default, este teste avisa antes que o dublê vire ficção."""
+        import inspect
+
+        from discord.webhook import async_ as webhook_async
+
+        parametro = inspect.signature(webhook_async.Webhook.send).parameters["view"]
+        self.assertIs(parametro.default, discord.utils.MISSING)
+
+    async def test_the_double_rejects_none_like_discord_does(self):
+        followup = self.FollowupEstrito()
+        with self.assertRaises(TypeError):
+            await followup.send(embed=None, view=None)
+
+    async def test_the_double_accepts_missing_and_a_real_view(self):
+        followup = self.FollowupEstrito()
+        await followup.send(embed=None, view=discord.utils.MISSING)
+        await followup.send(embed=None, view=discord.ui.View())
+        await followup.send(embed=None)
+        self.assertEqual(len(followup.chamadas), 3)
+
+    # ------------------------------------------------ o fluxo de pesca
+    def _make_conn(self):
+        return _make_pescar_conn()
+
+    def _make_interaction(self, user_id, followup):
+        return SimpleNamespace(
+            user=SimpleNamespace(id=user_id, name="Tester", display_name="Tester"),
+            response=SimpleNamespace(send_message=AsyncMock(), defer=AsyncMock()),
+            followup=followup,
+        )
+
+    async def _pescar(self, conn, user_id, alvo, sorteio=50):
+        followup = self.FollowupEstrito()
+        conn.execute("UPDATE user_cooldowns SET last_fish = NULL WHERE user_id = ?", (user_id,))
+        conn.commit()
+        with patch.object(economia, "get_bot_instance", return_value=SimpleNamespace(db_conn=conn)), \
+                patch.object(economia, "get_local_file", return_value=(None, None)), \
+                patch.object(economia.random, "choice", return_value=alvo), \
+                patch.object(economia.random, "randint", return_value=sorteio), \
+                patch.object(economia, "get_current_weather",
+                             return_value=("normal", economia.WEATHER_EFFECTS["normal"])):
+            await economia.pescar.callback(self._make_interaction(user_id, followup))
+        return followup
+
+    async def test_a_trash_catch_completes(self):
+        """O caso dominante: 35% dos lances da vara inicial são lixo."""
+        conn = self._make_conn()
+        user_id = 9401
+        ensure_user(conn, user_id, "Tester")
+        lixo = next(p for p in economia.FISH_DB if p[0] == "Bota Velha")
+
+        followup = await self._pescar(conn, user_id, lixo)
+
+        self.assertEqual(len(followup.chamadas), 1)
+        self.assertIs(followup.chamadas[0]["view"], discord.utils.MISSING)
+        self.assertEqual(get_inventory(conn, user_id).get("Bota Velha", 0), 1)
+
+    async def test_a_paid_catch_still_carries_the_desmanchar_view(self):
+        """A contraprova: peixe pago continua oferecendo o desmanche."""
+        conn = self._make_conn()
+        user_id = 9402
+        ensure_user(conn, user_id, "Tester")
+        truta = next(p for p in economia.FISH_DB if p[0] == "Truta")
+
+        followup = await self._pescar(conn, user_id, truta)
+
+        self.assertEqual(len(followup.chamadas), 1)
+        view = followup.chamadas[0]["view"]
+        self.assertIsInstance(view, economia.DesmancharView)
+        self.assertGreater(get_wallet(conn, user_id), 0)
+
+    async def test_a_zero_value_catch_from_maintenance_completes(self):
+        """O caminho que o Item A da Fase 3 acrescentou: vara de tier >= 4 cuja
+        captura bruta não cobre a manutenção resulta em valor 0, e valor 0
+        também deixava a view em None."""
+        conn = self._make_conn()
+        user_id = 9403
+        ensure_user(conn, user_id, "Tester")
+        set_current_rod(conn, user_id, "vara_void")
+        sardinha = next(p for p in economia.FISH_DB if p[0] == "Sardinha")
+
+        # 10 x 6.6 de sorte = 66 bruto, contra 1.750 de manutenção.
+        followup = await self._pescar(conn, user_id, sardinha, sorteio=10)
+
+        self.assertEqual(len(followup.chamadas), 1)
+        self.assertIs(followup.chamadas[0]["view"], discord.utils.MISSING)
+        self.assertEqual(get_wallet(conn, user_id), 0)
+
+    async def test_no_send_in_the_fishing_flow_ever_passes_none(self):
+        """Varredura: nenhuma das chamadas de send do fluxo pode levar None,
+        seja qual for o tipo de captura."""
+        conn = self._make_conn()
+        user_id = 9404
+        ensure_user(conn, user_id, "Tester")
+        for nome in ("Bota Velha", "Sardinha", "Truta", "Kraken"):
+            with self.subTest(captura=nome):
+                alvo = next(p for p in economia.FISH_DB if p[0] == nome)
+                followup = await self._pescar(conn, user_id, alvo)
+                for kwargs in followup.chamadas:
+                    self.assertIsNot(kwargs.get("view", discord.utils.MISSING), None)
+
+
 class ManutencaoDeEquipamentoTests(unittest.IsolatedAsyncioTestCase):
     """Item A: sink complementar da Forja do Abismo.
 

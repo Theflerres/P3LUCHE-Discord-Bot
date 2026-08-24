@@ -16,8 +16,36 @@ ERRO_LOG_FILE = os.path.join(LOG_FOLDER, "bot_erros.log")
 logger = logging.getLogger("P3LUCHE_ERROS")
 logger.setLevel(logging.DEBUG)
 
+
+def _ja_tem_file_handler(alvo: str) -> bool:
+    """Já existe um FileHandler deste logger escrevendo em `alvo`?
+
+    A pergunta certa é essa, e não "existe algum handler". O guard anterior
+    (`if not logger.handlers`) tratava painel e arquivo como mutuamente
+    exclusivos por acidente: `dashboard_session()` envolve o `bot.run()` em
+    main.py e anexa o TelemetryLogHandler a ESTE mesmo logger ANTES do
+    setup_hook carregar esta cog. Com o painel ligado — que é como o bot roda
+    em produção — o logger já chegava aqui com um handler, o FileHandler nunca
+    era criado, e todo erro de comando existia apenas no anel de 20 posições
+    em memória do painel. Nada ia para o disco, e um processo reiniciado
+    levava junto o único registro que havia.
+
+    Os dois destinos são complementares: o painel é volátil e pequeno (serve
+    para ver o agora), o arquivo é o registro durável (serve para investigar
+    depois). Comparar pelo caminho absoluto mantém a idempotência real que o
+    guard antigo tentava dar — recarregar a extensão não duplica a escrita —
+    sem desligar o arquivo por causa de um handler de outra natureza.
+    """
+    alvo_abs = os.path.abspath(alvo)
+    for h in logger.handlers:
+        base = getattr(h, "baseFilename", None)
+        if base and os.path.abspath(base) == alvo_abs:
+            return True
+    return False
+
+
 # Handler para arquivo
-if not logger.handlers:
+if not _ja_tem_file_handler(ERRO_LOG_FILE):
     file_handler = logging.FileHandler(ERRO_LOG_FILE, encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
     

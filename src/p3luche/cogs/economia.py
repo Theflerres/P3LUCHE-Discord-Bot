@@ -1066,7 +1066,20 @@ async def _finalize_pescar(interaction: discord.Interaction, ctx: dict):
 
     # Desmanche: só faz sentido quando houve peixe pago. Lixo já vai para a
     # mochila e vira sucata no Galdino pelo caminho de sempre.
-    view = None
+    #
+    # O sentinela é discord.utils.MISSING, NÃO None. Em `send`/`followup.send`
+    # a assinatura é `view: BaseView = MISSING` e a validação é
+    # `if view is not MISSING:` seguida de checagem de tipo — então None cai no
+    # TypeError("expected view parameter to be of type View or LayoutView").
+    # None só é válido em `edit_message`/`message.edit`, onde significa
+    # "remova a view"; é por isso que os outros pontos do projeto que usam
+    # view=None estão corretos e este não estava.
+    #
+    # Isto quebrava TODA captura de lixo (35% dos lances com a Vara de Bambu,
+    # 90% com a Galho Amarrado, o dobro disso na Tempestade Sombria) e toda
+    # captura de valor zero — inclusive o caminho novo em que a manutenção de
+    # equipamento zera o líquido de uma vara de tier >= 4.
+    view = discord.utils.MISSING
     if valor > 0 and not ctx.get("is_trash"):
         view = DesmancharView(user_id, nome, tier_p, valor)
 
@@ -1074,7 +1087,7 @@ async def _finalize_pescar(interaction: discord.Interaction, ctx: dict):
         mensagem = await interaction.followup.send(embed=embed, file=img_file, view=view, wait=True)
     else:
         mensagem = await interaction.followup.send(embed=embed, view=view, wait=True)
-    if view is not None:
+    if view is not discord.utils.MISSING:
         view.message = mensagem
 
 
