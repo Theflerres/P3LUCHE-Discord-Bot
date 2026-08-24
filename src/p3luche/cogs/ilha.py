@@ -457,7 +457,9 @@ class IlhaCog(commands.Cog):
         # Placeholder de imagem — segue o mesmo padrão gracioso de get_local_file
         # já usado em todos os outros hubs (guilda/taverna/oficina): se o
         # arquivo não existir ainda, o embed sai sem imagem, sem erro.
-        file, url = get_local_file("assets/locais/ilha_pessoal.jpg", "ilha_pessoal.jpg")
+        # PNG, nao JPG: o nome do anexo acompanha a extensao real do arquivo
+        # (o Discord renderiza pelo nome do anexo, nao pelos bytes).
+        file, url = get_local_file("assets/locais/ilha_pessoal.png", "ilha_pessoal.png")
         if file:
             embed.set_image(url=url)
             await interaction.response.send_message(embed=embed, file=file, view=view, ephemeral=True)

@@ -1811,7 +1811,11 @@ async def explorar(interaction: discord.Interaction):
     embed.set_footer(text="Cooldown do Drone: 10 minutos.")
 
     # CARREGA A IMAGEM DA ILHA AQUI
-    file, url = get_local_file("assets/locais/ilha player.jpg", "ilha.jpg")
+    # O arquivo entregue e PNG, nao JPG: o caminho E o nome do anexo seguem a
+    # extensao real do arquivo. O Discord decide como renderizar pelo nome do
+    # anexo, entao servir bytes PNG como "ilha.jpg" quebra a exibicao mesmo
+    # com o arquivo presente no disco.
+    file, url = get_local_file("assets/locais/ilha player.png", "ilha.png")
     if file: embed.set_image(url=url)
     
     if file: await interaction.followup.send(embed=embed, file=file)
@@ -3122,12 +3126,14 @@ async def guilda(interaction: discord.Interaction):
     # Mostra a "Recepção"
     embed = discord.Embed(title="🏛️ Guilda de Porto Solare", description="Bem-vindo ao quartel general. Selecione uma ação no terminal.", color=discord.Color.dark_blue())
     
-    file_img = None
-    if os.path.exists("assets/mapas/interior_guilda.png"):
-        file_img = discord.File("assets/mapas/interior_guilda.png", filename="guilda.png")
-        embed.set_image(url="attachment://guilda.png")
-    
+    # get_local_file como todo o resto do projeto. Este era o único ponto que
+    # montava o anexo na mão (os.path.exists + discord.File + a string
+    # "attachment://" digitada de novo), e por isso o único que não herdava a
+    # âncora de caminho em PROJECT_ROOT: quando o bot subia de outra pasta,
+    # este embed falhava por um motivo diferente de todos os outros.
+    file_img, url_img = get_local_file("assets/mapas/interior_guilda.png", "guilda.png")
     if file_img:
+        embed.set_image(url=url_img)
         await interaction.response.send_message(embed=embed, file=file_img, view=GuildView(user_id, interaction.user.name))
     else:
         await interaction.response.send_message(embed=embed, view=GuildView(user_id, interaction.user.name))

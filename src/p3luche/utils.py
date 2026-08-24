@@ -8,6 +8,7 @@ import os
 import re
 from datetime import timedelta
 from io import BytesIO
+from pathlib import Path
 
 import discord
 import docx
@@ -84,10 +85,41 @@ async def extract_text_from_attachment(attachment: discord.Attachment) -> str:
         return f"[Erro ao ler arquivo: {e}]"
 
 
+#: Raiz do projeto, derivada da localização deste arquivo — NÃO do diretório
+#: de trabalho. `utils.py` mora em <raiz>/src/p3luche/, então três níveis
+#: acima é a raiz onde `assets/` vive.
+#:
+#: Existia um bug latente aqui: todo caminho de asset no projeto é relativo
+#: (assets/npcs/galdino.gif, sem barra inicial), e get_local_file resolvia
+#: isso contra os.getcwd(). Bastava iniciar o bot de qualquer pasta que
+#: não a raiz do repositório para TODA mídia desaparecer silenciosamente
+#: das mensagens — mesmo os arquivos que existem — porque get_local_file
+#: degrada em silêncio quando não encontra. Ancorar em __file__ torna o
+#: carregamento independente de como o processo foi iniciado.
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def resolve_asset_path(path) -> Path:
+    """Converte um caminho de asset do projeto em caminho absoluto.
+
+    Caminho relativo é resolvido contra PROJECT_ROOT; caminho já absoluto é
+    devolvido como veio. Os chamadores continuam escrevendo caminhos
+    relativos e legíveis ("assets/pesca/tier0.png") — a âncora é aplicada
+    num ponto só, aqui.
+    """
+    p = Path(path)
+    return p if p.is_absolute() else PROJECT_ROOT / p
+
+
 def get_local_file(path, filename):
-    """Tenta carregar um arquivo local. Retorna (File, attachment_str) ou (None, None)."""
-    if os.path.exists(path):
-        return discord.File(path, filename=filename), f"attachment://{filename}"
+    """Tenta carregar um arquivo local. Retorna (File, attachment_str) ou (None, None).
+
+    O caminho é resolvido contra a raiz do projeto (ver resolve_asset_path),
+    não contra o diretório de trabalho do processo.
+    """
+    caminho = resolve_asset_path(path)
+    if caminho.is_file():
+        return discord.File(caminho, filename=filename), f"attachment://{filename}"
     return None, None
 
 
